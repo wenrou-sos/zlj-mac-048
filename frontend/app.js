@@ -387,10 +387,16 @@ const MilkingsPage = {
     const onlyV = ref(false);
     async function reload() {
       const p = new URLSearchParams();
-      p.set("date_from", dateFrom.value);
-      p.set("date_to", dateTo.value);
+      // 仅看违规时跨全部历史筛查，避免日期窗口漏掉较早的违规记录
+      if (!onlyV.value) {
+        p.set("date_from", dateFrom.value);
+        p.set("date_to", dateTo.value);
+      }
       if (cowId.value) p.set("cow_id", cowId.value);
-      if (onlyV.value) p.set("only_violations", "true");
+      if (onlyV.value) {
+        p.set("only_violations", "true");
+        p.set("limit", "1000");
+      }
       await loadMilkings("&" + p.toString());
     }
     const lactatingCows = computed(() => S.cows.filter((c) => c.status === "lactating"));
@@ -399,11 +405,13 @@ const MilkingsPage = {
   template: `
   <div class="card">
     <div class="toolbar">
-      <label class="input" style="width:auto;display:flex;align-items:center;gap:6px;border-style:dashed">
-        起 <input type="date" class="input" style="border:none;width:130px;padding:2px" v-model="dateFrom" @change="reload">
+      <label class="input" :style="{width:'auto',display:'flex',alignItems:'center',gap:'6px',borderStyle:'dashed',opacity: onlyV ? .45 : 1}">
+        起 <input type="date" class="input" style="border:none;width:130px;padding:2px"
+              :disabled="onlyV" v-model="dateFrom" @change="reload">
       </label>
-      <label class="input" style="width:auto;display:flex;align-items:center;gap:6px;border-style:dashed">
-        止 <input type="date" class="input" style="border:none;width:130px;padding:2px" v-model="dateTo" @change="reload">
+      <label class="input" :style="{width:'auto',display:'flex',alignItems:'center',gap:'6px',borderStyle:'dashed',opacity: onlyV ? .45 : 1}">
+        止 <input type="date" class="input" style="border:none;width:130px;padding:2px"
+              :disabled="onlyV" v-model="dateTo" @change="reload">
       </label>
       <select class="input" style="width:160px" v-model="cowId" @change="reload">
         <option value="">全部牛只</option>
@@ -411,6 +419,7 @@ const MilkingsPage = {
       </select>
       <label style="display:flex;align-items:center;gap:6px;color:#b45309;font-weight:600;cursor:pointer">
         <input type="checkbox" v-model="onlyV" @change="reload"> 仅看休药期违规混装
+        <span v-if="onlyV" style="color:#6b7280;font-weight:400">（全历史筛查，最多1000条）</span>
       </label>
       <span class="spacer"></span>
       <button class="btn btn-primary" @click="openModal({type:'milkingForm', rec:null})">＋ 登记挤奶</button>

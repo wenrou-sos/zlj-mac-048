@@ -213,12 +213,59 @@ def list_milkings(
         query = query.filter(models.MilkingRecord.date >= date_from)
     if date_to:
         query = query.filter(models.MilkingRecord.date <= date_to)
+    if only_violations:
+        # 违规判定必须在 SQL 层过滤：若先 limit 再在内存筛，较早的违规会被漏掉
+        query = query.filter(services.withdrawal_violation_clause())
     rows = query.order_by(
         models.MilkingRecord.date.desc(), models.MilkingRecord.id.desc()
     ).limit(limit).all()
-    out = [milking_to_dict(r, db) for r in rows]
-    if only_violations:
-        out = [r for r in out if r["violation"]]
+    return annotate_milkings(rows, db)
+
+
+def annotate_milkings(rows: list, db: Session) -> list:
+    """批量补充牛只与休药期标注，避免逐行 N+1 查询"""
+    if not rows:
+        return []
+    cow_ids = {r.cow_id for r in rows}
+    cows = {c.id: c for c in db.query(models.Cow).filter(models.Cow.id.in_(cow_ids)).all()}
+
+    min_d, max_d = min(r.date for r in rows), max(r.date for r in rows)
+    meds = (
+        db.query(models.Medication)
+        .filter(
+            models.Medication.cow_id.in_(cow_ids),
+            models.Medication.withdrawal_days > 0,
+            models.Medication.date <= max_d,
+            models.Medication.withdrawal_end >= min_d,
+        )
+        .order_by(models.Medication.withdrawal_end.desc())
+        .all()
+    )
+    # (cow_id) -> 与本批记录日期范围相交的用药区间
+    by_cow: dict = {}
+    for m in meds:
+        by_cow.setdefault(m.cow_id, []).append(m)
+
+    out = []
+    for r in rows:
+        cow = cows.get(r.cow_id)
+        med = next(
+            (m for m in by_cow.get(r.cow_id, [])
+             if m.date <= r.date <= m.withdrawal_end),
+            None,
+        )
+        in_w = med is not None
+        out.append({
+            "id": r.id, "cow_id": r.cow_id, "date": str(r.date), "session": r.session,
+            "session_label": SESSION_LABEL.get(r.session, r.session),
+            "yield_kg": r.yield_kg, "scc": r.scc, "discarded": r.discarded,
+            "note": r.note, "created_at": str(r.created_at) if r.created_at else None,
+            "cow_ear_tag": cow.ear_tag if cow else None,
+            "cow_name": cow.name if cow else None,
+            "in_withdrawal": in_w,
+            "withdrawal_until": str(med.withdrawal_end) if med else None,
+            "violation": bool(in_w and not r.discarded),
+        })
     return out
 
 
@@ -544,10 +591,20 @@ def dashboard(db: Session = Depends(get_db)):
 
     reminders = services.build_reminders(db, today)
     anomalies = services.detect_yield_anomalies(db, days=7, today=today)
-    violations = [
-        r for r in db.query(models.MilkingRecord).all()
-        if services.latest_medication_window(db, r.cow_id, r.date) and not r.discarded
-    ]
+    violation_count = (
+        db.query(models.MilkingRecord)
+        .filter(services.withdrawal_violation_clause())
+        .count()
+    )
+    cows_in_withdrawal = (
+        db.query(models.Medication.cow_id)
+        .filter(
+            models.Medication.withdrawal_days > 0,
+            models.Medication.date <= today,
+            models.Medication.withdrawal_end >= today,
+        )
+        .distinct().count()
+    )
 
     return {
         "today": str(today),
@@ -560,11 +617,8 @@ def dashboard(db: Session = Depends(get_db)):
         "reminder_count": len(reminders),
         "reminder_danger": sum(1 for r in reminders if r["level"] == "danger"),
         "anomaly_count": len(anomalies),
-        "violation_count": len(violations),
-        "cows_in_withdrawal": len({
-            r.cow_id for r in db.query(models.Medication).all()
-            if r.withdrawal_days > 0 and r.date <= today <= r.withdrawal_end
-        }),
+        "violation_count": violation_count,
+        "cows_in_withdrawal": cows_in_withdrawal,
     }
 
 

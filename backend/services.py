@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import date, timedelta
 from typing import Dict, List, Optional
 
+from sqlalchemy import and_, exists, or_
 from sqlalchemy.orm import Session
 
 from . import models
@@ -11,6 +12,25 @@ SESSION_LABEL = {"morning": "早班", "noon": "午班", "evening": "晚班"}
 STATUS_LABEL = {
     "lactating": "泌乳中", "dry": "干奶", "pregnant": "待产", "sold": "已离场",
 }
+
+
+def withdrawal_violation_clause(on_column=None, cow_column=None):
+    """
+    生成“该挤奶记录当日处于休药期内且未标记废弃”的 SQL EXISTS 条件，
+    可直接用于 WHERE 过滤，避免先 limit 截断再在内存里漏判。
+    """
+    on_column = on_column or models.MilkingRecord.date
+    cow_column = cow_column or models.MilkingRecord.cow_id
+    med = models.Medication
+    return and_(
+        models.MilkingRecord.discarded.is_(False),
+        exists().where(
+            med.cow_id == cow_column,
+            med.withdrawal_days > 0,
+            med.date <= on_column,
+            med.withdrawal_end >= on_column,
+        ),
+    )
 
 
 def cow_label(cow: models.Cow) -> str:
@@ -172,11 +192,15 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                 "days_overdue": 0,
             })
 
-    # 4) 健康复查
+    # 4) 健康复查（result 为 NULL 的“未结案”记录也必须纳入，
+    #    注意 SQL 三值逻辑：NULL != 'recovered' 结果为 NULL 会被 WHERE 过滤掉）
     for h in (
         db.query(models.HealthRecord)
         .filter(models.HealthRecord.follow_up_date.isnot(None))
-        .filter(models.HealthRecord.result != "recovered")
+        .filter(or_(
+            models.HealthRecord.result.is_(None),
+            models.HealthRecord.result != "recovered",
+        ))
         .all()
     ):
         cow = db.get(models.Cow, h.cow_id)
