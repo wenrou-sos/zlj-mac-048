@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from . import models, schemas, services
+from . import models, schemas, services, tasks
 from .database import Base, engine, get_db
 from .seed import init_db
 
@@ -550,10 +550,217 @@ def delete_estrus(rec_id: int, db: Session = Depends(get_db)):
     db.commit()
 
 
-# ---------------- 提醒 / 异常 / 仪表盘 ----------------
+# ---------------- 提醒 / 待办 / 异常 / 仪表盘 ----------------
 @app.get("/api/reminders")
 def get_reminders(db: Session = Depends(get_db)):
-    return services.build_reminders(db)
+    """
+    今日提醒（已对账）：先把引擎事项与持久化待办核对（幂等派单/更新/失效），
+    再返回全部活跃待办。刷新或重启不会为同一件事重复派单。
+    """
+    rows = tasks.reconcile(db)
+    active = [t for t in rows if t.status in tasks.ACTIVE_STATUSES]
+    return [tasks.task_to_dict(t) for t in active]
+
+
+@app.get("/api/tasks")
+def list_tasks(scope: str = Query("active", pattern="^(active|open|mine|closed|all)$"),
+               db: Session = Depends(get_db)):
+    tasks.reconcile(db)
+    if scope == "all":
+        rows = db.query(models.ReminderTask).order_by(models.ReminderTask.id.desc()).limit(500).all()
+    else:
+        rows = tasks.list_tasks(db, scope)
+    return [tasks.task_to_dict(t) for t in rows]
+
+
+@app.get("/api/tasks/{task_id}")
+def get_task(task_id: int, db: Session = Depends(get_db)):
+    try:
+        return tasks.task_to_dict(tasks.get_task(db, task_id))
+    except LookupError:
+        raise HTTPException(404, "未找到该待办")
+
+
+def _actor(payload: dict) -> Optional[str]:
+    return (payload.get("actor") or payload.get("person_name") or "").strip() or None
+
+
+@app.post("/api/tasks/{task_id}/claim")
+def claim_task(task_id: int, payload: dict, db: Session = Depends(get_db)):
+    name = (payload.get("person_name") or "").strip()
+    if not name:
+        raise HTTPException(400, "请先在右上角选择或填写值班人姓名")
+    try:
+        t = tasks.claim(db, task_id, name, payload.get("version"))
+    except tasks.Conflict as c:
+        raise HTTPException(409, {"message": c.message, "current": c.current})
+    except LookupError:
+        raise HTTPException(404, "未找到该待办")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return tasks.task_to_dict(t)
+
+
+@app.post("/api/tasks/{task_id}/assign")
+def assign_task(task_id: int, payload: dict, db: Session = Depends(get_db)):
+    name = (payload.get("person_name") or "").strip()
+    if not name:
+        raise HTTPException(400, "请填写负责人姓名")
+    try:
+        t = tasks.assign(db, task_id, name, _actor(payload), payload.get("version"))
+    except tasks.Conflict as c:
+        raise HTTPException(409, {"message": c.message, "current": c.current})
+    except LookupError:
+        raise HTTPException(404, "未找到该待办")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return tasks.task_to_dict(t)
+
+
+@app.post("/api/tasks/{task_id}/postpone")
+def postpone_task(task_id: int, payload: dict, db: Session = Depends(get_db)):
+    new_due = None
+    if payload.get("new_due_date"):
+        try:
+            new_due = date.fromisoformat(payload["new_due_date"])
+        except ValueError:
+            raise HTTPException(400, "改期日期格式应为 YYYY-MM-DD")
+    try:
+        t = tasks.postpone(db, task_id, payload.get("reason", ""), new_due,
+                           _actor(payload), payload.get("version"))
+    except tasks.Conflict as c:
+        raise HTTPException(409, {"message": c.message, "current": c.current})
+    except LookupError:
+        raise HTTPException(404, "未找到该待办")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return tasks.task_to_dict(t)
+
+
+@app.post("/api/tasks/{task_id}/complete")
+def complete_task(task_id: int, payload: dict, db: Session = Depends(get_db)):
+    try:
+        t = tasks.complete(
+            db, task_id, payload.get("result_note", ""), _actor(payload),
+            payload.get("version"), register_action=payload.get("register_action"),
+        )
+    except tasks.Conflict as c:
+        raise HTTPException(409, {"message": c.message, "current": c.current})
+    except LookupError:
+        raise HTTPException(404, "未找到该待办")
+    except ValueError as e:
+        # 红线：未做真实登记 / 休药警告试图办结 -> 400 明确拒绝
+        raise HTTPException(400, str(e))
+    return tasks.task_to_dict(t)
+
+
+@app.post("/api/tasks/{task_id}/acknowledge-update")
+def ack_update(task_id: int, payload: dict, db: Session = Depends(get_db)):
+    try:
+        t = tasks.acknowledge_update(db, task_id, _actor(payload), payload.get("version"))
+    except tasks.Conflict as c:
+        raise HTTPException(409, {"message": c.message, "current": c.current})
+    except LookupError:
+        raise HTTPException(404, "未找到该待办")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return tasks.task_to_dict(t)
+
+
+@app.post("/api/tasks/{task_id}/reopen")
+def reopen_task(task_id: int, payload: dict, db: Session = Depends(get_db)):
+    try:
+        t = tasks.reopen(db, task_id, _actor(payload))
+    except LookupError:
+        raise HTTPException(404, "未找到该待办")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return tasks.task_to_dict(t)
+
+
+@app.get("/api/tasks/{task_id}/events")
+def task_events(task_id: int, db: Session = Depends(get_db)):
+    try:
+        t = tasks.get_task(db, task_id)
+    except LookupError:
+        raise HTTPException(404, "未找到该待办")
+    return [
+        {"event": e.event, "actor": e.actor, "detail": e.detail,
+         "shift": e.shift_code,
+         "at": e.created_at.strftime("%Y-%m-%d %H:%M") if e.created_at else None}
+        for e in t.events
+    ]
+
+
+# ---------------- 值班人员（免登录，直接维护姓名） ----------------
+@app.get("/api/persons")
+def list_persons(db: Session = Depends(get_db)):
+    rows = db.query(models.Person).order_by(models.Person.active.desc(),
+                                            models.Person.name.asc()).all()
+    return [{"id": p.id, "name": p.name, "role": p.role, "active": p.active} for p in rows]
+
+
+@app.post("/api/persons", status_code=201)
+def create_person(payload: dict, db: Session = Depends(get_db)):
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "请填写姓名")
+    if db.query(models.Person).filter_by(name=name).first():
+        raise HTTPException(409, "该姓名已存在")
+    p = models.Person(name=name, role=(payload.get("role") or "").strip() or None)
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return {"id": p.id, "name": p.name, "role": p.role, "active": p.active}
+
+
+@app.patch("/api/persons/{person_id}")
+def update_person(person_id: int, payload: dict, db: Session = Depends(get_db)):
+    p = db.get(models.Person, person_id)
+    if not p:
+        raise HTTPException(404, "未找到该人员")
+    name = (payload.get("name") or "").strip()
+    if name and name != p.name:
+        if db.query(models.Person).filter_by(name=name).first():
+            raise HTTPException(409, "该姓名已存在")
+        p.name = name
+        # 改名同步到该人名下尚未结束的待办，历史事件流水保持原样留痕
+        open_n = 0
+        for t in db.query(models.ReminderTask).filter_by(owner_id=p.id).all():
+            if t.status in tasks.ACTIVE_STATUSES:
+                t.owner_name = name
+                t.version += 1
+                open_n += 1
+    if "role" in payload:
+        p.role = (payload.get("role") or "").strip() or None
+    if payload.get("active") is not None:
+        p.active = bool(payload["active"])
+    db.commit()
+    db.refresh(p)
+    return {"id": p.id, "name": p.name, "role": p.role, "active": p.active}
+
+
+# ---------------- 交班 ----------------
+@app.post("/api/handovers", status_code=201)
+def create_handover(payload: dict, db: Session = Depends(get_db)):
+    try:
+        h = tasks.build_handover(
+            db, _actor(payload), payload.get("to_person", ""), payload.get("note"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return tasks.handover_to_dict(h)
+
+
+@app.get("/api/handovers")
+def list_handovers(limit: int = Query(20, ge=1, le=100), db: Session = Depends(get_db)):
+    rows = (db.query(models.Handover)
+            .order_by(models.Handover.id.desc()).limit(limit).all())
+    return [tasks.handover_to_dict(h) for h in rows]
+
+
+@app.get("/api/shift/current")
+def current_shift():
+    return services.current_shift()
 
 
 @app.get("/api/anomalies")
@@ -589,8 +796,18 @@ def dashboard(db: Session = Depends(get_db)):
         d = today - timedelta(days=off)
         trend.append({"date": str(d), **day_milk(d)})
 
-    reminders = services.build_reminders(db, today)
     anomalies = services.detect_yield_anomalies(db, days=7, today=today)
+    # 对账后按持久化待办统计（休药警告始终计入，不允许被完成隐藏）
+    all_tasks = tasks.reconcile(db, today)
+    active_tasks = [t for t in all_tasks if t.status in tasks.ACTIVE_STATUSES]
+    open_n = sum(1 for t in active_tasks if t.status in (models.TASK_STATUS_OPEN,
+                                                         models.TASK_STATUS_CHANGED))
+    claimed_n = sum(1 for t in active_tasks if t.status in (models.TASK_STATUS_CLAIMED,
+                                                            models.TASK_STATUS_POSTPONED))
+    overdue_n = sum(1 for t in active_tasks if t.due_date and t.due_date < today)
+    changed_n = sum(1 for t in active_tasks if t.source_state == models.SOURCE_STATE_UPDATED)
+    invalid_n = sum(1 for t in all_tasks if t.status == models.TASK_STATUS_INVALID)
+    withdrawal_n = sum(1 for t in active_tasks if t.type == "withdrawal")
     violation_count = (
         db.query(models.MilkingRecord)
         .filter(services.withdrawal_violation_clause())
@@ -608,14 +825,21 @@ def dashboard(db: Session = Depends(get_db)):
 
     return {
         "today": str(today),
+        "shift": services.current_shift(),
         "cows_total": len(cows),
         "cows_active": len(active),
         "by_status": dict(by_status),
         "today_milk": day_milk(today),
         "yesterday_milk": day_milk(yesterday),
         "trend_14d": trend,
-        "reminder_count": len(reminders),
-        "reminder_danger": sum(1 for r in reminders if r["level"] == "danger"),
+        "reminder_count": len(active_tasks),
+        "reminder_danger": sum(1 for t in active_tasks if t.level == "danger"),
+        "task_open": open_n,
+        "task_claimed": claimed_n,
+        "task_overdue": overdue_n,
+        "task_changed": changed_n,
+        "task_invalid": invalid_n,
+        "task_withdrawal": withdrawal_n,
         "anomaly_count": len(anomalies),
         "violation_count": violation_count,
         "cows_in_withdrawal": cows_in_withdrawal,

@@ -12,6 +12,14 @@ async function api(path, opts = {}) {
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    // 409 冲突返回 {message,current}，抛出携带最新任务状态的错误供 UI 处理
+    if (res.status === 409 && data && data.detail) {
+      const d = data.detail;
+      const err = new Error(d.message || "该待办刚被其他人操作，请刷新后查看");
+      err.code = 409;
+      err.current = d.current;
+      throw err;
+    }
     const msg = typeof data.detail === "string" ? data.detail : "请求失败（" + res.status + "）";
     throw new Error(msg);
   }
@@ -51,6 +59,14 @@ const REMINDER_META = {
   calving: { ico: "🐣", label: "待产" },
   first_insemination: { ico: "📅", label: "产后首配" },
 };
+const TASK_STATUS_META = {
+  open: { label: "待认领", cls: "gray" },
+  claimed: { label: "处理中", cls: "blue" },
+  postponed: { label: "已延期", cls: "amber" },
+  done: { label: "已完成", cls: "green" },
+  invalid: { label: "已失效", cls: "red" },
+  changed: { label: "待确认更新", cls: "amber" },
+};
 
 /* ---------------- 全局状态 ---------------- */
 const S = reactive({
@@ -59,14 +75,18 @@ const S = reactive({
   modals: [],
   cows: [],
   drugs: [],
+  persons: [],
+  currentPerson: localStorage.getItem("df_person") || "",
+  shift: null,
   dashboard: null,
   reminders: [],
+  tasks: [],
   anomalies: [],
   milkings: [],
   health: [],
   meds: [],
   estruses: [],
-  loading: { milkings: false },
+  loading: { milkings: false, tasks: false },
 });
 
 let toastSeq = 0;
@@ -89,11 +109,19 @@ async function loadCows() {
 async function loadDrugs() {
   S.drugs = await api("/api/drugs");
 }
+async function loadPersons() {
+  S.persons = await api("/api/persons");
+}
 async function loadDashboard() {
   S.dashboard = await api("/api/dashboard");
+  S.shift = S.dashboard.shift || null;
 }
 async function loadReminders() {
+  // /api/reminders 先对账（幂等派单）再返回活跃待办
   S.reminders = await api("/api/reminders");
+}
+async function loadTasks(scope = "active") {
+  S.tasks = await api("/api/tasks?scope=" + scope);
 }
 async function loadAnomalies(days = 7) {
   S.anomalies = await api("/api/anomalies?days=" + days);
@@ -102,6 +130,12 @@ async function loadAnomalies(days = 7) {
 async function switchView(v) {
   S.view = v;
   if (v === "cows" && !S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
+  if (v === "tasks") {
+    S.loading.tasks = true;
+    Promise.all([loadTasks("all"), loadPersons()])
+      .catch((e) => toast(e.message, "error"))
+      .finally(() => { S.loading.tasks = false; });
+  }
   if (v === "milkings") loadMilkings();
   if (v === "health") {
     if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
@@ -128,6 +162,74 @@ async function loadMilkings(q = "") {
 async function loadHealthAll() { S.health = await api("/api/health"); }
 async function loadMedsAll() { S.meds = await api("/api/medications"); }
 async function loadEstrusesAll() { S.estruses = await api("/api/estruses"); }
+
+/* ---------------- 待办操作 ---------------- */
+async function refreshAllReminders() {
+  await Promise.all([loadDashboard(), loadReminders()]);
+  if (S.view === "tasks") await loadTasks("all");
+}
+
+function requirePerson() {
+  if (!S.currentPerson || !S.currentPerson.trim()) {
+    toast("请先在右上角选择或填写值班人姓名", "warn");
+    openModal({ type: "personForm", fromGuard: true });
+    return false;
+  }
+  return true;
+}
+
+// 处理 409：用服务器返回的最新任务就地替换，并弹出冲突说明
+function handleTaskConflict(err) {
+  if (err.code === 409) {
+    if (err.current) {
+      mergeTaskIntoState(err.current);
+      openModal({ type: "conflict", task: err.current, message: err.message });
+    } else {
+      toast(err.message, "error");
+    }
+  } else {
+    toast(err.message, "error");
+  }
+}
+
+function mergeTaskIntoState(t) {
+  const ri = S.reminders.findIndex((x) => x.id === t.id);
+  if (ri >= 0) S.reminders.splice(ri, 1, t);
+  const ti = S.tasks.findIndex((x) => x.id === t.id);
+  if (ti >= 0) S.tasks.splice(ti, 1, t);
+}
+
+async function claimTask(t) {
+  if (!requirePerson()) return;
+  try {
+    const u = await api(`/api/tasks/${t.id}/claim`, {
+      method: "POST", body: { person_name: S.currentPerson, version: t.version },
+    });
+    mergeTaskIntoState(u);
+    toast(`已认领：${u.title.replace(/^[^ ]+ /, "")}`);
+    await loadDashboard();
+  } catch (e) { handleTaskConflict(e); }
+}
+
+async function quickAssign(t, name, version) {
+  try {
+    const u = await api(`/api/tasks/${t.id}/assign`, {
+      method: "POST", body: { person_name: name, actor: S.currentPerson, version },
+    });
+    mergeTaskIntoState(u);
+    toast(`已指派给 ${name}`);
+    await Promise.all([loadPersons(), loadDashboard()]);
+    return u;
+  } catch (e) { handleTaskConflict(e); return null; }
+}
+
+async function setCurrentPerson(name) {
+  S.currentPerson = name;
+  localStorage.setItem("df_person", name);
+  if (name && !S.persons.some((p) => p.name === name)) {
+    await loadPersons().catch(() => {});
+  }
+}
 
 /* ---------------- 柱状图 ---------------- */
 const BarChart = {
@@ -181,9 +283,82 @@ const Sparkline = {
   },
 };
 
-/* ---------------- 工作台 ---------------- */
+/* ---------------- 待办卡片（工作台与待办页共用） ---------------- */
+const TaskCard = {
+  props: ["t", "compact"],
+  setup(props) {
+    return {
+      S, REMINDER_META, TASK_STATUS_META,
+      openModal, claimTask,
+      statusMeta: (t) => TASK_STATUS_META[t.status] || { label: t.status, cls: "gray" },
+    };
+  },
+  template: `
+  <div class="reminder task" :class="t.level">
+    <div class="r-ico">{{ REMINDER_META[t.type]?.ico || '•' }}</div>
+    <div class="r-body">
+      <div class="r-title">
+        {{ t.title }}
+        <span v-if="t.source_state==='updated'" class="badge amber" title="源记录已被修改">🔁 已更新·待确认</span>
+        <span v-if="t.status==='invalid'" class="badge red">⛓ 已失效</span>
+        <span v-if="t.register_required && t.status!=='done'" class="badge red" title="必须在业务模块完成真实登记">须真实登记</span>
+        <span v-if="t.type==='withdrawal'" class="badge red">安全警告·不可完成</span>
+        <span v-if="t.carry_count>0" class="badge purple" title="跨班续传次数">🤝 已续传{{ t.carry_count }}班</span>
+      </div>
+      <div class="r-detail">{{ t.detail }}</div>
+      <div class="r-meta">
+        {{ REMINDER_META[t.type]?.label }} · 截止 {{ t.due_date || '—' }}
+        <span v-if="t.days_overdue > 0" class="overdue">· 已逾期 {{ t.days_overdue }} 天</span>
+        · 派自 {{ t.shift_label }}
+      </div>
+
+      <!-- 认领/处理轨迹 -->
+      <div class="task-track">
+        <span class="who" v-if="t.owner_name">👤 负责人：<b>{{ t.owner_name }}</b></span>
+        <span class="who unclaimed" v-else>👤 尚未认领</span>
+        <span class="badge" :class="statusMeta(t).cls">{{ statusMeta(t).label }}</span>
+        <span v-if="t.status==='postponed'" class="postpone">延期原因：{{ t.postpone_reason }}</span>
+        <span v-if="t.result_note" class="result">处理结果：{{ t.result_note }}</span>
+      </div>
+      <div v-if="t.source_state==='updated'" class="update-tip">
+        源记录已变更，上方内容已按最新数据更新；负责人与处理记录保留。
+      </div>
+      <div v-if="t.status==='invalid'" class="invalid-tip">该待办因源记录删除/离场/业务办结已失效，仅留痕不再提醒。</div>
+
+      <!-- 操作区 -->
+      <div class="task-actions" v-if="!compact">
+        <template v-if="t.status==='invalid'">
+          <button class="btn btn-sm" @click="openModal({type:'taskDetail', id:t.id})">流水留痕</button>
+        </template>
+        <template v-else-if="t.status==='done'">
+          <span class="done-note">✅ {{ t.done_at }} 办结</span>
+          <button class="btn btn-sm" @click="openModal({type:'taskDetail', id:t.id})">详情</button>
+        </template>
+        <template v-else-if="t.type==='withdrawal'">
+          <span class="guard-note">🚫 有效期内始终置顶展示，到期自动解除；请确保该牛鲜奶废弃、不混入大罐</span>
+          <button class="link" @click="openModal({type:'cowDetail', id:t.cow_id})">查看牛只</button>
+          <button class="link" @click="openModal({type:'taskDetail', id:t.id})">认领/流水</button>
+        </template>
+        <template v-else>
+          <button class="btn btn-sm btn-primary" v-if="!t.owner_name" @click="claimTask(t)">🙋 我认领</button>
+          <button class="btn btn-sm" @click="openModal({type:'assign', task:t})">指派</button>
+          <button class="btn btn-sm" v-if="t.status!=='postponed'" @click="openModal({type:'postpone', task:t})">延期</button>
+          <button class="btn btn-sm" v-if="t.source_state==='updated'" @click="openModal({type:'ackUpdate', task:t})">确认更新</button>
+          <button class="btn btn-sm btn-danger" @click="openModal({type:'complete', task:t})">完成处理</button>
+          <button class="link" @click="openModal({type:'cowDetail', id:t.cow_id})">查看牛只</button>
+          <button class="link" @click="openModal({type:'taskDetail', id:t.id})">详情/流水</button>
+        </template>
+      </div>
+      <div class="task-actions" v-else>
+        <button class="link" @click="openModal({type:'taskDetail', id:t.id})">认领/处置</button>
+      </div>
+    </div>
+  </div>`,
+};
+
+
 const Dashboard = {
-  components: { BarChart },
+  components: { BarChart, TaskCard },
   setup() {
     const chartPoints = computed(() =>
       (S.dashboard?.trend_14d || []).map((t) => ({
@@ -204,7 +379,14 @@ const Dashboard = {
       return t[t.length - 1].total_kg + t[t.length - 1].discarded_kg <
         (t[t.length - 2].total_kg + t[t.length - 2].discarded_kg) * 0.6;
     });
-    return { S, chartPoints, deltaPct, todayPartial, REMINDER_META, fmtSCC };
+    const withdrawalTasks = computed(() => S.reminders.filter((t) => t.type === "withdrawal"));
+    const updatedTasks = computed(() => S.reminders.filter((t) => t.source_state === "updated"));
+    const restTasks = computed(() => S.reminders.filter(
+      (t) => t.type !== "withdrawal" && t.source_state !== "updated"));
+    return {
+      S, chartPoints, deltaPct, todayPartial, REMINDER_META, fmtSCC, switchView,
+      withdrawalTasks, updatedTasks, restTasks,
+    };
   },
   template: `
   <div v-if="S.dashboard">
@@ -227,15 +409,15 @@ const Dashboard = {
         <div class="big-ico">🥛</div>
       </div>
       <div class="card stat alert">
-        <div class="label">紧急待办</div>
-        <div class="value">{{ S.dashboard.reminder_danger }}<span class="unit"> / {{ S.dashboard.reminder_count }} 条提醒</span></div>
-        <div class="delta">休药期牛只 {{ S.dashboard.cows_in_withdrawal }} 头</div>
+        <div class="label">未完成待办</div>
+        <div class="value">{{ S.dashboard.reminder_count }}<span class="unit"> 条</span></div>
+        <div class="delta">待认领 {{ S.dashboard.task_open }} · 处理中 {{ S.dashboard.task_claimed }} · 逾期 {{ S.dashboard.task_overdue }}</div>
         <div class="big-ico">🔔</div>
       </div>
       <div class="card stat warn">
-        <div class="label">奶量异常牛只</div>
-        <div class="value">{{ S.dashboard.anomaly_count }}<span class="unit"> 头</span></div>
-        <div class="delta">休药期混装违规 {{ S.dashboard.violation_count }} 条</div>
+        <div class="label">奶量异常 / 休药警告</div>
+        <div class="value">{{ S.dashboard.anomaly_count }}<span class="unit"> 头异常</span></div>
+        <div class="delta">🚫 休药期待办 {{ S.dashboard.task_withdrawal }}<template v-if="S.dashboard.task_changed"> · 🔁 {{ S.dashboard.task_changed }} 条已更新</template></div>
         <div class="big-ico">📉</div>
       </div>
     </div>
@@ -252,24 +434,23 @@ const Dashboard = {
         </div>
       </div>
       <div class="card">
-        <div class="card-title">🔔 今日提醒 <span class="spacer"></span>
+        <div class="card-title">🔔 班次待办（{{ S.shift?.label || '' }}）<span class="spacer"></span>
+          <button class="link" @click="switchView('tasks')">全部待办/交班 →</button>
           <span class="badge red">{{ S.reminders.length }}</span>
         </div>
         <div class="reminder-list">
-          <div v-for="(r,i) in S.reminders" :key="i" class="reminder" :class="r.level">
-            <div class="r-ico">{{ REMINDER_META[r.type]?.ico || '•' }}</div>
-            <div class="r-body">
-              <div class="r-title">{{ r.title }}</div>
-              <div class="r-detail">{{ r.detail }}</div>
-              <div class="r-meta">
-                {{ REMINDER_META[r.type]?.label }} · 截止 {{ r.due_date }}
-                <span v-if="r.days_overdue > 0" class="overdue">· 已逾期 {{ r.days_overdue }} 天</span>
-                <button class="link" style="margin-left:8px"
-                  @click="openModal({type:'cowDetail', id:r.cow_id})">查看牛只</button>
-              </div>
+          <template v-if="S.reminders.length">
+            <div v-if="withdrawalTasks.length" class="task-group safety">
+              <div class="group-head">🚫 休药安全警告（有效期内不可完成、持续置顶）</div>
+              <task-card v-for="t in withdrawalTasks" :key="'w'+t.id" :t="t" compact></task-card>
             </div>
-          </div>
-          <div v-if="!S.reminders.length" class="empty">暂无提醒，牛群状态良好 🌿</div>
+            <div v-if="updatedTasks.length" class="task-group changed">
+              <div class="group-head">🔁 源记录已更新，待负责人确认</div>
+              <task-card v-for="t in updatedTasks" :key="'u'+t.id" :t="t" compact></task-card>
+            </div>
+            <task-card v-for="t in restTasks" :key="t.id" :t="t" compact></task-card>
+          </template>
+          <div v-else class="empty">暂无待办，牛群状态良好 🌿</div>
         </div>
       </div>
     </div>
@@ -292,6 +473,101 @@ const Dashboard = {
             <tr v-if="!S.anomalies.length"><td colspan="6" class="empty">近7天未发现异常 ✅</td></tr>
           </tbody>
         </table>
+      </div>
+    </div>
+  </div>`,
+};
+
+/* ---------------- 待办与交班 ---------------- */
+const TasksPage = {
+  components: { TaskCard },
+  setup() {
+    const tab = ref("active");
+    const handovers = ref([]);
+    const groups = computed(() => {
+      const list = S.tasks;
+      return {
+        withdrawal: list.filter((t) => t.type === "withdrawal"),
+        updated: list.filter((t) => t.source_state === "updated"),
+        open: list.filter((t) => t.type !== "withdrawal" && t.source_state !== "updated"
+          && ["open", "changed"].includes(t.status)),
+        claimed: list.filter((t) => ["claimed", "postponed"].includes(t.status)),
+        done: list.filter((t) => t.status === "done"),
+        invalid: list.filter((t) => t.status === "invalid"),
+      };
+    });
+    const visibleList = computed(() => {
+      const g = groups.value;
+      if (tab.value === "active") {
+        return [...g.withdrawal, ...g.updated, ...g.open, ...g.claimed];
+      }
+      if (tab.value === "closed") return [...g.done, ...g.invalid];
+      return S.tasks;
+    });
+    const counts = computed(() => ({
+      active: groups.value.withdrawal.length + groups.value.updated.length
+        + groups.value.open.length + groups.value.claimed.length,
+      closed: groups.value.done.length + groups.value.invalid.length,
+      all: S.tasks.length,
+    }));
+    async function reload() { await loadTasks(tab.value === "active" ? "all" : "all"); }
+    async function openHandover() {
+      try { handovers.value = await api("/api/handovers?limit=10"); }
+      catch (e) { handovers.value = []; }
+      openModal({ type: "handover", history: handovers.value });
+    }
+    return { S, tab, groups, visibleList, counts, reload, openHandover, openModal, TASK_STATUS_META };
+  },
+  template: `
+  <div class="tasks-wrap">
+    <div class="card">
+      <div class="toolbar">
+        <div class="tabs" style="border:none;margin:0">
+          <button class="tab" :class="{active:tab==='active'}" @click="tab='active'">未完成（{{ groups.withdrawal.length + groups.updated.length + groups.open.length + groups.claimed.length }}）</button>
+          <button class="tab" :class="{active:tab==='closed'}" @click="tab='closed'">已完成/失效（{{ groups.done.length + groups.invalid.length }}）</button>
+          <button class="tab" :class="{active:tab==='all'}" @click="tab='all'">全部</button>
+        </div>
+        <span class="spacer"></span>
+        <button class="btn" @click="reload">🔄 刷新对账</button>
+        <button class="btn btn-primary" @click="openHandover">🤝 交班给下一班</button>
+      </div>
+
+      <div v-if="tab==='active'" class="task-board">
+        <div v-if="groups.withdrawal.length" class="task-group safety">
+          <div class="group-head">🚫 休药安全警告 · {{ groups.withdrawal.length }}（不可完成、不可隐藏，到期自动解除）</div>
+          <task-card v-for="t in groups.withdrawal" :key="t.id" :t="t"></task-card>
+        </div>
+        <div v-if="groups.updated.length" class="task-group changed">
+          <div class="group-head">🔁 源记录已更新 · {{ groups.updated.length }}（请负责人确认后继续）</div>
+          <task-card v-for="t in groups.updated" :key="t.id" :t="t"></task-card>
+        </div>
+        <div class="task-group">
+          <div class="group-head">📥 待认领 · {{ groups.open.length }}</div>
+          <task-card v-for="t in groups.open" :key="t.id" :t="t"></task-card>
+          <div v-if="!groups.open.length && !groups.updated.length && !groups.withdrawal.length" class="empty">没有待认领事项</div>
+        </div>
+        <div class="task-group">
+          <div class="group-head">👤 处理中/已延期 · {{ groups.claimed.length }}</div>
+          <task-card v-for="t in groups.claimed" :key="t.id" :t="t"></task-card>
+          <div v-if="!groups.claimed.length" class="empty">暂无处理中事项</div>
+        </div>
+      </div>
+
+      <div v-else class="task-board">
+        <div v-if="tab==='closed'">
+          <div class="task-group">
+            <div class="group-head">✅ 已完成 · {{ groups.done.length }}</div>
+            <task-card v-for="t in groups.done" :key="t.id" :t="t"></task-card>
+          </div>
+          <div class="task-group">
+            <div class="group-head">⛓ 已失效（留痕）· {{ groups.invalid.length }}</div>
+            <task-card v-for="t in groups.invalid" :key="t.id" :t="t"></task-card>
+          </div>
+        </div>
+        <div v-else class="reminder-list">
+          <task-card v-for="t in visibleList" :key="t.id" :t="t"></task-card>
+        </div>
+        <div v-if="!visibleList.length" class="empty">暂无待办</div>
       </div>
     </div>
   </div>`,
@@ -579,8 +855,9 @@ const HealthPage = {
     async doneDose(m) {
       try {
         await api(`/api/medications/${m.id}`, { method: "PATCH", body: { treated: true } });
-        toast("已标记为执行，提醒将关闭");
+        toast("已标记为执行，对应续用药待办将在对账后办结");
         await loadMedsAll();
+        refreshDash();
       } catch (e) { toast(e.message, "error"); }
     },
     async removeHealth(h) {
@@ -1238,11 +1515,486 @@ const CowDetailModal = {
   </div></div>`,
 };
 
+/* ---------------- 弹窗：指派负责人 ---------------- */
+const AssignModal = {
+  setup() {
+    const m = topModal();
+    const t = m.task;
+    const name = ref(t.owner_name || S.currentPerson || "");
+    const newName = ref("");
+    const err = ref("");
+    const options = computed(() => S.persons.filter((p) => p.active));
+    async function submit(n) {
+      const who = (n || name.value || "").trim();
+      if (!who) { err.value = "请选择或填写负责人姓名"; return; }
+      const u = await quickAssign(t, who, t.version);
+      if (u) closeModal();
+    }
+    async function addAndAssign() {
+      err.value = "";
+      const n = newName.value.trim();
+      if (!n) { err.value = "请填写新负责人姓名"; return; }
+      try {
+        await api("/api/persons", { method: "POST", body: { name: n } });
+        await loadPersons();
+      } catch (e) {
+        if (String(e.message).includes("已存在")) { /* 忽略重名，继续指派 */ }
+        else { err.value = e.message; return; }
+      }
+      await submit(n);
+    }
+    return { t, name, newName, err, submit, addAndAssign, closeModal, options, S };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:460px">
+    <div class="modal-head"><h3>指派负责人</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box info">{{ t.title }}</div>
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field"><label>选择值班人员（免登录，姓名直接维护）</label>
+        <select class="input" v-model="name">
+          <option value="">— 请选择 —</option>
+          <option v-for="p in options" :key="p.id" :value="p.name">{{ p.name }}{{ p.role ? '（'+p.role+'）' : '' }}</option>
+        </select>
+      </div>
+      <button class="btn btn-primary" style="width:100%" @click="submit()">指派给所选人员</button>
+      <div class="field" style="margin-top:16px"><label>或直接填写新负责人姓名（自动加入名单）</label>
+        <input class="input" v-model="newName" placeholder="如 赵班长" @keyup.enter="addAndAssign"></div>
+      <button class="btn" style="width:100%" @click="addAndAssign">＋ 新建并指派</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：延期 ---------------- */
+const PostponeModal = {
+  setup() {
+    const m = topModal();
+    const t = m.task;
+    const f = reactive({ new_due_date: t.due_date || todayStr(), reason: "" });
+    const err = ref("");
+    async function submit() {
+      err.value = "";
+      if (!f.reason.trim()) { err.value = "请填写延期原因，交班时需要说明"; return; }
+      if (!requirePerson()) return;
+      try {
+        const u = await api(`/api/tasks/${t.id}/postpone`, {
+          method: "POST",
+          body: { ...f, actor: S.currentPerson, version: t.version },
+        });
+        mergeTaskIntoState(u);
+        toast("已记录延期原因与改期，待办将带到下一班");
+        await loadDashboard();
+        closeModal();
+      } catch (e) { e.code === 409 ? handleTaskConflict(e) : (err.value = e.message); }
+    }
+    return { t, f, err, submit, closeModal, S };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:460px">
+    <div class="modal-head"><h3>延期处理</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box info">{{ t.title }}<br><span style="color:#6b7280">原截止 {{ t.due_date }}</span></div>
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field"><label>改期至（可保持原日期，仅记录原因）</label>
+        <input type="date" class="input" v-model="f.new_due_date"></div>
+      <div class="field"><label>延期原因 <span class="req">*</span></label>
+        <textarea class="input" rows="3" v-model="f.reason"
+          placeholder="如：药品明日到货 / 牛只转群待观察 / 需等B超排期"></textarea></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="submit">确认延期</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：完成处理（含真实业务登记红线） ---------------- */
+const CompleteModal = {
+  setup() {
+    const m = topModal();
+    const t0 = m.task;
+    const t = ref(t0);
+    const f = reactive({ result_note: "", register_mode: "register" });
+    const preg = reactive({ result: "pregnant", result_date: todayStr(), note: "" });
+    const med = reactive({ note: "" });
+    const err = ref("");
+
+    async function submit() {
+      err.value = "";
+      if (!requirePerson()) return;
+      const body = { result_note: f.result_note, actor: S.currentPerson, version: t.value.version };
+      if (t.value.type === "medication_dose") {
+        if (f.register_mode === "register") {
+          body.register_action = { note: med.note };
+        } else {
+          err.value = "续用药必须先完成真实用药登记（与用药记录“已执行”一致），不能仅在待办上点完成。可先“暂不完成”，去用药管理登记。";
+          return;
+        }
+      } else if (t.value.type === "preg_check") {
+        if (f.register_mode === "register") {
+          body.register_action = { ...preg };
+        } else {
+          err.value = "孕检待办必须回填真实孕检结果，不能仅在待办上点完成。可先“暂不完成”，去发情与配种回填。";
+          return;
+        }
+      }
+      try {
+        const u = await api(`/api/tasks/${t.value.id}/complete`, { method: "POST", body });
+        mergeTaskIntoState(u);
+        toast(u.status === "done" ? "已完成并记录处理结果" : "孕检结果已登记，未孕事项转继续跟进");
+        if (u.status !== "done" && preg.result !== "pregnant") {
+          // 未孕：弹窗保持已无意义，关闭并刷新
+        }
+        await Promise.all([loadDashboard(), loadMedsAll(), loadEstrusesAll()]);
+        closeModal();
+      } catch (e) {
+        if (e.code === 409) handleTaskConflict(e);
+        else err.value = e.message;
+      }
+    }
+    return { t, f, preg, med, err, submit, closeModal, S };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:520px">
+    <div class="modal-head"><h3>完成处理</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box info">{{ t.title }}<br><span style="color:#6b7280">{{ t.detail }}</span></div>
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+
+      <!-- 续用药：必须真实登记 -->
+      <template v-if="t.type==='medication_dose'">
+        <div class="alert-box warn">
+          ⚠️ 完成本待办<strong>等同于确认已真实执行本次用药</strong>，系统将把对应用药记录标记为「已执行」。
+          若尚未用药，请关闭本弹窗，不能用待办完成代替用药登记。
+        </div>
+        <div class="field"><label>用药执行备注（选填）</label>
+          <input class="input" v-model="med.note" placeholder="如：第2针已肌注，牛只反应正常"></div>
+      </template>
+
+      <!-- 孕检：必须回填结果 -->
+      <template v-else-if="t.type==='preg_check'">
+        <div class="alert-box warn">
+          ⚠️ 请先完成真实孕检并回填结果（写入发情/配种记录）。仅点完成而不登记孕检结果将被拒绝。
+        </div>
+        <div class="field-row">
+          <div class="field"><label>孕检结果 <span class="req">*</span></label>
+            <select class="input" v-model="preg.result">
+              <option value="pregnant">已孕（事项办结）</option>
+              <option value="negative">未孕（登记后转长期空怀继续跟进）</option>
+              <option value="unknown">未确认（继续跟进）</option>
+            </select></div>
+          <div class="field"><label>孕检日期</label>
+            <input type="date" class="input" v-model="preg.result_date"></div>
+        </div>
+        <div class="field"><label>孕检备注</label><input class="input" v-model="preg.note" placeholder="如：直肠检查+ B超复核"></div>
+      </template>
+
+      <div class="field"><label>处理结果说明 <span class="req">*</span></label>
+        <textarea class="input" rows="3" v-model="f.result_note" :placeholder="
+          t.type==='medication_dose' ? '如：已按疗程完成续用药' :
+          t.type==='preg_check' ? '如：B超确认妊娠' : '记录实际处理情况，交班可见'"></textarea></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">暂不完成</button>
+      <button class="btn btn-primary" @click="submit">
+        {{ t.type==='medication_dose' ? '确认已用药并完成' : (t.type==='preg_check' ? '登记孕检结果' : '确认完成') }}
+      </button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：确认源记录已更新 ---------------- */
+const AckUpdateModal = {
+  setup() {
+    const m = topModal();
+    const err = ref("");
+    async function submit() {
+      if (!requirePerson()) return;
+      try {
+        const u = await api(`/api/tasks/${m.task.id}/acknowledge-update`, {
+          method: "POST", body: { actor: S.currentPerson, version: m.task.version },
+        });
+        mergeTaskIntoState(u);
+        toast("已确认更新，按最新内容继续处理");
+        await loadDashboard();
+        closeModal();
+      } catch (e) { e.code === 409 ? handleTaskConflict(e) : (err.value = e.message); }
+    }
+    return { m, err, submit, closeModal, S };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:480px">
+    <div class="modal-head"><h3>源记录已变更</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box warn">🔁 该待办的源记录被修改，待办已更新为最新内容，负责人与处理记录保留。</div>
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <p><b>{{ m.task.title }}</b></p>
+      <p style="color:#6b7280;margin-top:6px">{{ m.task.detail }}</p>
+      <p style="color:#6b7280;margin-top:6px;font-size:12.5px">截止 {{ m.task.due_date }}；负责人 {{ m.task.owner_name || '未认领' }}</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="submit">已知悉，按最新内容继续</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：并发认领冲突 ---------------- */
+const ConflictModal = {
+  setup() {
+    const m = topModal();
+    const t = computed(() => m.task);
+    return { m, t, closeModal, TASK_STATUS_META };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:460px">
+    <div class="modal-head"><h3>⚠️ 操作冲突</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger">{{ m.message }}</div>
+      <div class="kv-grid" style="grid-template-columns:1fr 1fr">
+        <div><div class="k">负责人</div><div class="v">{{ t.owner_name || '未认领' }}</div></div>
+        <div><div class="k">状态</div><div class="v">{{ TASK_STATUS_META[t.status]?.label || t.status }}</div></div>
+      </div>
+      <p style="color:#6b7280;font-size:12.5px">页面中的该待办已刷新为对方操作后的最新状态。如需接手，请与当前负责人协商后用「指派」转交。</p>
+    </div>
+    <div class="modal-foot"><button class="btn btn-primary" @click="closeModal">我知道了</button></div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：待办详情与操作流水 ---------------- */
+const TaskDetailModal = {
+  setup() {
+    const m = topModal();
+    const t = ref(null);
+    const err = ref("");
+    async function load() {
+      try { t.value = await api(`/api/tasks/${m.id}`); }
+      catch (e) { err.value = e.message; }
+    }
+    onMounted(load);
+    async function reopen() {
+      try {
+        const u = await api(`/api/tasks/${m.id}/reopen`, {
+          method: "POST", body: { actor: S.currentPerson }});
+        mergeTaskIntoState(u);
+        toast("已重新打开待办");
+        await loadDashboard();
+        t.value = u;
+      } catch (e) { toast(e.message, "error"); }
+    }
+    return { m, t, err, reopen, closeModal, TASK_STATUS_META, REMINDER_META };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:560px">
+    <div class="modal-head"><h3>待办详情与处理留痕</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body" v-if="t">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <h3 style="font-size:16px">{{ REMINDER_META[t.type]?.ico }} {{ t.title }}</h3>
+      <p style="color:#374151;margin:8px 0">{{ t.detail }}</p>
+      <div class="detail-meta" style="margin:10px 0">
+        <span class="badge" :class="TASK_STATUS_META[t.status]?.cls">{{ TASK_STATUS_META[t.status]?.label }}</span>
+        <span class="badge gray">负责人：{{ t.owner_name || '未认领' }}</span>
+        <span class="badge gray">截止 {{ t.due_date || '—' }}</span>
+        <span class="badge gray" v-if="t.carry_count>0">已续传 {{ t.carry_count }} 班</span>
+        <span class="badge red" v-if="t.register_required">须真实登记</span>
+      </div>
+      <p v-if="t.postpone_reason" style="font-size:13px;color:#92400e">延期原因：{{ t.postpone_reason }}</p>
+      <p v-if="t.result_note" style="font-size:13px;color:#2f6b3d">处理结果：{{ t.result_note }}</p>
+
+      <div class="card-title" style="margin-top:16px">📜 操作流水</div>
+      <ul class="event-list">
+        <li v-for="(e,i) in [...t.events].reverse()" :key="i">
+          <span class="ev-at">{{ e.at }}</span>
+          <span class="ev-name">{{ {created:'系统派单',claimed:'认领',assigned:'指派/交班',
+            postponed:'延期',done:'完成',acknowledged:'确认',updated:'内容更新',
+            invalid:'失效',reopened:'重新打开',carried:'跨班续传',registered:'真实登记'}[e.event] || e.event }}</span>
+          <span class="ev-actor" v-if="e.actor">{{ e.actor }}</span>
+          <span class="ev-detail">{{ e.detail }}</span>
+        </li>
+      </ul>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-danger" v-if="t && ['done','invalid'].includes(t.status) && t.type!=='withdrawal'"
+        @click="reopen">重新打开</button>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn" @click="closeModal">关闭</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：交班 ---------------- */
+const HandoverModal = {
+  setup() {
+    const m = topModal();
+    const toPerson = ref("");
+    const note = ref("");
+    const err = ref("");
+    const result = ref(null);
+    const newName = ref("");
+    async function addPerson() {
+      const n = newName.value.trim();
+      if (!n) return;
+      try { await api("/api/persons", { method: "POST", body: { name: n } }); await loadPersons(); }
+      catch (e) { if (!String(e.message).includes("已存在")) { err.value = e.message; return; } }
+      toPerson.value = n; newName.value = "";
+    }
+    async function submit() {
+      err.value = "";
+      if (!toPerson.value.trim()) { err.value = "请填写接班人"; return; }
+      try {
+        const h = await api("/api/handovers", {
+          method: "POST",
+          body: { actor: S.currentPerson, to_person: toPerson.value, note: note.value },
+        });
+        result.value = h;
+        await Promise.all([loadDashboard(), loadReminders()]);
+      } catch (e) { err.value = e.message; }
+    }
+    const activeTasks = computed(() => S.reminders);
+    return { m, toPerson, note, err, result, newName, addPerson, submit, closeModal, S, activeTasks };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal wide">
+    <div class="modal-head"><h3>🤝 交班给下一班（{{ S.shift?.label }}）</h3>
+      <button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+
+      <template v-if="!result">
+        <div class="alert-box info">
+          交班人：<b>{{ S.currentPerson || '（未选择值班人）' }}</b>。
+          下方 {{ activeTasks.length }} 条未完成事项将<strong>全部带到下一班</strong>，按稳定指纹续传、不重复派单；
+          休药安全警告始终包含在内。
+        </div>
+        <div class="field-row">
+          <div class="field"><label>接班人 <span class="req">*</span></label>
+            <input class="input" list="handover-persons" v-model="toPerson" placeholder="填写或选择接班人姓名">
+            <datalist id="handover-persons">
+              <option v-for="p in S.persons.filter(x=>x.active)" :key="p.id" :value="p.name"></option>
+            </datalist></div>
+          <div class="field"><label>新增人员（免登录直接建名）</label>
+            <div style="display:flex;gap:8px"><input class="input" v-model="newName" placeholder="新接班人姓名">
+              <button class="btn" @click="addPerson">加入</button></div></div>
+        </div>
+        <div class="field"><label>交班备注</label>
+          <textarea class="input" rows="2" v-model="note" placeholder="如：1610 乳房炎晚间需再测一次体温；1609 注意单独挤奶"></textarea></div>
+
+        <div class="card-title">📋 随班移交的未完成事项（{{ activeTasks.length }}）</div>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>事项</th><th>类型</th><th>负责人</th><th>截止</th><th>状态</th><th>续传</th></tr></thead>
+          <tbody>
+            <tr v-for="t in activeTasks" :key="t.id">
+              <td>{{ t.title }}</td>
+              <td>{{ t.type_label }}</td>
+              <td>{{ t.owner_name || '—' }}</td>
+              <td>{{ t.due_date }}</td>
+              <td>{{ {open:'待认领',claimed:'处理中',postponed:'已延期',changed:'待确认更新'}[t.status] || t.status }}</td>
+              <td><span v-if="t.carry_count" class="badge purple">第{{ t.carry_count+1 }}班</span><span v-else>本班</span></td>
+            </tr>
+          </tbody>
+        </table></div>
+      </template>
+
+      <template v-else>
+        <div class="alert-box info">✅ 交班单已生成，{{ result.open_count }} 条未完成事项已带到下一班并指派给
+          <b>{{ result.to_person }}</b>。</div>
+        <div class="card-title">最近交班记录</div>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>交班时间</th><th>班次</th><th>交班人</th><th>接班人</th><th class="num">移交事项</th><th>备注</th></tr></thead>
+          <tbody>
+            <tr v-for="h in m.history" :key="h.id">
+              <td>{{ h.created_at }}</td><td>{{ h.shift_label }}</td>
+              <td>{{ h.from_person || '—' }}</td><td><b>{{ h.to_person }}</b></td>
+              <td class="num">{{ h.open_count }}</td><td style="color:#6b7280">{{ h.note || '—' }}</td>
+            </tr>
+            <tr v-if="!m.history.length"><td colspan="6" class="empty">本次为首张交班单</td></tr>
+          </tbody>
+        </table></div>
+      </template>
+    </div>
+    <div class="modal-foot">
+      <template v-if="!result">
+        <button class="btn" @click="closeModal">取消</button>
+        <button class="btn btn-primary" @click="submit">确认交班</button>
+      </template>
+      <button v-else class="btn btn-primary" @click="closeModal">完成</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：值班人/名单维护 ---------------- */
+const PersonFormModal = {
+  setup() {
+    const m = topModal();
+    const name = ref(S.currentPerson || "");
+    const role = ref("");
+    const err = ref("");
+    async function submit() {
+      err.value = "";
+      const n = name.value.trim();
+      if (!n) { err.value = "请填写姓名"; return; }
+      try {
+        if (!S.persons.some((p) => p.name === n)) {
+          await api("/api/persons", { method: "POST", body: { name: n, role: role.value } });
+        }
+        await setCurrentPerson(n);
+        await loadPersons();
+        toast(`当前值班人：${n}`);
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    async function rename(p, ev) {
+      const n = ev.target.textContent.trim();
+      if (!n || n === p.name) { ev.target.textContent = p.name; return; }
+      try {
+        await api(`/api/persons/${p.id}`, { method: "PATCH", body: { name: n } });
+        await loadPersons();
+        if (S.currentPerson === p.name) await setCurrentPerson(n);
+        toast("已改名，其名下未完成待办已同步");
+      } catch (e) { toast(e.message, "error"); ev.target.textContent = p.name; }
+    }
+    async function toggle(p) {
+      await api(`/api/persons/${p.id}`, { method: "PATCH", body: { active: !p.active } });
+      await loadPersons();
+    }
+    return { S, name, role, err, submit, closeModal, rename, toggle };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:520px">
+    <div class="modal-head"><h3>值班人员（无需登录）</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="alert-box info">直接用姓名标识当前操作人，认领/指派/交班均以此留痕。</div>
+      <div class="field-row">
+        <div class="field"><label>当前值班人姓名</label><input class="input" v-model="name" placeholder="如 李兽医"></div>
+        <div class="field"><label>岗位（选填）</label><input class="input" v-model="role" placeholder="兽医/配种员/班长"></div>
+      </div>
+      <button class="btn btn-primary" @click="submit">设为当前值班人</button>
+
+      <div class="card-title" style="margin-top:18px">名单（点姓名可直接改名）</div>
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>姓名（点击改名）</th><th>岗位</th><th>状态</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="p in S.persons" :key="p.id">
+            <td><span class="link" contenteditable="true" @blur="rename(p,$event)">{{ p.name }}</span></td>
+            <td>{{ p.role || '—' }}</td>
+            <td><span class="badge" :class="p.active?'green':'gray'">{{ p.active?'在岗':'停用' }}</span></td>
+            <td><button class="link" @click="toggle(p)">{{ p.active?'停用':'启用' }}</button></td>
+          </tr>
+          <tr v-if="!S.persons.length"><td colspan="4" class="empty">还没有人员</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </div></div>`,
+};
+
 /* ---------------- 根组件 ---------------- */
 const App = {
-  components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage,
+  components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage, TasksPage,
     CowFormModal, MilkingFormModal, HealthFormModal, DrugFormModal,
-    MedFormModal, EstrusFormModal, CowDetailModal },
+    MedFormModal, EstrusFormModal, CowDetailModal,
+    AssignModal, PostponeModal, CompleteModal, AckUpdateModal, ConflictModal,
+    TaskDetailModal, HandoverModal, PersonFormModal },
   setup() {
     onMounted(async () => {
       try {
@@ -1252,17 +2004,30 @@ const App = {
           loadAnomalies(),
           loadCows(),
           loadDrugs(),
+          loadPersons(),
         ]);
       } catch (e) { toast(e.message, "error"); }
+      // 每 60 秒自动对账：别人的认领/指派、源记录变更会及时反映，且不会重复派单
+      setInterval(() => {
+        loadReminders().catch(() => {});
+        loadDashboard().catch(() => {});
+      }, 60000);
     });
     const nav = [
       { key: "dashboard", ico: "📊", label: "工作台" },
+      { key: "tasks", ico: "📋", label: "待办交班" },
       { key: "cows", ico: "🐄", label: "奶牛档案" },
       { key: "milkings", ico: "🥛", label: "挤奶记录" },
       { key: "health", ico: "🏥", label: "健康与用药" },
       { key: "repro", ico: "💕", label: "发情与配种" },
     ];
-    return { S, switchView, nav, topModal };
+    const activePersons = computed(() => S.persons.filter((p) => p.active));
+    function onPickPerson(ev) {
+      const v = ev.target.value;
+      if (v === "__manage__") { openModal({ type: "personForm" }); ev.target.value = S.currentPerson || ""; return; }
+      setCurrentPerson(v);
+    }
+    return { S, switchView, nav, topModal, activePersons, onPickPerson };
   },
   template: `
   <div class="layout">
@@ -1272,19 +2037,31 @@ const App = {
         <button v-for="n in nav" :key="n.key" class="nav-item"
                 :class="{active:S.view===n.key}" @click="switchView(n.key)">
           <span class="ico">{{ n.ico }}</span>{{ n.label }}
-          <span v-if="n.key==='dashboard' && S.dashboard && S.dashboard.reminder_count"
+          <span v-if="n.key==='tasks' && S.dashboard && S.dashboard.reminder_count"
                 class="nav-badge">{{ S.dashboard.reminder_count }}</span>
         </button>
       </nav>
-      <div class="sidebar-foot">Vue 3 · FastAPI · SQLite<br>内置 12 头样例牛群数据</div>
+      <div class="sidebar-foot">Vue 3 · FastAPI · SQLite<br>待办按指纹持久化，交班不丢单</div>
     </aside>
     <main class="main">
       <div class="topbar">
         <h1>{{ nav.find(n=>n.key===S.view)?.label }}</h1>
-        <div class="date">📅 {{ S.dashboard?.today || '' }} · 牧场管理系统</div>
+        <div class="topbar-right">
+          <span class="shift-chip" v-if="S.shift">🕘 {{ S.shift.label }}</span>
+          <span class="person-box">
+            👤
+            <select class="person-select" :value="S.currentPerson" @change="onPickPerson($event)">
+              <option value="">未选择值班人</option>
+              <option v-for="p in activePersons" :key="p.id" :value="p.name">{{ p.name }}{{ p.role ? '·'+p.role : '' }}</option>
+              <option value="__manage__">＋ 管理/新增人员…</option>
+            </select>
+          </span>
+          <div class="date">📅 {{ S.dashboard?.today || '' }}</div>
+        </div>
       </div>
       <div class="content">
         <dashboard v-if="S.view==='dashboard'"></dashboard>
+        <tasks-page v-else-if="S.view==='tasks'"></tasks-page>
         <cows-page v-else-if="S.view==='cows'"></cows-page>
         <milkings-page v-else-if="S.view==='milkings'"></milkings-page>
         <health-page v-else-if="S.view==='health'"></health-page>
@@ -1301,6 +2078,14 @@ const App = {
       <med-form-modal v-else-if="md.type==='medForm'"></med-form-modal>
       <estrus-form-modal v-else-if="md.type==='estrusForm'"></estrus-form-modal>
       <cow-detail-modal v-else-if="md.type==='cowDetail'"></cow-detail-modal>
+      <assign-modal v-else-if="md.type==='assign'"></assign-modal>
+      <postpone-modal v-else-if="md.type==='postpone'"></postpone-modal>
+      <complete-modal v-else-if="md.type==='complete'"></complete-modal>
+      <ack-update-modal v-else-if="md.type==='ackUpdate'"></ack-update-modal>
+      <conflict-modal v-else-if="md.type==='conflict'"></conflict-modal>
+      <task-detail-modal v-else-if="md.type==='taskDetail'"></task-detail-modal>
+      <handover-modal v-else-if="md.type==='handover'"></handover-modal>
+      <person-form-modal v-else-if="md.type==='personForm'"></person-form-modal>
     </template>
 
     <div class="toast-wrap">

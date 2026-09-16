@@ -1,6 +1,7 @@
 """业务规则：发情/配种/用药/健康提醒、休药期校验、奶量异常发现"""
+import hashlib
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
 
 from sqlalchemy import and_, exists, or_
@@ -12,6 +13,24 @@ SESSION_LABEL = {"morning": "早班", "noon": "午班", "evening": "晚班"}
 STATUS_LABEL = {
     "lactating": "泌乳中", "dry": "干奶", "pregnant": "待产", "sold": "已离场",
 }
+
+# 班次划分（与挤奶三班对齐）：早班 05–12、午班 12–17、晚班 17–次日05
+SHIFT_LABEL = {"morning": "早班", "noon": "午班", "evening": "晚班"}
+
+
+def current_shift(now: Optional[datetime] = None) -> dict:
+    """返回当前班次；晚班归属其开始日的日期，跨零点不变班"""
+    now = now or datetime.now()
+    h = now.hour
+    if 5 <= h < 12:
+        sess = "morning"
+    elif 12 <= h < 17:
+        sess = "noon"
+    else:
+        sess = "evening"
+    d = now.date()
+    return {"code": f"{d}#{sess}", "label": f"{d} {SHIFT_LABEL[sess]}",
+            "date": str(d), "session": sess}
 
 
 def withdrawal_violation_clause(on_column=None, cow_column=None):
@@ -71,10 +90,30 @@ def check_withdrawal(db: Session, cow_id: int, on_date: date) -> dict:
     }
 
 
+def _source_hash(*parts) -> str:
+    """源内容指纹：仅当提醒的业务字段变化时才变化，用于识别“更新”"""
+    raw = "|".join("" if p is None else str(p) for p in parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
-    """汇总全部提醒（发情、配种孕检、用药、健康复查、待产、长期空怀）"""
+    """
+    汇总全部提醒（发情、配种孕检、用药、健康复查、待产、长期空怀）。
+    每条提醒附带稳定身份：
+      - dedup_key：同一业务事项的稳定指纹（可跨阶段、跨天、跨重启保持不变），
+                   持久化待办据此去重，刷新/重启绝不重复派单；
+      - ref_type/ref_id：指向源记录，供源记录变更/删除时核对；
+      - source_hash：当前源内容哈希，变化即“已更新”。
+    """
     today = today or date.today()
     out: List[dict] = []
+
+    def add(r: dict, *, ref_type: str, ref_id: int, key: str, sig: tuple):
+        r["ref_type"] = ref_type
+        r["ref_id"] = ref_id
+        r["dedup_key"] = key
+        r["source_hash"] = _source_hash(*sig)
+        out.append(r)
 
     # 1) 发情未配种：发情后 24~48 小时为最佳配种窗口，提醒保留 2 天
     for e in (
@@ -88,7 +127,7 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             continue
         if 0 <= (today - e.date).days <= 2:
             urgent = (today - e.date).days == 0
-            out.append({
+            add({
                 "type": "estrus",
                 "level": "danger" if urgent else "warning",
                 "cow_id": cow.id,
@@ -99,9 +138,12 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                           f"请于发情后 12 小时内适时输精",
                 "due_date": str(e.date + timedelta(days=1)),
                 "days_overdue": max(0, (today - e.date - timedelta(days=1)).days),
-            })
+            }, ref_type="estrus", ref_id=e.id, key=f"estrus:{e.id}",
+               sig=("estrus", e.date, e.detection, e.score, e.inseminated,
+                    e.insemination_date, e.result, cow.ear_tag, cow.name))
 
-    # 2) 配种后孕检 / 返情
+    # 2) 配种后孕检 / 返情（同一配种记录在不同阶段可能变换提醒类型，
+    #    dedup_key 不含 type，身份保持连续；source_hash 含 type，阶段跃迁标记“已更新”）
     seen_cows: set = set()
     for e in (
         db.query(models.EstrusRecord)
@@ -121,9 +163,11 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
         days = (today - insem).days
         if days < 18:
             continue
+        repro_sig = ("repro", e.date, e.detection, e.inseminated, e.insemination_date,
+                     e.semen, e.result, e.result_date, cow.ear_tag, cow.name)
         # 18~24天：返情观察；35~45天：孕检；超过60天无结果：长期未确认
         if 18 <= days <= 24 and e.result in ("pending", None):
-            out.append({
+            add({
                 "type": "return_estrus",
                 "level": "warning",
                 "cow_id": cow.id,
@@ -133,10 +177,11 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                           f"注意观察是否返情，必要时复配",
                 "due_date": str(insem + timedelta(days=24)),
                 "days_overdue": 0,
-            })
+            }, ref_type="estrus", ref_id=e.id, key=f"repro:{e.id}",
+               sig=(*repro_sig, "return_estrus", days))
         elif 25 <= days <= 60 and e.result in ("pending", None):
             overdue = max(0, days - 42)
-            out.append({
+            add({
                 "type": "preg_check",
                 "level": "danger" if overdue else "warning",
                 "cow_id": cow.id,
@@ -145,9 +190,10 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                 "detail": f"配种已 {days} 天，建议尽快做直肠/B超孕检并回填结果",
                 "due_date": str(insem + timedelta(days=42)),
                 "days_overdue": overdue,
-            })
+            }, ref_type="estrus", ref_id=e.id, key=f"repro:{e.id}",
+               sig=(*repro_sig, "preg_check", days))
         elif days > 60 and e.result in ("pending", None, "negative"):
-            out.append({
+            add({
                 "type": "open_cow",
                 "level": "danger",
                 "cow_id": cow.id,
@@ -157,7 +203,8 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                           f"安排同期发情或淘汰评估",
                 "due_date": str(insem + timedelta(days=60)),
                 "days_overdue": days - 60,
-            })
+            }, ref_type="estrus", ref_id=e.id, key=f"repro:{e.id}",
+               sig=(*repro_sig, "open_cow", days))
 
     # 3) 用药提醒：下次用药 / 休药期进行中
     for m in db.query(models.Medication).all():
@@ -167,7 +214,7 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
         if m.next_dose_date and not m.treated:
             delta = (m.next_dose_date - today).days
             if -3 <= delta <= 3:
-                out.append({
+                add({
                     "type": "medication_dose",
                     "level": "danger" if delta <= 0 else "warning",
                     "cow_id": cow.id,
@@ -177,10 +224,12 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                               f"{m.next_dose_date}，{m.reason or ''}",
                     "due_date": str(m.next_dose_date),
                     "days_overdue": max(0, -delta),
-                })
+                }, ref_type="medication", ref_id=m.id, key=f"meddose:{m.id}",
+                   sig=("meddose", m.drug_name, m.dose, m.next_dose_date,
+                        m.treated, m.reason, cow.ear_tag, cow.name))
         if m.withdrawal_days > 0 and m.date <= today <= m.withdrawal_end:
             left = (m.withdrawal_end - today).days
-            out.append({
+            add({
                 "type": "withdrawal",
                 "level": "danger" if left == 0 else "warning",
                 "cow_id": cow.id,
@@ -190,7 +239,9 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                           f"（剩余 {left + 1} 个挤奶日），该牛牛奶不可混入大罐",
                 "due_date": str(m.withdrawal_end + timedelta(days=1)),
                 "days_overdue": 0,
-            })
+            }, ref_type="medication", ref_id=m.id, key=f"withdrawal:{m.id}",
+               sig=("withdrawal", m.drug_name, m.date, m.withdrawal_days,
+                    m.withdrawal_end, cow.ear_tag, cow.name))
 
     # 4) 健康复查（result 为 NULL 的“未结案”记录也必须纳入，
     #    注意 SQL 三值逻辑：NULL != 'recovered' 结果为 NULL 会被 WHERE 过滤掉）
@@ -208,7 +259,7 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             continue
         delta = (h.follow_up_date - today).days
         if -7 <= delta <= 3:
-            out.append({
+            add({
                 "type": "health_followup",
                 "level": "danger" if delta < 0 else "warning",
                 "cow_id": cow.id,
@@ -218,7 +269,9 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                           f"{h.follow_up_date}，当前状态 {_result_label(h.result)}",
                 "due_date": str(h.follow_up_date),
                 "days_overdue": max(0, -delta),
-            })
+            }, ref_type="health", ref_id=h.id, key=f"health:{h.id}",
+               sig=("health", h.diagnosis, h.follow_up_date, h.result,
+                    h.severity, cow.ear_tag, cow.name))
 
     # 5) 待产 / 预产临近（7 天内）
     for cow in db.query(models.Cow).filter(models.Cow.expected_calving_date.isnot(None)).all():
@@ -226,7 +279,7 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             continue
         delta = (cow.expected_calving_date - today).days
         if -3 <= delta <= 10:
-            out.append({
+            add({
                 "type": "calving",
                 "level": "danger" if delta <= 2 else "info",
                 "cow_id": cow.id,
@@ -236,7 +289,9 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                           f" {abs(delta)} 天），做好产房与接产准备",
                 "due_date": str(cow.expected_calving_date),
                 "days_overdue": max(0, -delta),
-            })
+            }, ref_type="cow", ref_id=cow.id, key=f"calving:{cow.id}",
+               sig=("calving", cow.expected_calving_date, cow.status,
+                    cow.ear_tag, cow.name))
 
     # 6) 产后首配窗口（产后 45~70 天未配种）
     for cow in db.query(models.Cow).filter(models.Cow.calving_date.isnot(None)).all():
@@ -256,7 +311,7 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             continue
         if insem and insem.insemination_date and insem.insemination_date >= cow.calving_date:
             continue
-        out.append({
+        add({
             "type": "first_insemination",
             "level": "info" if dim < 55 else "warning",
             "cow_id": cow.id,
@@ -265,7 +320,9 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             "detail": f"产后已 {dim} 天，建议加强发情监测并安排首次配种",
             "due_date": str(cow.calving_date + timedelta(days=60)),
             "days_overdue": max(0, dim - 60),
-        })
+        }, ref_type="cow", ref_id=cow.id, key=f"firstinsem:{cow.id}",
+           sig=("firstinsem", cow.calving_date, cow.status,
+                cow.ear_tag, cow.name, dim))
 
     level_rank = {"danger": 0, "warning": 1, "info": 2}
     out.sort(key=lambda r: (level_rank.get(r["level"], 9), r.get("days_overdue", 0) * -1))

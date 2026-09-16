@@ -16,6 +16,19 @@ from sqlalchemy.orm import relationship
 
 from .database import Base
 
+# 待办任务生命周期状态
+TASK_STATUS_OPEN = "open"          # 待处理（未认领）
+TASK_STATUS_CLAIMED = "claimed"    # 已认领/指派，处理中
+TASK_STATUS_POSTPONED = "postponed"  # 已延期，等待改期后的日期
+TASK_STATUS_DONE = "done"          # 已处理完成
+TASK_STATUS_INVALID = "invalid"    # 源记录已失效/删除（留痕，不再提醒）
+TASK_STATUS_CHANGED = "changed"    # 源记录发生变更，内容已更新待确认
+# 待办相对源记录的状态（对账时计算）
+SOURCE_STATE_ACTIVE = "active"
+SOURCE_STATE_UPDATED = "updated"
+SOURCE_STATE_INVALID = "invalid"
+SOURCE_STATE_REGISTERED = "registered"  # 已在业务模块完成真实登记
+
 
 class Cow(Base):
     """奶牛档案"""
@@ -146,3 +159,97 @@ class EstrusRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     cow = relationship("Cow", back_populates="estruses")
+
+
+class Person(Base):
+    """值班人员名单（无登录，直接维护姓名即可）"""
+
+    __tablename__ = "persons"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(32), unique=True, nullable=False)
+    role = Column(String(32), nullable=True, comment="岗位，如 兽医/配种员/挤奶工/班长")
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ReminderTask(Base):
+    """
+    提醒待办（持久化派工单）。
+    dedup_key 为提醒引擎对同一业务事项算出的稳定指纹：
+    刷新/重启只做“对账”，同指纹绝不重复建单，负责人、延期与处理记录随之保留。
+    """
+
+    __tablename__ = "reminder_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    dedup_key = Column(String(96), unique=True, nullable=False, index=True)
+    type = Column(String(32), nullable=False, comment="提醒类型，同 services 的 reminder type")
+    cow_id = Column(Integer, ForeignKey("cows.id", ondelete="SET NULL"), nullable=True, index=True)
+    ref_type = Column(String(24), nullable=True, comment="estrus/medication/health/cow")
+    ref_id = Column(Integer, nullable=True, comment="源记录主键")
+    title = Column(String(160), nullable=False)
+    detail = Column(String(512), nullable=True)
+    level = Column(String(8), nullable=False, default="warning")
+    due_date = Column(Date, nullable=True, index=True)
+    source_hash = Column(String(64), nullable=True, comment="源内容指纹，变化则标记已更新")
+
+    status = Column(String(16), nullable=False, default=TASK_STATUS_OPEN, index=True)
+    source_state = Column(String(16), nullable=False, default=SOURCE_STATE_ACTIVE,
+                          comment="active/updated/invalid/registered")
+    owner_id = Column(Integer, ForeignKey("persons.id"), nullable=True, index=True)
+    owner_name = Column(String(32), nullable=True, comment="负责人姓名快照，人员改名也不丢历史")
+    postpone_reason = Column(String(256), nullable=True)
+    result_note = Column(String(512), nullable=True, comment="处理结果")
+    registered = Column(Boolean, default=False,
+                        comment="真实业务登记是否已完成（用药执行/孕检结果回填等）")
+
+    shift_code = Column(String(16), nullable=False, index=True, comment="首次派单班次 YYYY-MM-DD#序号")
+    shift_label = Column(String(16), nullable=False)
+    carry_count = Column(Integer, default=0, comment="跨班续传次数")
+    version = Column(Integer, nullable=False, default=1, comment="乐观锁版本，防并发认领覆盖")
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    claimed_at = Column(DateTime, nullable=True)
+    postponed_at = Column(DateTime, nullable=True)
+    done_at = Column(DateTime, nullable=True)
+    closed_at = Column(DateTime, nullable=True, comment="失效/结案时间")
+    last_seen_at = Column(DateTime, default=datetime.utcnow, comment="对账时最近一次仍在提醒中")
+
+    owner = relationship("Person")
+    events = relationship("TaskEvent", back_populates="task",
+                          cascade="all, delete-orphan", order_by="TaskEvent.id")
+
+
+class TaskEvent(Base):
+    """待办操作流水：认领/指派/延期/完成/失效全部留痕，供交班与追溯"""
+
+    __tablename__ = "task_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("reminder_tasks.id", ondelete="CASCADE"), index=True)
+    event = Column(String(24), nullable=False,
+                   comment="created/claimed/assigned/postponed/done/acknowledged/"
+                           "updated/invalid/reopened/carried")
+    actor = Column(String(32), nullable=True, comment="操作人姓名")
+    detail = Column(String(512), nullable=True)
+    shift_code = Column(String(16), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    task = relationship("ReminderTask", back_populates="events")
+
+
+class Handover(Base):
+    """交班单：一个班次一次，记录交给谁及当时未完成事项快照"""
+
+    __tablename__ = "handovers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    shift_code = Column(String(16), nullable=False, index=True, comment="交出班次")
+    shift_label = Column(String(16), nullable=False)
+    from_person = Column(String(32), nullable=True, comment="交班人")
+    to_person = Column(String(32), nullable=True, comment="接班人")
+    note = Column(String(512), nullable=True, comment="交班备注")
+    open_count = Column(Integer, default=0, comment="未完成事项数（带到下一班）")
+    items_json = Column(Text, nullable=True, comment="未完成事项快照 JSON")
+    created_at = Column(DateTime, default=datetime.utcnow)
