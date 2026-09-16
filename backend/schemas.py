@@ -212,3 +212,36 @@ class EstrusOut(EstrusCreate):
 
     class Config:
         from_attributes = True
+
+
+# ---------- 奶量异常调查 ----------
+class CaseUpdate(BaseModel):
+    finding: Optional[str] = None
+    follow_up_date: Optional[date] = None
+
+
+class CaseRecheck(BaseModel):
+    eval_date: Optional[date] = None
+    result: str = Field(..., pattern="^(normal|abnormal|observed)$",
+                        description="normal 复查正常 / abnormal 仍异常 / observed 继续观察")
+    level: Optional[str] = Field(None, pattern="^(danger|warning|info|ok)$")
+    note: Optional[str] = None
+    operator: Optional[str] = None
+    follow_up_date: Optional[date] = None
+
+
+class CaseClose(BaseModel):
+    outcome: str = Field(..., pattern="^(resolved|false_positive)$",
+                         description="resolved 确认恢复 / false_positive 误报")
+    false_reason: Optional[str] = Field(None, max_length=255, description="误报原因")
+    close_note: Optional[str] = None
+    operator: Optional[str] = None
+
+
+class CaseReopen(BaseModel):
+    note: Optional[str] = None
+    follow_up_date: Optional[date] = None
+
+
+class HealthLink(BaseModel):
+    health_id: int

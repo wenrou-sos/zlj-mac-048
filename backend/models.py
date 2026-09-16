@@ -45,6 +45,7 @@ class Cow(Base):
     health_records = relationship("HealthRecord", back_populates="cow", cascade="all, delete-orphan")
     medications = relationship("Medication", back_populates="cow", cascade="all, delete-orphan")
     estruses = relationship("EstrusRecord", back_populates="cow", cascade="all, delete-orphan")
+    anomaly_cases = relationship("AnomalyCase", back_populates="cow", cascade="all, delete-orphan")
 
 
 class MilkingRecord(Base):
@@ -146,3 +147,79 @@ class EstrusRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     cow = relationship("Cow", back_populates="estruses")
+
+
+class AnomalyCase(Base):
+    """奶量异常调查单：同一头牛一次连续异常归为一单，恢复后再次异常另开新单并指向上一单"""
+
+    __tablename__ = "anomaly_cases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    cow_id = Column(Integer, ForeignKey("cows.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(
+        String(16), nullable=False, default="open", index=True,
+        comment="open 调查中 / resolved 已恢复关闭 / false_positive 误报关闭 / reopened 重开续跟",
+    )
+    detected_on = Column(Date, nullable=False, index=True, comment="首次发现日期（取首个命中日）")
+    first_tags = Column(String(128), nullable=True, comment="发现时异常类型快照，逗号分隔")
+    first_level = Column(String(8), nullable=False, default="info", comment="发现时风险等级")
+    latest_level = Column(String(8), nullable=False, default="info", comment="最近一次评估风险等级")
+    latest_tags = Column(String(128), nullable=True, comment="最近一次评估异常类型，逗号分隔")
+    latest_evidence_date = Column(Date, nullable=True, index=True, comment="最近一次命中/评估日期")
+    first_snapshot = Column(Text, nullable=True, comment="发现时证据快照（JSON 冻结，不随后续补改变化）")
+    finding = Column(Text, nullable=True, comment="排查结论/调查说明")
+    false_reason = Column(Text, nullable=True, comment="误报原因（status=false_positive 时必填）")
+    follow_up_date = Column(Date, nullable=True, index=True, comment="计划复查日")
+    closed_at = Column(Date, nullable=True)
+    close_note = Column(Text, nullable=True, comment="关闭时备注")
+    parent_case_id = Column(
+        Integer, ForeignKey("anomaly_cases.id", ondelete="SET NULL"),
+        nullable=True, index=True, comment="恢复后再次异常时，上一单ID",
+    )
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    cow = relationship("Cow", back_populates="anomaly_cases")
+    evidence = relationship(
+        "AnomalyEvidence", back_populates="case",
+        cascade="all, delete-orphan", order_by="AnomalyEvidence.id.desc()",
+    )
+    health_links = relationship(
+        "CaseHealthLink", back_populates="case", cascade="all, delete-orphan",
+    )
+
+
+class AnomalyEvidence(Base):
+    """调查证据：发现 / 跟踪 / 复查 / 关闭节点的奶量与体细胞证据快照（只追加，不修改）"""
+
+    __tablename__ = "anomaly_evidence"
+
+    id = Column(Integer, primary_key=True, index=True)
+    case_id = Column(Integer, ForeignKey("anomaly_cases.id", ondelete="CASCADE"), nullable=False, index=True)
+    kind = Column(
+        String(16), nullable=False, default="detect",
+        comment="detect 发现 / followup 系统跟踪 / recheck 人工复查 / close 关闭 / reopen 重开",
+    )
+    eval_date = Column(Date, nullable=False, index=True, comment="评估日期")
+    level = Column(String(8), nullable=True, comment="danger/warning/info/ok（ok=复查正常）")
+    tags = Column(String(128), nullable=True)
+    signature = Column(String(64), nullable=True, comment="信号指纹，相同判断不重复追加")
+    snapshot = Column(Text, nullable=True, comment="当时奶量/SCC/基线/命中记录的 JSON 快照")
+    note = Column(Text, nullable=True, comment="复查意见/说明")
+    operator = Column(String(32), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    case = relationship("AnomalyCase", back_populates="evidence")
+
+
+class CaseHealthLink(Base):
+    """调查单与已有健康记录的关联（多对多，手动关联；删健康记录时关联自动解除）"""
+
+    __tablename__ = "case_health_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    case_id = Column(Integer, ForeignKey("anomaly_cases.id", ondelete="CASCADE"), nullable=False, index=True)
+    health_id = Column(Integer, ForeignKey("health_records.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    case = relationship("AnomalyCase", back_populates="health_links")
+    health = relationship("HealthRecord")

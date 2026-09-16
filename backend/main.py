@@ -1,4 +1,6 @@
 """FastAPI 入口：牧场管理系统 API"""
+import json
+import logging
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
@@ -7,11 +9,14 @@ from typing import List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import case as sql_case
 from sqlalchemy.orm import Session
 
 from . import models, schemas, services
 from .database import Base, engine, get_db
 from .seed import init_db
+
+logger = logging.getLogger("dairy.anomaly")
 
 Base.metadata.create_all(bind=engine)
 init_db()
@@ -27,6 +32,16 @@ app.add_middleware(
 
 VALID_STATUS = {"lactating", "dry", "pregnant", "sold"}
 SESSION_LABEL = {"morning": "早班", "noon": "午班", "evening": "晚班"}
+
+
+def case_status_order(column):
+    """调查单排序：调查中/重开续跟 → 已恢复关闭 → 误报关闭"""
+    return sql_case(
+        (column.in_(("open", "reopened")), 0),
+        (column == "resolved", 1),
+        (column == "false_positive", 2),
+        else_=9,
+    )
 
 
 # ---------------- 序列化 ----------------
@@ -151,6 +166,10 @@ def cow_detail(cow_id: int, db: Session) -> dict:
         db.query(models.EstrusRecord).filter_by(cow_id=cow_id)
         .order_by(models.EstrusRecord.date.desc()).limit(20).all()
     )
+    anomaly_cases = (
+        db.query(models.AnomalyCase).filter_by(cow_id=cow_id)
+        .order_by(models.AnomalyCase.id.desc()).limit(10).all()
+    )
     wd = services.check_withdrawal(db, cow_id, today)
     # 近7天每日产奶量（含废弃标记）
     trend = []
@@ -192,6 +211,7 @@ def cow_detail(cow_id: int, db: Session) -> dict:
             "semen": e.semen, "technician": e.technician, "result": e.result,
             "result_date": str(e.result_date) if e.result_date else None, "note": e.note,
         } for e in estruses],
+        "anomaly_cases": [services.case_to_dict(db, c) for c in anomaly_cases],
         "yield_trend": trend,
     }
 
@@ -324,6 +344,11 @@ def create_milking(payload: schemas.MilkingCreate, db: Session = Depends(get_db)
     db.add(rec)
     db.commit()
     db.refresh(rec)
+    # 新奶量数据进入：立即对账异常调查单（可能触发开单/跟踪/消退证据）
+    try:
+        services.reconcile_anomaly_cases(db, source="milk_change")
+    except Exception:
+        logger.exception("挤奶登记后异常调查对账失败（不影响挤奶数据）")
     result = milking_to_dict(rec, db)
     result["warnings"] = warnings
     return result
@@ -339,6 +364,11 @@ def update_milking(rec_id: int, payload: schemas.MilkingUpdate, db: Session = De
         setattr(rec, k, v)
     db.commit()
     db.refresh(rec)
+    # 补改历史奶量：重新判断并以新证据记录，旧证据快照保持不变
+    try:
+        services.reconcile_anomaly_cases(db, source="milk_change")
+    except Exception:
+        logger.exception("补改挤奶记录后异常调查对账失败（不影响挤奶数据）")
     return milking_to_dict(rec, db)
 
 
@@ -349,6 +379,11 @@ def delete_milking(rec_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "未找到该记录")
     db.delete(rec)
     db.commit()
+    # 删除同样属于“补改”，重新对账（只追加新判断，不抹旧证据）
+    try:
+        services.reconcile_anomaly_cases(db, source="milk_change")
+    except Exception:
+        logger.exception("删除挤奶记录后异常调查对账失败（不影响挤奶数据）")
 
 
 # ---------------- 健康记录 ----------------
@@ -398,6 +433,8 @@ def delete_health(rec_id: int, db: Session = Depends(get_db)):
     h = db.get(models.HealthRecord, rec_id)
     if not h:
         raise HTTPException(404, "未找到该记录")
+    # 显式解除调查单关联（SQLite 默认不强制外键级联，避免悬挂关联）
+    db.query(models.CaseHealthLink).filter_by(health_id=rec_id).delete()
     db.delete(h)
     db.commit()
 
@@ -561,6 +598,254 @@ def get_anomalies(days: int = Query(7, ge=1, le=30), db: Session = Depends(get_d
     return services.detect_yield_anomalies(db, days=days)
 
 
+# ---------------- 奶量异常调查单 ----------------
+def _get_case_or_404(db: Session, case_id: int) -> models.AnomalyCase:
+    case = db.get(models.AnomalyCase, case_id)
+    if not case:
+        raise HTTPException(404, "未找到该调查单")
+    return case
+
+
+@app.get("/api/anomaly-cases")
+def list_anomaly_cases(
+    status: Optional[str] = None,
+    cow_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    """异常调查单列表；先例行对账（发现新异常/跟踪变严重），保证状态最新"""
+    services.reconcile_anomaly_cases(db)
+    query = db.query(models.AnomalyCase)
+    if status == "open":
+        query = query.filter(models.AnomalyCase.status.in_(services.OPEN_STATUSES))
+    elif status in services.CLOSED_STATUSES:
+        query = query.filter(models.AnomalyCase.status == status)
+    elif status:
+        raise HTTPException(400, "非法状态筛选")
+    if cow_id:
+        query = query.filter_by(cow_id=cow_id)
+    rows = query.order_by(
+        # 进行中（open/reopened）排在已关闭之前
+        case_status_order(models.AnomalyCase.status),
+        models.AnomalyCase.latest_evidence_date.desc(),
+        models.AnomalyCase.id.desc(),
+    ).all()
+    return [services.case_to_dict(db, c) for c in rows]
+
+
+@app.get("/api/anomaly-cases/{case_id}")
+def get_anomaly_case(case_id: int, db: Session = Depends(get_db)):
+    case = _get_case_or_404(db, case_id)
+    out = services.case_to_dict(db, case, detail=True)
+    # 详情页同时给出当前最新判断（基于最新挤奶数据实时计算，供与冻结证据对照）
+    cur = {
+        a["cow_id"]: a for a in services.detect_yield_anomalies(db, days=7)
+    }.get(case.cow_id)
+    out["current"] = cur
+    return out
+
+
+@app.post("/api/anomaly-cases", status_code=201)
+def create_anomaly_case(payload: dict, db: Session = Depends(get_db)):
+    """手动开单（如外部检查发现、系统窗口之外的异常）"""
+    cow_id = payload.get("cow_id")
+    cow = db.get(models.Cow, cow_id) if cow_id else None
+    if not cow:
+        raise HTTPException(404, "未找到该牛")
+    existing = (
+        db.query(models.AnomalyCase)
+        .filter_by(cow_id=cow_id)
+        .filter(models.AnomalyCase.status.in_(services.OPEN_STATUSES))
+        .first()
+    )
+    if existing:
+        raise HTTPException(409, f"该牛已有进行中的调查单 #{existing.id}，请直接跟踪处理")
+    today = date.today()
+    cur = {a["cow_id"]: a for a in services.detect_yield_anomalies(db, days=7)}.get(cow_id)
+    if cur:
+        case = services._create_case(db, cow_id, cur, today)
+    else:
+        note = payload.get("note") or "人工开单（当前窗口内未触发自动检测）"
+        level = payload.get("level") if payload.get("level") in ("danger", "warning", "info") else "info"
+        tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
+        tags = [t for t in tags if t in services.TAG_LABELS]
+        case = models.AnomalyCase(
+            cow_id=cow_id, status="open", detected_on=today,
+            first_level=level, first_tags=",".join(tags),
+            latest_level=level, latest_tags=",".join(tags),
+            latest_evidence_date=today,
+        )
+        db.add(case)
+        db.flush()
+        db.add(models.AnomalyEvidence(
+            case_id=case.id, kind="detect", eval_date=today, level=level,
+            tags=",".join(tags), note=note, operator=payload.get("operator"),
+            snapshot=json.dumps({"manual": True}, ensure_ascii=False),
+        ))
+        services._auto_link_health(db, case, today)
+    db.commit()
+    db.refresh(case)
+    return services.case_to_dict(db, case, detail=True)
+
+
+@app.patch("/api/anomaly-cases/{case_id}")
+def update_anomaly_case(case_id: int, payload: schemas.CaseUpdate, db: Session = Depends(get_db)):
+    case = _get_case_or_404(db, case_id)
+    data = payload.model_dump(exclude_unset=True)
+    if "follow_up_date" in data and data["follow_up_date"] is not None \
+            and data["follow_up_date"] < case.detected_on:
+        raise HTTPException(400, "复查日期不能早于发现日期")
+    for k, v in data.items():
+        setattr(case, k, v)
+    db.commit()
+    db.refresh(case)
+    return services.case_to_dict(db, case)
+
+
+@app.post("/api/anomaly-cases/{case_id}/recheck")
+def recheck_anomaly_case(case_id: int, payload: schemas.CaseRecheck,
+                         db: Session = Depends(get_db)):
+    """人工复查：记录复查结论（正常/仍异常/继续观察），这是关闭前必须留下的依据"""
+    case = _get_case_or_404(db, case_id)
+    if case.status not in services.OPEN_STATUSES:
+        raise HTTPException(400, "调查单已关闭，如需继续跟踪请先重开")
+    eval_date = payload.eval_date or date.today()
+    if payload.result == "normal":
+        level = "ok"
+    elif payload.level:
+        level = payload.level
+    else:
+        level = case.latest_level if case.latest_level != "ok" else "info"
+    tags = case.latest_tags if payload.result == "abnormal" else None
+    cur = {a["cow_id"]: a for a in services.detect_yield_anomalies(db, days=7)}.get(case.cow_id)
+    snapshot = None
+    if payload.result == "abnormal" and cur:
+        snapshot = json.dumps(cur, ensure_ascii=False)
+    result_notes = {"normal": "复查结果：已恢复正常", "abnormal": "复查结果：异常仍存在",
+                    "observed": "复查结果：继续观察"}
+    case.latest_level = level
+    case.latest_tags = tags
+    case.latest_evidence_date = eval_date
+    if payload.follow_up_date:
+        case.follow_up_date = payload.follow_up_date
+    db.add(models.AnomalyEvidence(
+        case_id=case.id, kind="recheck", eval_date=eval_date, level=level,
+        tags=tags, snapshot=snapshot,
+        note=result_notes[payload.result] + ("——" + payload.note if payload.note else ""),
+        operator=payload.operator,
+    ))
+    db.commit()
+    db.refresh(case)
+    return services.case_to_dict(db, case, detail=True)
+
+
+@app.post("/api/anomaly-cases/{case_id}/close")
+def close_anomaly_case(case_id: int, payload: schemas.CaseClose, db: Session = Depends(get_db)):
+    """关闭调查：必须先有人工复查记录；误报必须注明原因"""
+    case = _get_case_or_404(db, case_id)
+    if case.status not in services.OPEN_STATUSES:
+        raise HTTPException(400, "调查单已关闭")
+    has_manual = (
+        db.query(models.AnomalyEvidence)
+        .filter_by(case_id=case.id, kind="recheck")
+        .count()
+    )
+    if not has_manual:
+        raise HTTPException(400, "请先提交一次人工复查，再关闭调查单")
+    reason = (payload.false_reason or "").strip()
+    if payload.outcome == "false_positive" and not reason:
+        raise HTTPException(400, "判定为误报时必须注明误报原因")
+    today = date.today()
+    case.status = payload.outcome
+    case.false_reason = reason or None
+    case.close_note = payload.close_note
+    case.closed_at = today
+    case.latest_level = "ok"
+    case.latest_tags = None
+    case.latest_evidence_date = today
+    label = "确认恢复，结案" if payload.outcome == "resolved" else "判定为误报，结案"
+    db.add(models.AnomalyEvidence(
+        case_id=case.id, kind="close", eval_date=today, level="ok",
+        note=label + (f"：{payload.close_note}" if payload.close_note else "")
+             + (f"；误报原因：{reason}" if reason else ""),
+        operator=payload.operator,
+    ))
+    db.commit()
+    db.refresh(case)
+    return services.case_to_dict(db, case, detail=True)
+
+
+@app.post("/api/anomaly-cases/{case_id}/reopen")
+def reopen_anomaly_case(case_id: int, payload: schemas.CaseReopen,
+                        db: Session = Depends(get_db)):
+    """误关/关早了：重开原单继续跟踪（区别于恢复后新异常另开新单）"""
+    case = _get_case_or_404(db, case_id)
+    if case.status in services.OPEN_STATUSES:
+        raise HTTPException(400, "调查单进行中，无需重开")
+    today = date.today()
+    case.status = "reopened"
+    case.closed_at = None
+    case.close_note = None
+    case.false_reason = None
+    if payload.follow_up_date:
+        case.follow_up_date = payload.follow_up_date
+    cur = {a["cow_id"]: a for a in services.detect_yield_anomalies(db, days=7)}.get(case.cow_id)
+    if cur:
+        case.latest_level = cur["level"]
+        case.latest_tags = ",".join(cur["tags"])
+        snapshot = json.dumps(cur, ensure_ascii=False)
+        detail = "；".join(cur["reasons"])
+    else:
+        case.latest_level = "ok"
+        case.latest_tags = None
+        snapshot = None
+        detail = "当前窗口未触发自动检测"
+    case.latest_evidence_date = today
+    db.add(models.AnomalyEvidence(
+        case_id=case.id, kind="reopen", eval_date=today,
+        level=case.latest_level, tags=case.latest_tags,
+        snapshot=snapshot,
+        note="调查单重新开启" + ("——" + payload.note if payload.note else "——") + detail,
+    ))
+    db.commit()
+    db.refresh(case)
+    return services.case_to_dict(db, case, detail=True)
+
+
+@app.post("/api/anomaly-cases/{case_id}/health-links", status_code=201)
+def link_anomaly_health(case_id: int, payload: schemas.HealthLink,
+                        db: Session = Depends(get_db)):
+    case = _get_case_or_404(db, case_id)
+    h = db.get(models.HealthRecord, payload.health_id)
+    if not h:
+        raise HTTPException(404, "未找到该健康记录")
+    if h.cow_id != case.cow_id:
+        raise HTTPException(400, "只能关联同一头牛的健康记录")
+    exists_link = (
+        db.query(models.CaseHealthLink)
+        .filter_by(case_id=case.id, health_id=h.id)
+        .first()
+    )
+    if exists_link:
+        raise HTTPException(409, "该健康记录已关联")
+    db.add(models.CaseHealthLink(case_id=case.id, health_id=h.id))
+    db.commit()
+    return services.case_to_dict(db, case, detail=True)
+
+
+@app.delete("/api/anomaly-cases/{case_id}/health-links/{health_id}", status_code=204)
+def unlink_anomaly_health(case_id: int, health_id: int, db: Session = Depends(get_db)):
+    case = _get_case_or_404(db, case_id)
+    link = (
+        db.query(models.CaseHealthLink)
+        .filter_by(case_id=case.id, health_id=health_id)
+        .first()
+    )
+    if not link:
+        raise HTTPException(404, "未找到该关联")
+    db.delete(link)
+    db.commit()
+
+
 @app.get("/api/dashboard")
 def dashboard(db: Session = Depends(get_db)):
     today = date.today()
@@ -590,7 +875,18 @@ def dashboard(db: Session = Depends(get_db)):
         trend.append({"date": str(d), **day_milk(d)})
 
     reminders = services.build_reminders(db, today)
-    anomalies = services.detect_yield_anomalies(db, days=7, today=today)
+    # 工作台异常以“调查单”为准：例行对账后统计进行中/高风险/待复查
+    services.reconcile_anomaly_cases(db, today=today)
+    open_cases = db.query(models.AnomalyCase).filter(
+        models.AnomalyCase.status.in_(services.OPEN_STATUSES)
+    ).all()
+    anomaly_open = len(open_cases)
+    anomaly_danger = sum(1 for c in open_cases if c.latest_level == "danger")
+    anomaly_waiting_close = sum(
+        1 for c in open_cases
+        if (c.follow_up_date and c.follow_up_date <= today + timedelta(days=3))
+        or c.latest_level == "ok"
+    )
     violation_count = (
         db.query(models.MilkingRecord)
         .filter(services.withdrawal_violation_clause())
@@ -616,7 +912,9 @@ def dashboard(db: Session = Depends(get_db)):
         "trend_14d": trend,
         "reminder_count": len(reminders),
         "reminder_danger": sum(1 for r in reminders if r["level"] == "danger"),
-        "anomaly_count": len(anomalies),
+        "anomaly_count": anomaly_open,
+        "anomaly_danger": anomaly_danger,
+        "anomaly_waiting_close": anomaly_waiting_close,
         "violation_count": violation_count,
         "cows_in_withdrawal": cows_in_withdrawal,
     }

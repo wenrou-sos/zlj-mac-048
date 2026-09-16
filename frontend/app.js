@@ -50,6 +50,27 @@ const REMINDER_META = {
   health_followup: { ico: "🏥", label: "健康复查" },
   calving: { ico: "🐣", label: "待产" },
   first_insemination: { ico: "📅", label: "产后首配" },
+  anomaly_recheck: { ico: "📉", label: "异常复查" },
+};
+
+const CASE_STATUS = {
+  open: { label: "调查中", cls: "red" },
+  reopened: { label: "重开续跟", cls: "amber" },
+  resolved: { label: "已恢复关闭", cls: "green" },
+  false_positive: { label: "误报关闭", cls: "gray" },
+};
+const CASE_LEVEL = {
+  danger: { label: "高风险", cls: "red" },
+  warning: { label: "需关注", cls: "amber" },
+  info: { label: "观察", cls: "blue" },
+  ok: { label: "信号消退", cls: "green" },
+};
+const EVIDENCE_KIND = {
+  detect: { label: "发现", ico: "🚨", cls: "red" },
+  followup: { label: "跟踪", ico: "📡", cls: "blue" },
+  recheck: { label: "人工复查", ico: "🩺", cls: "amber" },
+  close: { label: "关闭", ico: "✅", cls: "green" },
+  reopen: { label: "重开", ico: "🔓", cls: "amber" },
 };
 
 /* ---------------- 全局状态 ---------------- */
@@ -61,12 +82,12 @@ const S = reactive({
   drugs: [],
   dashboard: null,
   reminders: [],
-  anomalies: [],
+  cases: [],
   milkings: [],
   health: [],
   meds: [],
   estruses: [],
-  loading: { milkings: false },
+  loading: { milkings: false, cases: false },
 });
 
 let toastSeq = 0;
@@ -95,14 +116,23 @@ async function loadDashboard() {
 async function loadReminders() {
   S.reminders = await api("/api/reminders");
 }
-async function loadAnomalies(days = 7) {
-  S.anomalies = await api("/api/anomalies?days=" + days);
+async function loadCases(status = "") {
+  S.loading.cases = true;
+  try {
+    S.cases = await api("/api/anomaly-cases" + (status ? "?status=" + status : ""));
+  } catch (e) { toast(e.message, "error"); }
+  S.loading.cases = false;
 }
 
 async function switchView(v) {
   S.view = v;
   if (v === "cows" && !S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
   if (v === "milkings") loadMilkings();
+  if (v === "cases") {
+    loadCases();
+    if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
+    if (!S.health.length) loadHealthAll();
+  }
   if (v === "health") {
     if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
     if (!S.health.length) loadHealthAll();
@@ -185,6 +215,14 @@ const Sparkline = {
 const Dashboard = {
   components: { BarChart },
   setup() {
+    const showClosed = ref(false);
+    const shownCases = computed(() =>
+      S.cases.filter((c) =>
+        showClosed.value
+          ? ["resolved", "false_positive"].includes(c.status)
+          : ["open", "reopened"].includes(c.status)
+      )
+    );
     const chartPoints = computed(() =>
       (S.dashboard?.trend_14d || []).map((t) => ({
         label: t.date.slice(5),
@@ -204,7 +242,12 @@ const Dashboard = {
       return t[t.length - 1].total_kg + t[t.length - 1].discarded_kg <
         (t[t.length - 2].total_kg + t[t.length - 2].discarded_kg) * 0.6;
     });
-    return { S, chartPoints, deltaPct, todayPartial, REMINDER_META, fmtSCC };
+    return {
+      S, chartPoints, deltaPct, todayPartial, REMINDER_META, fmtSCC,
+      CASE_STATUS, CASE_LEVEL,
+      showClosed, shownCases, switchView,
+      openCase: (id) => openModal({ type: "caseDetail", id }),
+    };
   },
   template: `
   <div v-if="S.dashboard">
@@ -233,9 +276,9 @@ const Dashboard = {
         <div class="big-ico">🔔</div>
       </div>
       <div class="card stat warn">
-        <div class="label">奶量异常牛只</div>
-        <div class="value">{{ S.dashboard.anomaly_count }}<span class="unit"> 头</span></div>
-        <div class="delta">休药期混装违规 {{ S.dashboard.violation_count }} 条</div>
+        <div class="label">奶量异常调查</div>
+        <div class="value">{{ S.dashboard.anomaly_count }}<span class="unit"> 单进行中</span></div>
+        <div class="delta">高风险 {{ S.dashboard.anomaly_danger }} · 待复查关闭 {{ S.dashboard.anomaly_waiting_close }}</div>
         <div class="big-ico">📉</div>
       </div>
     </div>
@@ -265,7 +308,9 @@ const Dashboard = {
                 {{ REMINDER_META[r.type]?.label }} · 截止 {{ r.due_date }}
                 <span v-if="r.days_overdue > 0" class="overdue">· 已逾期 {{ r.days_overdue }} 天</span>
                 <button class="link" style="margin-left:8px"
-                  @click="openModal({type:'cowDetail', id:r.cow_id})">查看牛只</button>
+                  @click="r.case_id ? openCase(r.case_id) : openModal({type:'cowDetail', id:r.cow_id})">
+                  {{ r.case_id ? '调查详情' : '查看牛只' }}
+                </button>
               </div>
             </div>
           </div>
@@ -275,26 +320,486 @@ const Dashboard = {
     </div>
 
     <div class="card" style="margin-top:16px">
-      <div class="card-title">⚠️ 奶量异常发现 <span class="sub">逐班次对比近7天基线（单班骤降&gt;25% / 体细胞≥50万 / 连续3天下滑）</span></div>
+      <div class="card-title">📉 奶量异常调查
+        <span class="sub">同一头牛的一次连续异常归为一单：发现证据冻结留痕，复查后关闭；恢复后再次异常自动另开新单</span>
+        <span class="spacer"></span>
+        <button class="btn btn-sm" @click="showClosed = !showClosed">
+          {{ showClosed ? '← 返回进行中' : '查看已关闭单' }}
+        </button>
+        <button class="btn btn-sm" style="margin-left:6px" @click="switchView('cases')">全部调查单</button>
+      </div>
       <div class="table-wrap">
         <table class="data">
-          <thead><tr><th>牛只</th><th>风险等级</th><th>异常类型</th><th>说明</th><th>最近日期</th><th></th></tr></thead>
+          <thead><tr>
+            <th>单号</th><th>牛只</th><th>状态</th><th>发现/当前等级</th>
+            <th>当前异常类型</th><th>发现日</th><th>复查日</th><th>证据</th><th></th>
+          </tr></thead>
           <tbody>
-            <tr v-for="a in S.anomalies" :key="a.cow_id">
-              <td><b>{{ a.cow_tag }}</b> {{ a.cow_name ? '（' + a.cow_name + '）' : '' }}</td>
-              <td><span class="badge" :class="{red:a.level==='danger',amber:a.level==='warning',blue:a.level==='info'}">
-                {{ {danger:'高风险',warning:'需关注',info:'观察'}[a.level] }}</span></td>
-              <td><span v-for="t in a.tag_labels" :key="t" class="badge gray" style="margin-right:4px">{{ t }}</span></td>
-              <td style="max-width:420px">{{ a.message.replace(a.cow_tag + (a.cow_name ? '（'+a.cow_name+'）' : '') + '：','') }}</td>
-              <td>{{ a.latest_date }}</td>
-              <td><button class="link" @click="openModal({type:'cowDetail', id:a.cow_id})">档案/处置</button></td>
+            <tr v-for="c in shownCases" :key="c.id">
+              <td><b>#{{ c.id }}</b>
+                <span v-if="c.parent_case_id" class="badge purple" style="margin-left:4px" title="恢复后再次异常，另开的新单">复发↺#{{ c.parent_case_id }}</span>
+              </td>
+              <td><b>{{ c.cow_tag }}</b> {{ c.cow_name ? '（' + c.cow_name + '）' : '' }}</td>
+              <td><span class="badge" :class="CASE_STATUS[c.status].cls">{{ c.status_label }}</span></td>
+              <td>
+                <span class="badge gray">{{ c.first_level_label }}</span>
+                →
+                <span class="badge" :class="CASE_LEVEL[c.latest_level].cls">{{ c.latest_level_label }}</span>
+              </td>
+              <td>
+                <span v-if="c.latest_tag_labels.length">
+                  <span v-for="t in c.latest_tag_labels" :key="t" class="badge gray" style="margin-right:4px">{{ t }}</span>
+                </span>
+                <span v-else class="badge green">无信号</span>
+              </td>
+              <td>{{ c.detected_on }}</td>
+              <td>{{ c.follow_up_date || '-' }}</td>
+              <td>{{ c.evidence_count }} 条<span v-if="c.manual_recheck_count"> · 复查 {{ c.manual_recheck_count }}</span></td>
+              <td><button class="link" @click="openCase(c.id)">调查详情</button></td>
             </tr>
-            <tr v-if="!S.anomalies.length"><td colspan="6" class="empty">近7天未发现异常 ✅</td></tr>
+            <tr v-if="!shownCases.length">
+              <td colspan="9" class="empty">{{ showClosed ? '暂无已关闭调查单' : '暂无进行中的异常调查 ✅' }}</td>
+            </tr>
           </tbody>
         </table>
       </div>
     </div>
   </div>`,
+};
+
+/* ---------------- 异常调查 ---------------- */
+const CasesPage = {
+  setup() {
+    const status = ref("");
+    const cowId = ref("");
+    const filtered = computed(() =>
+      S.cases.filter((c) => !cowId.value || c.cow_id === Number(cowId.value))
+    );
+    async function reload() {
+      await loadCases(status.value);
+    }
+    onMounted(reload);
+    return {
+      S, status, cowId, filtered, reload,
+      CASE_STATUS, CASE_LEVEL,
+      openCase: (id) => openModal({ type: "caseDetail", id }),
+      openCow: (id) => openModal({ type: "cowDetail", id }),
+    };
+  },
+  template: `
+  <div class="card">
+    <div class="toolbar">
+      <select class="input" style="width:150px" v-model="status" @change="reload">
+        <option value="">全部状态</option>
+        <option value="open">进行中（调查/重开）</option>
+        <option value="resolved">已恢复关闭</option>
+        <option value="false_positive">误报关闭</option>
+      </select>
+      <select class="input" style="width:200px" v-model="cowId">
+        <option value="">全部牛只</option>
+        <option v-for="c in S.cows" :key="c.id" :value="c.id">{{ c.ear_tag }} {{ c.name || '' }}</option>
+      </select>
+      <button class="btn" @click="reload">🔄 刷新对账</button>
+      <span class="spacer"></span>
+      <span style="color:var(--gray-500);font-size:12.5px">
+        每次刷新都会用最新挤奶数据自动对账：新异常自动开单、变严重追加证据、恢复后复发另开新单
+      </span>
+    </div>
+    <div class="table-wrap">
+      <table class="data">
+        <thead><tr>
+          <th>单号</th><th>牛只</th><th>状态</th><th>发现日</th><th>发现等级</th>
+          <th>当前等级</th><th>当前异常类型</th><th>计划复查</th><th>关联病历</th>
+          <th>证据</th><th>关闭日</th><th>操作</th>
+        </tr></thead>
+        <tbody>
+          <tr v-for="c in filtered" :key="c.id">
+            <td><b>#{{ c.id }}</b>
+              <span v-if="c.parent_case_id" class="badge purple" style="margin-left:4px">复发↺#{{ c.parent_case_id }}</span>
+            </td>
+            <td><b class="link" @click="openCow(c.cow_id)">{{ c.cow_tag }}</b> {{ c.cow_name || '' }}</td>
+            <td><span class="badge" :class="CASE_STATUS[c.status].cls">{{ c.status_label }}</span></td>
+            <td>{{ c.detected_on }}</td>
+            <td><span class="badge gray">{{ c.first_level_label }}</span></td>
+            <td><span class="badge" :class="CASE_LEVEL[c.latest_level].cls">{{ c.latest_level_label }}</span></td>
+            <td>
+              <template v-if="c.latest_tag_labels.length">
+                <span v-for="t in c.latest_tag_labels" :key="t" class="badge gray" style="margin-right:4px">{{ t }}</span>
+              </template>
+              <span v-else>-</span>
+            </td>
+            <td>
+              {{ c.follow_up_date || '-' }}
+            </td>
+            <td>{{ c.linked_health.length }} 条</td>
+            <td>{{ c.evidence_count }} 条</td>
+            <td>{{ c.closed_at || '-' }}</td>
+            <td style="white-space:nowrap">
+              <button class="link" @click="openCase(c.id)">调查详情</button>
+            </td>
+          </tr>
+          <tr v-if="!filtered.length"><td colspan="12" class="empty">暂无调查单</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`,
+};
+
+/* ---------------- 弹窗：调查单详情（证据时间线 + 复查/关闭/重开） ---------------- */
+const CaseDetailModal = {
+  setup() {
+    const m = topModal();
+    const d = ref(null);
+    const expanded = ref({});  // evidenceId -> bool
+    const busy = ref(false);
+
+    async function reload() {
+      d.value = await api(`/api/anomaly-cases/${m.id}`);
+    }
+    onMounted(async () => {
+      try {
+        await Promise.all([reload(), loadHealthAll().catch(() => {})]);
+      } catch (e) { toast(e.message, "error"); closeModal(); }
+    });
+    // 子弹窗（复查表单等）关闭后自动刷新
+    watch(
+      () => S.modals.length,
+      async (n, old) => {
+        if (n < old && n > 0 && topModal()?.type === "caseDetail" && topModal()?.id === m.id) {
+          await reload();
+          await loadCases();
+        }
+      }
+    );
+
+    const isOpen = computed(() => d.value && ["open", "reopened"].includes(d.value.status));
+
+    function toggleSnap(id) { expanded.value[id] = !expanded.value[id]; }
+
+    async function saveFinding() {
+      busy.value = true;
+      try {
+        d.value = await api(`/api/anomaly-cases/${m.id}`, {
+          method: "PATCH",
+          body: { finding: d.value.finding, follow_up_date: d.value.follow_up_date || null },
+        });
+        toast("排查结论/复查日已保存");
+      } catch (e) { toast(e.message, "error"); }
+      busy.value = false;
+    }
+
+    function openRecheck() { openModal({ type: "caseRecheck", id: m.id, detail: d.value }); }
+
+    async function closeCase(outcome) {
+      const isFp = outcome === "false_positive";
+      let falseReason = "";
+      if (isFp) {
+        falseReason = prompt("请注明误报原因（必填，将永久留痕）：", "");
+        if (falseReason === null) return;
+        if (!falseReason.trim()) { toast("误报原因必填", "error"); return; }
+      }
+      const closeNote = prompt(isFp ? "补充说明（可留空）：" : "复查确认恢复的结案说明（可留空）：", "") || "";
+      busy.value = true;
+      try {
+        d.value = await api(`/api/anomaly-cases/${m.id}/close`, {
+          method: "POST",
+          body: { outcome, false_reason: falseReason, close_note: closeNote },
+        });
+        toast(isFp ? "已按误报关闭并记录原因" : "已确认恢复，调查关闭");
+        await loadCases();
+        refreshDash();
+      } catch (e) { toast(e.message, "error"); }
+      busy.value = false;
+    }
+
+    async function reopen() {
+      const note = prompt("重开原因（关错了/关早了，将记录为重开证据；恢复后的新异常会自动另开新单）：", "") || "";
+      busy.value = true;
+      try {
+        d.value = await api(`/api/anomaly-cases/${m.id}/reopen`, {
+          method: "POST", body: { note },
+        });
+        toast("调查单已重开续跟");
+        await loadCases();
+        refreshDash();
+      } catch (e) { toast(e.message, "error"); }
+      busy.value = false;
+    }
+
+    function linkHealth() { openModal({ type: "caseLinkHealth", id: m.id, detail: d.value }); }
+    async function unlink(hid) {
+      if (!confirm("解除该健康记录与本调查单的关联？（不会删除健康记录本身）")) return;
+      try {
+        await api(`/api/anomaly-cases/${m.id}/health-links/${hid}`, { method: "DELETE" });
+        toast("已解除关联");
+        await reload();
+      } catch (e) { toast(e.message, "error"); }
+    }
+    function openCow(cid) { openModal({ type: "cowDetail", id: cid }); }
+    function addHealth() {
+      openModal({
+        type: "healthForm",
+        rec: { presetCow: d.value.cow_id, fromCaseId: m.id },
+      });
+    }
+
+    function snapRows(snap) {
+      if (!snap) return [];
+      const rows = [];
+      for (const h of snap.drop_hits || []) {
+        rows.push({ d: h.date, label: `${h.session_label}单班骤降`,
+          v: `${h.yield_kg}kg（基线 ${h.baseline_kg}kg，-${h.drop_pct}%）` });
+      }
+      for (const h of snap.scc_hits || []) {
+        rows.push({ d: h.date, label: `${h.session_label}体细胞异常`,
+          v: `SCC ${fmtSCC(h.scc)} cells/mL` });
+      }
+      if (snap.trend_hit) {
+        const t = snap.trend_hit;
+        rows.push({ d: `${t.start_date}→${t.date}`, label: `连续${t.streak_days}天下滑`,
+          v: `${t.baseline_kg}kg → ${t.yield_kg}kg（-${t.drop_pct}%）` });
+      }
+      return rows;
+    }
+
+    return {
+      d, m, expanded, busy, isOpen, toggleSnap, saveFinding, openRecheck,
+      closeCase, reopen, linkHealth, unlink, openCow, addHealth,
+      CASE_STATUS, CASE_LEVEL, EVIDENCE_KIND, H_RESULT, snapRows, closeModal,
+    };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal wide" v-if="d">
+    <div class="modal-head">
+      <h3>奶量异常调查单 #{{ d.id }}
+        <span class="badge" :class="CASE_STATUS[d.status].cls" style="margin-left:8px">{{ d.status_label }}</span>
+        <span v-if="d.parent_case_id" class="badge purple" style="margin-left:6px">恢复后复发，关联上一单 #{{ d.parent_case_id }}</span>
+      </h3>
+      <button class="modal-close" @click="closeModal">×</button>
+    </div>
+    <div class="modal-body">
+      <!-- 概要 -->
+      <div class="detail-head">
+        <div class="cow-avatar">📉</div>
+        <div style="flex:1">
+          <h2 class="link" @click="openCow(d.cow_id)">{{ d.cow_tag }} {{ d.cow_name ? '（' + d.cow_name + '）' : '' }}</h2>
+          <div class="detail-meta">
+            <span class="badge gray">发现 {{ d.detected_on }}</span>
+            <span class="badge gray">发现等级 {{ d.first_level_label }}</span>
+            <span class="badge" :class="CASE_LEVEL[d.latest_level].cls">当前 {{ d.latest_level_label }}</span>
+            <span v-for="t in d.latest_tag_labels" :key="t" class="badge gray">{{ t }}</span>
+            <span v-if="d.follow_up_date" class="badge blue">计划复查 {{ d.follow_up_date }}</span>
+            <span v-if="d.closed_at" class="badge green">关闭 {{ d.closed_at }}</span>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <button class="btn btn-sm" @click="openCow(d.cow_id)">牛只档案</button>
+        </div>
+      </div>
+
+      <!-- 最新实时判断提示 -->
+      <div class="alert-box info" v-if="d.current">
+        📡 当前最新检测仍触发异常：<b>{{ d.current.message }}</b>
+      </div>
+      <div class="alert-box info" v-else-if="isOpen" style="background:var(--green-50);color:var(--green-800);border-color:var(--green-100)">
+        ✅ 当前近7天检测已无异常信号，可安排人工复查后关闭。
+      </div>
+      <div class="alert-box" :class="d.status==='false_positive' ? 'warn' : 'info'"
+           v-if="d.status==='false_positive' && d.false_reason" style="margin-bottom:14px">
+        误报原因：<b>{{ d.false_reason }}</b>
+      </div>
+
+      <!-- 排查结论 -->
+      <div class="card-title">🔎 排查结论与复查安排</div>
+      <div class="field">
+        <textarea class="input" rows="2" v-model="d.finding"
+          :disabled="!isOpen"
+          placeholder="现场排查情况、饲喂/环境变化、处置措施等（保存后留痕，可随时补充）"></textarea>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>计划复查日期</label>
+          <input type="date" class="input" v-model="d.follow_up_date" :disabled="!isOpen">
+        </div>
+        <div class="field" style="display:flex;align-items:flex-end;gap:8px">
+          <button class="btn" :disabled="!isOpen || busy" @click="saveFinding">保存结论/复查日</button>
+        </div>
+      </div>
+
+      <!-- 关联健康记录 -->
+      <div class="card-title" style="margin-top:8px">
+        🏥 关联健康记录
+        <span class="spacer"></span>
+        <button class="btn btn-sm" @click="addHealth">＋登记健康记录</button>
+        <button class="btn btn-sm" style="margin-left:6px" @click="linkHealth" :disabled="!isOpen">关联已有记录</button>
+      </div>
+      <div class="table-wrap" v-if="d.linked_health.length">
+        <table class="data">
+          <thead><tr><th>日期</th><th>类型</th><th>诊断</th><th>程度</th><th>复查日</th><th>状态</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="h in d.linked_health" :key="h.id">
+              <td>{{ h.date }}</td><td>{{ H_TYPE[h.record_type] || h.record_type }}</td>
+              <td>{{ h.diagnosis || '-' }}</td>
+              <td>{{ SEVERITY[h.severity] || '-' }}</td>
+              <td>{{ h.follow_up_date || '-' }}</td>
+              <td>{{ h.result_label }}</td>
+              <td><button class="link" style="color:var(--red-500)" @click="unlink(h.id)" :disabled="!isOpen">解除</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="empty" v-else style="padding:14px 0">尚未关联健康记录</div>
+
+      <!-- 证据时间线 -->
+      <div class="card-title" style="margin-top:8px">🧊 证据时间线（发现/跟踪/复查时冻结，补改历史奶量不会改写旧证据）</div>
+      <div class="timeline">
+        <div v-for="e in d.evidence" :key="e.id" class="tl-item">
+          <div class="tl-ico" :class="EVIDENCE_KIND[e.kind].cls">{{ EVIDENCE_KIND[e.kind].ico }}</div>
+          <div class="tl-body">
+            <div class="tl-head">
+              <b>{{ EVIDENCE_KIND[e.kind].label }}</b>
+              <span class="tl-date">{{ e.eval_date }}</span>
+              <span v-if="e.level" class="badge" :class="CASE_LEVEL[e.level].cls">{{ e.level_label }}</span>
+              <span v-for="t in e.tag_labels" :key="t" class="badge gray" style="margin-left:4px">{{ t }}</span>
+              <span v-if="e.operator" class="tl-op">操作人：{{ e.operator }}</span>
+            </div>
+            <div class="tl-note" v-if="e.note">{{ e.note }}</div>
+            <button v-if="e.snapshot && snapRows(e.snapshot).length" class="link"
+                    style="font-size:12px" @click="toggleSnap(e.id)">
+              {{ expanded[e.id] ? '收起冻结证据明细' : '查看当时冻结的奶量/SCC证据' }}
+            </button>
+            <table class="data" v-if="expanded[e.id] && e.snapshot" style="margin-top:6px">
+              <thead><tr><th>日期/区间</th><th>信号</th><th>当时数值（快照）</th></tr></thead>
+              <tbody>
+                <tr v-for="(r,i) in snapRows(e.snapshot)" :key="i">
+                  <td>{{ r.d }}</td><td>{{ r.label }}</td><td>{{ r.v }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 操作区 -->
+      <div class="case-actions" v-if="isOpen">
+        <button class="btn btn-primary" @click="openRecheck">🩺 提交人工复查</button>
+        <button class="btn" @click="closeCase('resolved')"
+          :disabled="d.manual_recheck_count === 0"
+          :title="d.manual_recheck_count === 0 ? '请先提交一次人工复查' : ''">
+          ✅ 复查正常·确认恢复关闭
+        </button>
+        <button class="btn btn-danger" @click="closeCase('false_positive')"
+          :disabled="d.manual_recheck_count === 0"
+          :title="d.manual_recheck_count === 0 ? '请先提交一次人工复查' : ''">
+          误报关闭（须注明原因）
+        </button>
+      </div>
+      <div class="hint" v-if="isOpen && d.manual_recheck_count === 0">
+        关闭前必须先提交一次人工复查（确认正常/仍异常/继续观察），作为结案依据。
+      </div>
+      <div class="case-actions" v-else-if="!isOpen">
+        <button class="btn" @click="reopen">🔓 关错了/关早了，重开本单续跟</button>
+        <span class="hint">恢复后再次出现的异常会由系统自动另开新单，无需手动重开。</span>
+      </div>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：人工复查 ---------------- */
+const CaseRecheckModal = {
+  setup() {
+    const m = topModal();
+    const f = reactive({
+      eval_date: todayStr(),
+      result: "normal",
+      note: "",
+      operator: "",
+      follow_up_date: m.detail?.follow_up_date || null,
+    });
+    const err = ref("");
+    async function save() {
+      err.value = "";
+      try {
+        await api(`/api/anomaly-cases/${m.id}/recheck`, { method: "POST", body: f });
+        toast("复查结果已记录为证据");
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    return { f, err, save, closeModal };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:560px">
+    <div class="modal-head"><h3>人工复查 · 调查单 #{{ m.id }}</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field-row">
+        <div class="field"><label>复查日期</label><input type="date" class="input" v-model="f.eval_date"></div>
+        <div class="field"><label>复查人</label><input class="input" v-model="f.operator" placeholder="如 王兽医"></div>
+      </div>
+      <div class="field"><label>复查结果 <span class="req">*</span></label>
+        <select class="input" v-model="f.result">
+          <option value="normal">复查正常（信号消退、奶量/SCC恢复）→ 可随后关闭</option>
+          <option value="abnormal">异常仍存在（继续跟踪，系统继续追加证据）</option>
+          <option value="observed">继续观察（暂不下结论，设定下次复查）</option>
+        </select>
+      </div>
+      <div class="field"><label>下次复查日期（选填）</label>
+        <input type="date" class="input" v-model="f.follow_up_date"></div>
+      <div class="field"><label>复查说明（乳房/采食/体温/SCC 复测等）</label>
+        <textarea class="input" rows="3" v-model="f.note"
+          placeholder="如：左后乳区肿胀消退，乳汁正常，复测SCC 22万，近3天奶量回升至基线"></textarea>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">提交复查</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：关联已有健康记录 ---------------- */
+const CaseLinkHealthModal = {
+  setup() {
+    const m = topModal();
+    const err = ref("");
+    const candidate = computed(() =>
+      S.health.filter(
+        (h) => h.cow_id === m.detail.cow_id &&
+          !m.detail.linked_health.some((l) => l.id === h.id)
+      )
+    );
+    async function pick(hid) {
+      err.value = "";
+      try {
+        await api(`/api/anomaly-cases/${m.id}/health-links`, {
+          method: "POST", body: { health_id: hid },
+        });
+        toast("已关联健康记录");
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    return { candidate, err, pick, closeModal, H_TYPE, SEVERITY, H_RESULT };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:640px">
+    <div class="modal-head"><h3>关联已有健康记录 · 调查单 #{{ m.id }}</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="alert-box info">仅显示同一头牛、且尚未关联到本单的健康记录。</div>
+      <table class="data">
+        <thead><tr><th>日期</th><th>类型</th><th>诊断</th><th>复查日</th><th>状态</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="h in candidate" :key="h.id">
+            <td>{{ h.date }}</td><td>{{ H_TYPE[h.record_type] || h.record_type }}</td>
+            <td>{{ h.diagnosis || '-' }}</td>
+            <td>{{ h.follow_up_date || '-' }}</td>
+            <td>{{ H_RESULT[h.result] || '未结案' }}</td>
+            <td><button class="btn btn-sm btn-primary" @click="pick(h.id)">关联</button></td>
+          </tr>
+          <tr v-if="!candidate.length"><td colspan="6" class="empty">没有可关联的健康记录</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div></div>`,
 };
 
 /* ---------------- 奶牛档案 ---------------- */
@@ -818,7 +1323,9 @@ const MilkingFormModal = {
 };
 
 async function refreshDash() {
-  try { await Promise.all([loadDashboard(), loadAnomalies(), loadReminders()]); } catch (_) {}
+  try {
+    await Promise.all([loadDashboard(), loadReminders(), loadCases()]);
+  } catch (_) {}
 }
 
 /* ---------------- 弹窗：健康表单 ---------------- */
@@ -835,15 +1342,24 @@ const HealthFormModal = {
     async function save() {
       err.value = "";
       try {
+        let created = null;
         const body = { ...f };
         if (m.rec?.id) {
           delete body.id; delete body.cow_ear_tag; delete body.cow_name;
           await api(`/api/health/${m.rec.id}`, { method: "PATCH", body });
         } else {
-          await api("/api/health", { method: "POST", body });
+          created = await api("/api/health", { method: "POST", body });
         }
         toast("健康记录已保存（复查日将生成提醒）");
         await loadHealthAll();
+        // 从调查单详情中新建的病历：自动关联到该调查单
+        if (created && m.rec?.fromCaseId) {
+          try {
+            await api(`/api/anomaly-cases/${m.rec.fromCaseId}/health-links`, {
+              method: "POST", body: { health_id: created.id },
+            });
+          } catch (e) { /* 已关联等冲突可忽略 */ }
+        }
         closeModal();
       } catch (e) { err.value = e.message; }
     }
@@ -1130,7 +1646,8 @@ const CowDetailModal = {
       const preset = { presetCow: d.value.id };
       openModal({ type, rec: preset });
     }
-    return { d, tab, spark, addRecord, closeModal, SESSION, H_TYPE, SEVERITY, H_RESULT, DETECTION, INSEM_RESULT, addDays };
+    return { d, tab, spark, addRecord, closeModal, SESSION, H_TYPE, SEVERITY, H_RESULT,
+      DETECTION, INSEM_RESULT, addDays, CASE_STATUS };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal wide" v-if="d">
@@ -1167,6 +1684,7 @@ const CowDetailModal = {
 
       <div class="tabs">
         <button class="tab" :class="{active:tab==='overview'}" @click="tab='overview'">概览</button>
+        <button class="tab" :class="{active:tab==='cases'}" @click="tab='cases'">异常调查</button>
         <button class="tab" :class="{active:tab==='milkings'}" @click="tab='milkings'">挤奶记录</button>
         <button class="tab" :class="{active:tab==='health'}" @click="tab='health'">健康</button>
         <button class="tab" :class="{active:tab==='meds'}" @click="tab='meds'">用药/休药</button>
@@ -1177,6 +1695,27 @@ const CowDetailModal = {
         <div class="card-title">近7天日产奶量（不含废弃）</div>
         <sparkline :points="spark"></sparkline>
         <p v-if="d.note" style="color:#6b7280;margin-top:14px">备注：{{ d.note }}</p>
+      </div>
+
+      <div v-if="tab==='cases'" class="table-wrap">
+        <table class="data">
+          <thead><tr><th>单号</th><th>状态</th><th>发现日</th><th>发现等级</th><th>当前等级</th><th>类型</th><th>关闭日</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="c in d.anomaly_cases" :key="c.id">
+              <td><b>#{{ c.id }}</b>
+                <span v-if="c.parent_case_id" class="badge purple" style="margin-left:4px">↺#{{ c.parent_case_id }}</span>
+              </td>
+              <td><span class="badge" :class="CASE_STATUS[c.status].cls">{{ c.status_label }}</span></td>
+              <td>{{ c.detected_on }}</td>
+              <td>{{ c.first_level_label }}</td>
+              <td>{{ c.latest_level_label }}</td>
+              <td><span v-for="t in c.first_tag_labels" :key="t" class="badge gray" style="margin-right:4px">{{ t }}</span></td>
+              <td>{{ c.closed_at || '-' }}</td>
+              <td><button class="link" @click="openModal({type:'caseDetail', id:c.id})">调查详情</button></td>
+            </tr>
+            <tr v-if="!d.anomaly_cases.length"><td colspan="8" class="empty">该牛暂无异常调查单</td></tr>
+          </tbody>
+        </table>
       </div>
 
       <div v-if="tab==='milkings'" class="table-wrap"><table class="data">
@@ -1240,16 +1779,17 @@ const CowDetailModal = {
 
 /* ---------------- 根组件 ---------------- */
 const App = {
-  components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage,
+  components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage, CasesPage,
     CowFormModal, MilkingFormModal, HealthFormModal, DrugFormModal,
-    MedFormModal, EstrusFormModal, CowDetailModal },
+    MedFormModal, EstrusFormModal, CowDetailModal,
+    CaseDetailModal, CaseRecheckModal, CaseLinkHealthModal },
   setup() {
     onMounted(async () => {
       try {
         await Promise.all([
           loadDashboard(),
           loadReminders(),
-          loadAnomalies(),
+          loadCases(),
           loadCows(),
           loadDrugs(),
         ]);
@@ -1257,12 +1797,16 @@ const App = {
     });
     const nav = [
       { key: "dashboard", ico: "📊", label: "工作台" },
+      { key: "cases", ico: "📉", label: "异常调查" },
       { key: "cows", ico: "🐄", label: "奶牛档案" },
       { key: "milkings", ico: "🥛", label: "挤奶记录" },
       { key: "health", ico: "🏥", label: "健康与用药" },
       { key: "repro", ico: "💕", label: "发情与配种" },
     ];
-    return { S, switchView, nav, topModal };
+    const openCaseCount = computed(() =>
+      S.cases.filter((c) => ["open", "reopened"].includes(c.status)).length
+    );
+    return { S, switchView, nav, topModal, openCaseCount };
   },
   template: `
   <div class="layout">
@@ -1274,6 +1818,8 @@ const App = {
           <span class="ico">{{ n.ico }}</span>{{ n.label }}
           <span v-if="n.key==='dashboard' && S.dashboard && S.dashboard.reminder_count"
                 class="nav-badge">{{ S.dashboard.reminder_count }}</span>
+          <span v-else-if="n.key==='cases' && openCaseCount"
+                class="nav-badge" style="background:var(--amber-500)">{{ openCaseCount }}</span>
         </button>
       </nav>
       <div class="sidebar-foot">Vue 3 · FastAPI · SQLite<br>内置 12 头样例牛群数据</div>
@@ -1285,6 +1831,7 @@ const App = {
       </div>
       <div class="content">
         <dashboard v-if="S.view==='dashboard'"></dashboard>
+        <cases-page v-else-if="S.view==='cases'"></cases-page>
         <cows-page v-else-if="S.view==='cows'"></cows-page>
         <milkings-page v-else-if="S.view==='milkings'"></milkings-page>
         <health-page v-else-if="S.view==='health'"></health-page>
@@ -1301,6 +1848,9 @@ const App = {
       <med-form-modal v-else-if="md.type==='medForm'"></med-form-modal>
       <estrus-form-modal v-else-if="md.type==='estrusForm'"></estrus-form-modal>
       <cow-detail-modal v-else-if="md.type==='cowDetail'"></cow-detail-modal>
+      <case-detail-modal v-else-if="md.type==='caseDetail'"></case-detail-modal>
+      <case-recheck-modal v-else-if="md.type==='caseRecheck'"></case-recheck-modal>
+      <case-link-health-modal v-else-if="md.type==='caseLinkHealth'"></case-link-health-modal>
     </template>
 
     <div class="toast-wrap">

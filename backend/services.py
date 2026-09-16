@@ -1,4 +1,5 @@
-"""业务规则：发情/配种/用药/健康提醒、休药期校验、奶量异常发现"""
+"""业务规则：发情/配种/用药/健康提醒、休药期校验、奶量异常发现、异常调查闭环"""
+import json
 from collections import defaultdict
 from datetime import date, timedelta
 from typing import Dict, List, Optional
@@ -267,6 +268,61 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             "days_overdue": max(0, dim - 60),
         })
 
+    # 7) 异常调查复查：到期复查、信号消退待关闭、持续异常久未结案
+    for case in db.query(models.AnomalyCase).filter(
+        models.AnomalyCase.status.in_(OPEN_STATUSES)
+    ).all():
+        cow = db.get(models.Cow, case.cow_id)
+        if not cow or cow.status == "sold":
+            continue
+        status_txt = "重开续跟" if case.status == "reopened" else "调查中"
+        if case.follow_up_date:
+            delta = (case.follow_up_date - today).days
+            if -7 <= delta <= 3:
+                out.append({
+                    "type": "anomaly_recheck",
+                    "level": "danger" if delta < 0 else "warning",
+                    "cow_id": cow.id,
+                    "cow_tag": cow.ear_tag,
+                    "case_id": case.id,
+                    "title": f"{cow_label(cow)} 奶量异常待复查（{status_txt}）",
+                    "detail": f"计划复查日 {case.follow_up_date}，"
+                              f"复查确认恢复后可关闭本次调查（#{case.id}）",
+                    "due_date": str(case.follow_up_date),
+                    "days_overdue": max(0, -delta),
+                })
+                continue
+        if case.latest_level == "ok":
+            # 信号消退但未安排复查日：催促人工复查结案
+            stale = (today - case.latest_evidence_date).days if case.latest_evidence_date else 0
+            if stale >= 3:
+                out.append({
+                    "type": "anomaly_recheck",
+                    "level": "warning",
+                    "cow_id": cow.id,
+                    "cow_tag": cow.ear_tag,
+                    "case_id": case.id,
+                    "title": f"{cow_label(cow)} 异常信号已消退，待复查关闭",
+                    "detail": f"调查单 #{case.id} 已连续 {stale} 天无异常信号，"
+                              f"请复查并按“已恢复/误报”关闭，避免长期挂起",
+                    "due_date": str(case.latest_evidence_date),
+                    "days_overdue": stale - 3,
+                })
+        elif case.latest_level == "danger":
+            age = (today - case.detected_on).days
+            if age >= 3:
+                out.append({
+                    "type": "anomaly_recheck",
+                    "level": "danger",
+                    "cow_id": cow.id,
+                    "cow_tag": cow.ear_tag,
+                    "case_id": case.id,
+                    "title": f"{cow_label(cow)} 高风险奶量异常持续 {age} 天未结案",
+                    "detail": f"调查单 #{case.id} 仍为高风险，请尽快排查并记录结论",
+                    "due_date": str(case.detected_on + timedelta(days=3)),
+                    "days_overdue": max(0, age - 3),
+                })
+
     level_rank = {"danger": 0, "warning": 1, "info": 2}
     out.sort(key=lambda r: (level_rank.get(r["level"], 9), r.get("days_overdue", 0) * -1))
     return out
@@ -327,22 +383,26 @@ def detect_yield_anomalies(db: Session, days: int = 7, today: Optional[date] = N
                         drop = (baseline - rec.yield_kg) / baseline * 100
                         drop_hits.append({
                             "date": str(d), "session_label": SESSION_LABEL[sess],
+                            "session": sess, "milking_id": rec.id,
                             "yield_kg": rec.yield_kg, "baseline_kg": round(baseline, 1),
-                            "drop_pct": round(drop, 1),
+                            "drop_pct": round(drop, 1), "scc": rec.scc,
                         })
                 if rec.scc and rec.scc >= 500_000:
                     scc_hits.append({
                         "date": str(d), "session_label": SESSION_LABEL[sess],
-                        "scc": rec.scc,
+                        "session": sess, "milking_id": rec.id,
+                        "scc": rec.scc, "yield_kg": rec.yield_kg,
                     })
 
         # 连续下降趋势：仅用完整班次的日期，避免今日早班误判
         counts = defaultdict(int)
         daily = defaultdict(float)
+        day_ids: Dict[date, list] = defaultdict(list)
         for sess, series in by_sess.items():
             for d, rec in series:
                 counts[d] += 1
                 daily[d] += rec.yield_kg
+                day_ids[d].append(rec.id)
         full_days = sorted(d for d in daily if counts[d] >= 3 and d < today)
         streak = 0
         for i in range(len(full_days) - 1, 0, -1):
@@ -357,10 +417,12 @@ def detect_yield_anomalies(db: Session, days: int = 7, today: Optional[date] = N
             if pct >= 15:
                 trend_hit = {
                     "date": str(last),
+                    "start_date": str(first),
                     "streak_days": streak + 1,
                     "yield_kg": round(daily[last], 1),
                     "baseline_kg": round(daily[first], 1),
                     "drop_pct": round(pct, 1),
+                    "milking_ids": [mid for dd in full_days[-streak - 1:] for mid in day_ids[dd]],
                 }
 
         if not (drop_hits or scc_hits or trend_hit):
@@ -397,11 +459,17 @@ def detect_yield_anomalies(db: Session, days: int = 7, today: Optional[date] = N
             [h["date"] for h in drop_hits + scc_hits] +
             ([trend_hit["date"]] if trend_hit else [])
         )
+        # 未截断的最早命中日，作为调查单“发现日”（展示用的 hits 列表才截断到 6 条）
+        all_hit_dates = [h["date"] for h in drop_hits + scc_hits]
+        if trend_hit:
+            all_hit_dates.append(trend_hit["start_date"])
+        earliest_date = min(all_hit_dates) if all_hit_dates else latest_date
         agg[cow_id] = {
             "cow_id": cow_id,
             "cow_tag": cow.ear_tag,
             "cow_name": cow.name,
             "latest_date": latest_date,
+            "earliest_hit_date": earliest_date,
             "level": level,
             "tags": tags,
             "tag_labels": [
@@ -419,3 +487,277 @@ def detect_yield_anomalies(db: Session, days: int = 7, today: Optional[date] = N
     level_rank = {"danger": 0, "warning": 1, "info": 2}
     anomalies.sort(key=lambda a: (level_rank[a["level"]], a["latest_date"]))
     return anomalies
+
+
+# ---------- 奶量异常调查闭环 ----------
+TAG_LABELS = {"high_scc": "体细胞异常", "downward_trend": "持续下滑", "yield_drop": "单班骤降"}
+CASE_STATUS_LABELS = {
+    "open": "调查中", "reopened": "重开续跟",
+    "resolved": "已恢复关闭", "false_positive": "误报关闭",
+}
+LEVEL_LABELS = {"danger": "高风险", "warning": "需关注", "info": "观察", "ok": "信号消退"}
+LEVEL_RANK = {"danger": 0, "warning": 1, "info": 2, "ok": 3}
+OPEN_STATUSES = ("open", "reopened")
+CLOSED_STATUSES = ("resolved", "false_positive")
+CLEAR_SIGNATURE = "clear"
+
+
+def _snapshot_dates(snap: dict) -> List[str]:
+    # 优先用检测器给出的未截断最早命中日；手动/旧结构快照回退到 hits 列表
+    if snap.get("earliest_hit_date"):
+        return [snap["earliest_hit_date"], snap.get("latest_date", snap["earliest_hit_date"])]
+    dates = [h["date"] for h in snap.get("drop_hits", [])]
+    dates += [h["date"] for h in snap.get("scc_hits", [])]
+    if snap.get("trend_hit"):
+        dates.append(snap["trend_hit"]["date"])
+    return dates
+
+
+def _case_signature(snap: dict) -> str:
+    """信号指纹：判断结果（命中日期+指标值）未变则不重复追加证据"""
+    drops = [
+        (h["date"], h["session"], round(h["yield_kg"], 1), round(h["baseline_kg"], 1))
+        for h in snap.get("drop_hits", [])
+    ]
+    sccs = [(h["date"], h["session"], h["scc"]) for h in snap.get("scc_hits", [])]
+    t = snap.get("trend_hit")
+    trend = (t["start_date"], t["date"], t["streak_days"], t["yield_kg"]) if t else None
+    return json.dumps(
+        {"l": snap["level"], "tags": snap["tags"], "d": sorted(drops),
+         "s": sorted(sccs), "t": trend},
+        ensure_ascii=False, sort_keys=True,
+    )
+
+
+def _auto_link_health(db: Session, case: models.AnomalyCase, detected_on: date) -> None:
+    """开单时自动关联同牛 30 天内、尚未结案的已有健康记录"""
+    existing = {
+        lk.health_id for lk in (
+            db.query(models.CaseHealthLink).filter_by(case_id=case.id).all()
+        )
+    }
+    rows = (
+        db.query(models.HealthRecord)
+        .filter(
+            models.HealthRecord.cow_id == case.cow_id,
+            models.HealthRecord.date >= detected_on - timedelta(days=30),
+            or_(
+                models.HealthRecord.result.is_(None),
+                models.HealthRecord.result != "recovered",
+            ),
+        )
+        .all()
+    )
+    for h in rows:
+        if h.id not in existing:
+            db.add(models.CaseHealthLink(case_id=case.id, health_id=h.id))
+
+
+def _create_case(
+    db: Session, cow_id: int, snap: dict, today: date,
+    parent_id: Optional[int] = None,
+) -> models.AnomalyCase:
+    hit_dates = _snapshot_dates(snap)
+    detected_on = min(date.fromisoformat(d) for d in hit_dates) if hit_dates else today
+    # 复发是“另开新单”：状态仍为调查中，复发关系由 parent_case_id 表达；
+    # “reopened”状态只保留给人工重开旧单（关错了/关早了）
+    snapshot_json = json.dumps(snap, ensure_ascii=False)
+    case = models.AnomalyCase(
+        cow_id=cow_id, status="open", detected_on=detected_on,
+        first_tags=",".join(snap["tags"]), first_level=snap["level"],
+        latest_level=snap["level"], latest_tags=",".join(snap["tags"]),
+        latest_evidence_date=date.fromisoformat(snap["latest_date"]),
+        first_snapshot=snapshot_json, parent_case_id=parent_id,
+    )
+    db.add(case)
+    db.flush()
+    db.add(models.AnomalyEvidence(
+        case_id=case.id, kind="detect", eval_date=today, level=snap["level"],
+        tags=",".join(snap["tags"]), signature=_case_signature(snap),
+        snapshot=snapshot_json,
+        note="系统发现：" + "；".join(snap["reasons"])
+             + ("（该牛恢复后再次异常，另开新单跟踪）" if parent_id else ""),
+    ))
+    _auto_link_health(db, case, detected_on)
+    return case
+
+
+def _open_or_reopen(db: Session, cow_id: int, snap: dict, today: date):
+    """无进行中调查单但出现异常：已关闭单之后的新异常另开新单；仅旧数据则不重开"""
+    closed = (
+        db.query(models.AnomalyCase)
+        .filter(
+            models.AnomalyCase.cow_id == cow_id,
+            models.AnomalyCase.status.in_(CLOSED_STATUSES),
+        )
+        .order_by(models.AnomalyCase.closed_at.desc(), models.AnomalyCase.id.desc())
+        .first()
+    )
+    if closed and closed.closed_at:
+        hit_dates = _snapshot_dates(snap)
+        # 命中全部落在关闭日之前/当天：只是窗口里残留的旧数据，不重开也不另开
+        if hit_dates and all(d <= str(closed.closed_at) for d in hit_dates):
+            return None
+        return _create_case(db, cow_id, snap, today, parent_id=closed.id)
+    return _create_case(db, cow_id, snap, today)
+
+
+def _last_evidence(db: Session, case_id: int) -> Optional[models.AnomalyEvidence]:
+    return (
+        db.query(models.AnomalyEvidence)
+        .filter_by(case_id=case_id)
+        .order_by(models.AnomalyEvidence.id.desc())
+        .first()
+    )
+
+
+def _update_open_case(
+    db: Session, case: models.AnomalyCase, snap: dict, today: date, source: str
+) -> None:
+    """进行中调查单持续跟踪：判断发生变化（变严重/形态变化/补改后结论变化）才追加证据"""
+    sig = _case_signature(snap)
+    case.latest_level = snap["level"]
+    case.latest_tags = ",".join(snap["tags"])
+    case.latest_evidence_date = date.fromisoformat(snap["latest_date"])
+    last = _last_evidence(db, case.id)
+    if last and last.signature == sig and last.kind in ("detect", "followup"):
+        return
+    note = "系统跟踪：" + "；".join(snap["reasons"])
+    if source == "milk_change":
+        note = "历史奶量记录补改后重新判断——" + note
+    db.add(models.AnomalyEvidence(
+        case_id=case.id, kind="followup", eval_date=today, level=snap["level"],
+        tags=",".join(snap["tags"]), signature=sig,
+        snapshot=json.dumps(snap, ensure_ascii=False), note=note,
+    ))
+
+
+def _clear_open_case(db: Session, case: models.AnomalyCase, today: date) -> None:
+    """进行中调查单近窗口已无异常信号：标记消退并提示人工复查关闭，不自动结案"""
+    case.latest_level = "ok"
+    case.latest_tags = None
+    case.latest_evidence_date = today
+    last = _last_evidence(db, case.id)
+    if last and last.kind in ("followup", "detect") and last.signature == CLEAR_SIGNATURE:
+        return
+    db.add(models.AnomalyEvidence(
+        case_id=case.id, kind="followup", eval_date=today, level="ok",
+        signature=CLEAR_SIGNATURE,
+        snapshot=json.dumps({"active": False, "window_days": 7}, ensure_ascii=False),
+        note="近 7 天未再触发任何异常信号（单班骤降/持续下滑/体细胞异常），"
+             "请安排复查，确认恢复后关闭调查",
+    ))
+
+
+def reconcile_anomaly_cases(
+    db: Session, days: int = 7, today: Optional[date] = None, source: str = "scheduled"
+) -> List[models.AnomalyCase]:
+    """
+    用最新检测结果对账调查单（幂等）：
+    - 进行中单：新数据变严重/形态变化 → 追加跟踪证据；信号消退 → 记录消退待复查
+    - 无进行中单：新异常自动开单；关闭后再次异常 → 另开新单并关联上一单
+    source=scheduled 例行扫描；milk_change 由挤奶记录新增/补改触发
+    """
+    today = today or date.today()
+    detected = detect_yield_anomalies(db, days=days, today=today)
+    snapshots = {a["cow_id"]: a for a in detected}
+
+    open_cases = (
+        db.query(models.AnomalyCase)
+        .filter(models.AnomalyCase.status.in_(OPEN_STATUSES))
+        .all()
+    )
+    open_by_cow = {c.cow_id: c for c in open_cases}
+    touched: List[models.AnomalyCase] = []
+
+    for cow_id, snap in snapshots.items():
+        case = open_by_cow.get(cow_id)
+        if case:
+            _update_open_case(db, case, snap, today, source)
+        else:
+            case = _open_or_reopen(db, cow_id, snap, today)
+        if case:
+            touched.append(case)
+
+    for cow_id, case in open_by_cow.items():
+        if cow_id not in snapshots:
+            _clear_open_case(db, case, today)
+            touched.append(case)
+
+    db.commit()
+    for c in touched:
+        db.refresh(c)
+    return touched
+
+
+def _evidence_to_dict(e: models.AnomalyEvidence) -> dict:
+    tags = [t for t in (e.tags or "").split(",") if t]
+    return {
+        "id": e.id, "kind": e.kind,
+        "kind_label": {"detect": "发现", "followup": "跟踪", "recheck": "人工复查",
+                       "close": "关闭", "reopen": "重开"}.get(e.kind, e.kind),
+        "eval_date": str(e.eval_date), "level": e.level,
+        "level_label": LEVEL_LABELS.get(e.level, e.level) if e.level else None,
+        "tags": tags,
+        "tag_labels": [TAG_LABELS.get(t, t) for t in tags],
+        "snapshot": json.loads(e.snapshot) if e.snapshot else None,
+        "note": e.note, "operator": e.operator,
+        "created_at": str(e.created_at) if e.created_at else None,
+    }
+
+
+def case_to_dict(db: Session, case: models.AnomalyCase, detail: bool = False) -> dict:
+    cow = db.get(models.Cow, case.cow_id)
+    first_tags = [t for t in (case.first_tags or "").split(",") if t]
+    latest_tags = [t for t in (case.latest_tags or "").split(",") if t]
+    evidence_rows = (
+        db.query(models.AnomalyEvidence)
+        .filter_by(case_id=case.id)
+        .order_by(models.AnomalyEvidence.id.desc())
+        .all()
+    )
+    manual_rechecks = [e for e in evidence_rows if e.kind == "recheck"]
+    linked = []
+    for lk in case.health_links:
+        h = db.get(models.HealthRecord, lk.health_id)
+        if h:
+            linked.append({
+                "id": h.id, "date": str(h.date), "record_type": h.record_type,
+                "diagnosis": h.diagnosis, "severity": h.severity,
+                "result": h.result, "note": h.note,
+                "result_label": _result_label(h.result),
+            })
+    out = {
+        "id": case.id, "cow_id": case.cow_id,
+        "cow_tag": cow.ear_tag if cow else None,
+        "cow_name": cow.name if cow else None,
+        "cow_status": cow.status if cow else None,
+        "status": case.status,
+        "status_label": CASE_STATUS_LABELS.get(case.status, case.status),
+        "detected_on": str(case.detected_on),
+        "first_level": case.first_level,
+        "first_level_label": LEVEL_LABELS.get(case.first_level, case.first_level),
+        "first_tags": first_tags,
+        "first_tag_labels": [TAG_LABELS.get(t, t) for t in first_tags],
+        "latest_level": case.latest_level,
+        "latest_level_label": LEVEL_LABELS.get(case.latest_level, case.latest_level),
+        "latest_tags": latest_tags,
+        "latest_tag_labels": [TAG_LABELS.get(t, t) for t in latest_tags],
+        "latest_evidence_date": str(case.latest_evidence_date) if case.latest_evidence_date else None,
+        "finding": case.finding, "false_reason": case.false_reason,
+        "follow_up_date": str(case.follow_up_date) if case.follow_up_date else None,
+        "closed_at": str(case.closed_at) if case.closed_at else None,
+        "close_note": case.close_note,
+        "parent_case_id": case.parent_case_id,
+        "evidence_count": len(evidence_rows),
+        "manual_recheck_count": len(manual_rechecks),
+        "last_manual_recheck_date": (
+            str(manual_rechecks[0].eval_date) if manual_rechecks else None
+        ),
+        "linked_health": linked,
+        "created_at": str(case.created_at) if case.created_at else None,
+    }
+    if detail:
+        out["first_snapshot"] = json.loads(case.first_snapshot) if case.first_snapshot else None
+        out["evidence"] = [_evidence_to_dict(e) for e in evidence_rows]
+    return out

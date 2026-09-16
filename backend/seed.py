@@ -1,4 +1,5 @@
 """初始化并写入样例牛群数据（所有日期相对今天生成，保证提醒场景可直接演示）"""
+import json
 import random
 from datetime import date, timedelta
 
@@ -159,6 +160,16 @@ def seed_database(db: Session) -> None:
         models.HealthRecord(cow_id=cows["1611"].id, date=_d(-8), record_type="checkup",
                             diagnosis="常规体检", temperature=38.9, result="recovered",
                             note="体况评分3.0，建议关注采食量"),
+        # 1601 上次“异常”为计量设备误报，排查后关闭（演示误报闭环）
+        models.HealthRecord(cow_id=cows["1601"].id, date=_d(-13), record_type="checkup",
+                            diagnosis="奶量下降排查（计量设备异常）", temperature=38.8,
+                            result="recovered",
+                            note="早班计量读数偏低，现场复测产量正常，设备校准"),
+        # 1610 上一轮乳房炎（-12 天）已治疗恢复；近3天再次发作（演示恢复后另开新单）
+        models.HealthRecord(cow_id=cows["1610"].id, date=_d(-19), record_type="diagnosis",
+                            diagnosis="临床型乳房炎（左前乳区，上一轮）", temperature=40.1,
+                            severity="moderate", follow_up_date=_d(-12), result="recovered",
+                            note="上一轮感染，灌注治疗后奶量与SCC均恢复正常"),
     ])
 
     # ---------- 用药记录 ----------
@@ -235,6 +246,130 @@ def seed_database(db: Session) -> None:
     ])
 
     db.commit()
+    _seed_demo_cases(db, cows)
+    db.commit()
+
+
+def _milking_snapshot_row(r: models.MilkingRecord) -> dict:
+    return {
+        "date": str(r.date), "session": r.session,
+        "session_label": SESSIONS_LABEL.get(r.session, r.session),
+        "milking_id": r.id, "yield_kg": r.yield_kg,
+        "baseline_kg": None, "drop_pct": None, "scc": r.scc,
+    }
+
+
+SESSIONS_LABEL = {"morning": "早班", "noon": "午班", "evening": "晚班"}
+
+
+def _seed_demo_cases(db: Session, cows: dict) -> None:
+    """演示调查闭环：1610 上轮乳房炎已恢复关闭（当前复发→自动另开新单）；1601 计量误报关闭"""
+    if db.query(models.AnomalyCase).count() > 0:
+        return
+
+    def milking(tag: str, off: int, sess: str) -> models.MilkingRecord:
+        return (
+            db.query(models.MilkingRecord)
+            .join(models.Cow, models.MilkingRecord.cow_id == models.Cow.id)
+            .filter(models.Cow.ear_tag == tag,
+                    models.MilkingRecord.date == _d(off),
+                    models.MilkingRecord.session == sess)
+            .first()
+        )
+
+    def health_of(tag: str, diag_prefix: str) -> models.HealthRecord:
+        return (
+            db.query(models.HealthRecord)
+            .join(models.Cow, models.HealthRecord.cow_id == models.Cow.id)
+            .filter(models.Cow.ear_tag == tag,
+                    models.HealthRecord.diagnosis.like(diag_prefix + "%"))
+            .order_by(models.HealthRecord.id.asc())
+            .first()
+        )
+
+    # ---------- 1610 玉珠：上一轮乳房炎（-19 发现，-12 复查临床恢复关闭）；近3天再次发作 ----------
+    h_prev = health_of("1610", "临床型乳房炎（左前乳区")
+    r_detect = milking("1610", -19, "morning")
+    r_close = milking("1610", -12, "morning")
+    detect_snap = {
+        "level": "danger", "tags": ["high_scc", "yield_drop"],
+        "reasons": ["上一轮：左前乳区临床型乳房炎，SCC 升高伴产量下降"],
+        "drop_hits": [_milking_snapshot_row(r_detect)] if r_detect else [],
+        "scc_hits": [_milking_snapshot_row(r_detect)] if r_detect else [],
+        "trend_hit": None,
+        "latest_date": str(_d(-19)),
+        "demo": True,
+        "demo_note": "上一轮感染的历史快照（样例演示数据）",
+    }
+    case1 = models.AnomalyCase(
+        cow_id=cows["1610"].id, status="resolved", detected_on=_d(-19),
+        first_tags="high_scc,yield_drop", first_level="danger",
+        latest_level="ok", latest_tags=None, latest_evidence_date=_d(-12),
+        first_snapshot=json.dumps(detect_snap, ensure_ascii=False),
+        finding="左前乳区临床型乳房炎，阿莫西林灌注+氟尼辛消炎，疗程后临床症状消退、奶量回升",
+        follow_up_date=_d(-12), closed_at=_d(-12),
+        close_note="-12 临床复查乳区无红肿、日产恢复至约 30kg，确认恢复；近3天SCC再次飙升、"
+                   "左后乳区发病，系统已自动另开新调查单跟踪本轮复发",
+    )
+    db.add(case1)
+    db.flush()
+    db.add_all([
+        models.AnomalyEvidence(
+            case_id=case1.id, kind="detect", eval_date=_d(-19), level="danger",
+            tags="high_scc,yield_drop", snapshot=json.dumps(detect_snap, ensure_ascii=False),
+            note="系统发现：上一轮左前乳区乳房炎，SCC 升高伴产量下降（历史快照）",
+            operator="系统"),
+        models.AnomalyEvidence(
+            case_id=case1.id, kind="recheck", eval_date=_d(-12), level="ok",
+            snapshot=json.dumps({"manual": True}, ensure_ascii=False),
+            note="复查结果：已恢复正常——临床症状消退，奶量回升至约 30kg/日",
+            operator="王兽医"),
+        models.AnomalyEvidence(
+            case_id=case1.id, kind="close", eval_date=_d(-12), level="ok",
+            note="确认恢复，结案：左前乳区本轮治疗有效，继续常规体细胞监测", operator="王兽医"),
+    ])
+    if h_prev:
+        db.add(models.CaseHealthLink(case_id=case1.id, health_id=h_prev.id))
+
+    # ---------- 1601 花花：-13 早班计量读数偏低，排查为设备误报，当日关闭 ----------
+    h_fp = health_of("1601", "奶量下降排查")
+    r_fp = milking("1601", -13, "morning")
+    fp_snap = {
+        "level": "warning", "tags": ["yield_drop"],
+        "reasons": [f"{_d(-13)} 早班产奶量读数较基线下降约 30%（设备读数异常）"],
+        "drop_hits": [_milking_snapshot_row(r_fp)] if r_fp else [],
+        "scc_hits": [], "trend_hit": None,
+        "latest_date": str(_d(-13)),
+        "demo": True,
+    }
+    case2 = models.AnomalyCase(
+        cow_id=cows["1601"].id, status="false_positive", detected_on=_d(-13),
+        first_tags="yield_drop", first_level="warning",
+        latest_level="ok", latest_tags=None, latest_evidence_date=_d(-13),
+        first_snapshot=json.dumps(fp_snap, ensure_ascii=False),
+        finding="现场复测与午/晚班产量均正常，牛只采食、乳房无异常",
+        false_reason="挤奶计量设备故障导致早班读数偏低，校准后恢复正常，非牛只异常",
+        follow_up_date=None, closed_at=_d(-13),
+        close_note="设备误报，牛只无健康问题",
+    )
+    db.add(case2)
+    db.flush()
+    db.add_all([
+        models.AnomalyEvidence(
+            case_id=case2.id, kind="detect", eval_date=_d(-13), level="warning",
+            tags="yield_drop", snapshot=json.dumps(fp_snap, ensure_ascii=False),
+            note="系统发现：早班读数较基线下降约30%（设备读数异常）", operator="系统"),
+        models.AnomalyEvidence(
+            case_id=case2.id, kind="recheck", eval_date=_d(-13), level="ok",
+            snapshot=json.dumps({"manual": True}, ensure_ascii=False),
+            note="复查结果：已恢复正常——人工复测产量正常，SCC 无异常", operator="王兽医"),
+        models.AnomalyEvidence(
+            case_id=case2.id, kind="close", eval_date=_d(-13), level="ok",
+            note="判定为误报，结案；误报原因：挤奶计量设备故障导致早班读数偏低，"
+                 "校准后恢复正常，非牛只异常", operator="王兽医"),
+    ])
+    if h_fp:
+        db.add(models.CaseHealthLink(case_id=case2.id, health_id=h_fp.id))
 
 
 def init_db(force: bool = False) -> None:
@@ -250,6 +385,60 @@ def init_db(force: bool = False) -> None:
             seed_database(db)
         finally:
             db.close()
+    else:
+        # 存量库升级：补充调查闭环演示数据（仅在尚无调查单时，幂等）
+        db = SessionLocal()
+        try:
+            _ensure_demo_upgrade(db)
+        finally:
+            db.close()
+
+    # 建表/升级后统一对账一次：自动为当前进行中的异常开调查单（幂等，证据不重复）
+    from . import services
+    db = SessionLocal()
+    try:
+        services.reconcile_anomaly_cases(db)
+    finally:
+        db.close()
+
+
+def _ensure_demo_upgrade(db: Session) -> None:
+    Base.metadata.create_all(bind=engine)
+    if db.query(models.AnomalyCase).count() > 0:
+        return
+    cows = {c.ear_tag: c for c in db.query(models.Cow).all()}
+    if "1601" not in cows or "1610" not in cows:
+        return  # 非内置样例库，不擅自注入演示数据
+
+    def ensure_health(tag: str, **kw):
+        cow = cows[tag]
+        prefix = kw.pop("diagnosis_prefix")
+        exists = (
+            db.query(models.HealthRecord)
+            .filter_by(cow_id=cow.id)
+            .filter(models.HealthRecord.diagnosis.like(prefix + "%"))
+            .first()
+        )
+        if not exists:
+            db.add(models.HealthRecord(cow_id=cow.id, **kw))
+            db.flush()
+
+    ensure_health(
+        "1601", diagnosis_prefix="奶量下降排查",
+        date=_d(-13), record_type="checkup",
+        diagnosis="奶量下降排查（计量设备异常）", temperature=38.8, result="recovered",
+        note="早班计量读数偏低，现场复测产量正常，设备校准",
+    )
+    ensure_health(
+        "1610", diagnosis_prefix="临床型乳房炎（左前乳区",
+        date=_d(-19), record_type="diagnosis",
+        diagnosis="临床型乳房炎（左前乳区，上一轮）", temperature=40.1,
+        severity="moderate", follow_up_date=_d(-12), result="recovered",
+        note="上一轮感染，灌注治疗后奶量与SCC均恢复正常",
+    )
+    db.commit()
+    _seed_demo_cases(db, cows)
+    db.commit()
 
 
 def db_is_empty() -> bool:
