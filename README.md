@@ -30,7 +30,10 @@
 | 人员账号管理 | ✓ | 非管理员账号 | — | — | — |
 
 > **防锁死**：系统始终至少保留一个启用中的管理员——停用/降级最后一个管理员会被后端拒绝（409）；
+> 该校验在写锁事务内完成（SQLite `BEGIN IMMEDIATE` 串行化），**两个管理员并发各自停用账号时也只会成功一个**；
 > 即使误操作，也可用命令行恢复：`python -m backend.auth_cli ensure-admin admin 新密码`。
+> **换账号数据隔离**：退出、登录、会话失效会清空全部按范围缓存的业务数据并作废旧会话的在途响应，
+> 切换到其他牛舍账号不会残留上一个账号看到的记录。
 > 旧版本（无登录）数据库首次启动会**自动迁移**：补齐新表/新列、按牛只原"牛舍/群组"归并牛舍、
 > 创建初始化管理员 `admin`（初始密码 `admin123`，可用环境变量 `DAIRY_ADMIN_PASSWORD` 覆盖）。
 
@@ -149,7 +152,10 @@ dairy-farm/
 │   ├── styles.css
 │   ├── app.js         # Vue 3 单文件应用（登录页/工作台/5 大模块/人员权限/弹窗表单）
 │   └── vendor/vue.global.prod.js
-├── test_auth.py       # 鉴权与越权端到端测试（67 项检查）
+├── test_auth.py                 # 鉴权与越权端到端测试（67 项检查）
+├── test_concurrent_admin.py     # 并发停用管理员的防锁死竞态测试
+├── check_templates.js           # Vue 组件模板编译校验
+├── test_frontend_scope.js       # 前端换账号数据隔离（含慢响应串号）测试
 ├── requirements.txt
 └── run.sh
 ```

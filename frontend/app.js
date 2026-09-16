@@ -85,6 +85,11 @@ const S = reactive({
 });
 
 /* ---------------- 登录 / 权限辅助 ---------------- */
+// 会话代际：每次登录/退出/失效递增；旧会话的晚到响应不得写回，杜绝跨账号数据串号
+let sessionGen = 0;
+function curGen() { return sessionGen; }
+function bumpGen() { sessionGen += 1; }
+
 function can(perm) {
   const perms = S.user?.permissions || [];
   return S.user?.is_admin || perms.includes(perm);
@@ -110,16 +115,10 @@ async function bootstrap() {
   S.bootstrapping = true;
   try {
     await refreshMe();
-    await Promise.all([
-      loadSheds().catch(() => {}),
-      loadDashboard().catch((e) => toast(e.message, "error")),
-      loadReminders().catch(() => {}),
-      loadAnomalies().catch(() => {}),
-      loadCows().catch(() => {}),
-      loadDrugs().catch(() => {}),
-    ]);
+    await loadScopedBase();
   } catch (e) {
     S.authed = false;
+    resetScopedData();
   }
   S.bootstrapping = false;
 }
@@ -127,6 +126,24 @@ function sessionExpired(msg) {
   S.authed = false;
   S.user = null;
   S.loginMessage = msg;
+  resetScopedData();
+  S.modals.length = 0;
+  S.view = "dashboard";
+}
+// 清空所有按牛舍范围授权的业务数据缓存，防止换账号/退出后残留上一个账号可见的记录
+function resetScopedData() {
+  bumpGen();  // 使所有在途的旧会话响应作废
+  S.cows = [];
+  S.sheds = [];
+  S.drugs = [];
+  S.dashboard = null;
+  S.reminders = [];
+  S.anomalies = [];
+  S.milkings = [];
+  S.health = [];
+  S.meds = [];
+  S.estruses = [];
+  S.users = [];
 }
 async function doLogin(username, password) {
   // 登录接口单独处理 401，避免触发全局跳登录的死循环
@@ -138,25 +155,36 @@ async function doLogin(username, password) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.detail || "登录失败");
+  // 先清掉上一个账号的全部范围数据，再按新账号权限加载
+  resetScopedData();
   S.user = data;
   S.authed = true;
   S.loginMessage = "";
+  S.view = "dashboard";
+  await loadScopedBase();
+}
+// 登录后/启动时按当前账号加载基础数据；某项无权或失败时保持为空，绝不沿用上一个账号
+async function loadScopedBase() {
   await Promise.all([
-    loadSheds().catch(() => {}),
-    loadDashboard().catch(() => {}),
-    loadReminders().catch(() => {}),
-    loadAnomalies().catch(() => {}),
-    loadCows().catch(() => {}),
-    loadDrugs().catch(() => {}),
+    loadSheds().catch(() => { S.sheds = []; }),
+    loadDashboard().catch(() => { S.dashboard = null; }),
+    loadReminders().catch(() => { S.reminders = []; }),
+    loadAnomalies().catch(() => { S.anomalies = []; }),
+    loadCows().catch(() => { S.cows = []; }),
+    loadDrugs().catch(() => { S.drugs = []; }),
   ]);
 }
 async function doLogout() {
   try { await api("/api/auth/logout", { method: "POST" }); } catch (e) { /* ignore */ }
   S.authed = false;
   S.user = null;
+  resetScopedData();
+  S.modals.length = 0;
 }
 async function loadSheds() {
-  S.sheds = await api("/api/sheds");
+  const g = curGen();
+  const data = await api("/api/sheds");
+  if (g === curGen()) S.sheds = data;
 }
 
 let toastSeq = 0;
@@ -174,50 +202,87 @@ function closeModal() { S.modals.pop(); }
 function topModal() { return S.modals[S.modals.length - 1]; }
 
 async function loadCows() {
-  S.cows = await api("/api/cows");
+  const g = curGen();
+  const data = await api("/api/cows");
+  if (g === curGen()) S.cows = data;
 }
 async function loadDrugs() {
-  S.drugs = await api("/api/drugs");
+  const g = curGen();
+  const data = await api("/api/drugs");
+  if (g === curGen()) S.drugs = data;
 }
 async function loadDashboard() {
-  S.dashboard = await api("/api/dashboard");
+  const g = curGen();
+  const data = await api("/api/dashboard");
+  if (g === curGen()) S.dashboard = data;
 }
 async function loadReminders() {
-  S.reminders = await api("/api/reminders");
+  const g = curGen();
+  const data = await api("/api/reminders");
+  if (g === curGen()) S.reminders = data;
 }
 async function loadAnomalies(days = 7) {
-  S.anomalies = await api("/api/anomalies?days=" + days);
+  const g = curGen();
+  const data = await api("/api/anomalies?days=" + days);
+  if (g === curGen()) S.anomalies = data;
 }
 
 async function switchView(v) {
   S.view = v;
-  if (v === "cows" && !S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
-  if (v === "milkings") loadMilkings();
+  // 每次进入都重新拉取该页数据，确保换账号/调岗/停用后看到的是当前账号的范围
+  if (v === "cows") loadCows().catch((e) => toast(e.message, "error"));
+  if (v === "milkings") {
+    loadMilkings();
+    if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
+  }
   if (v === "health") {
     if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
-    if (!S.health.length) loadHealthAll();
-    if (!S.meds.length) loadMedsAll();
+    loadHealthAll();
+    loadMedsAll();
     if (!S.drugs.length) loadDrugs();
   }
   if (v === "repro") {
     if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
-    if (!S.estruses.length) loadEstrusesAll();
+    loadEstrusesAll();
   }
-  if (v === "milkings" && !S.cows.length) {
-    loadCows().catch((e) => toast(e.message, "error"));
-  }
+  if (v === "admin" && can("user:manage")) loadUsers();
+}
+
+async function loadUsers() {
+  const g = curGen();
+  const [users, sheds] = await Promise.all([
+    api("/api/users"),
+    S.sheds.length ? Promise.resolve(S.sheds) : api("/api/sheds"),
+  ]);
+  if (g !== curGen()) return;
+  S.users = users;
+  if (!S.sheds.length) S.sheds = sheds;
 }
 
 async function loadMilkings(q = "") {
   S.loading.milkings = true;
+  const g = curGen();
   try {
-    S.milkings = await api("/api/milkings?limit=300" + q);
+    const data = await api("/api/milkings?limit=300" + q);
+    if (g === curGen()) S.milkings = data;
   } catch (e) { toast(e.message, "error"); }
   S.loading.milkings = false;
 }
-async function loadHealthAll() { S.health = await api("/api/health"); }
-async function loadMedsAll() { S.meds = await api("/api/medications"); }
-async function loadEstrusesAll() { S.estruses = await api("/api/estruses"); }
+async function loadHealthAll() {
+  const g = curGen();
+  const data = await api("/api/health");
+  if (g === curGen()) S.health = data;
+}
+async function loadMedsAll() {
+  const g = curGen();
+  const data = await api("/api/medications");
+  if (g === curGen()) S.meds = data;
+}
+async function loadEstrusesAll() {
+  const g = curGen();
+  const data = await api("/api/estruses");
+  if (g === curGen()) S.estruses = data;
+}
 
 /* ---------------- 柱状图 ---------------- */
 const BarChart = {

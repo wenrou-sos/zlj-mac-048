@@ -1102,10 +1102,12 @@ def update_user(
     will_be_active = payload.active if payload.active is not None else user.active
     will_be_admin = "admin" in (new_roles if new_roles is not None
                                 else [r for r in (user.roles or "").split(",") if r])
-    # 防锁死：不允许停用/取消岗位最后一个启用中的管理员
-    if _is_admin_user(user) and (not will_be_active or not will_be_admin):
-        if _active_admin_count(db, exclude_user_id=user_id) == 0:
-            raise HTTPException(409, "系统必须至少保留一个启用中的管理员，已阻止该操作")
+    removing_last_admin = (
+        _is_admin_user(user) and (not will_be_active or not will_be_admin)
+    )
+    # 快速预检（友好报错）；最终的并发安全校验在 flush 后、同一事务内再做一次
+    if removing_last_admin and _active_admin_count(db, exclude_user_id=user_id) == 0:
+        raise HTTPException(409, "系统必须至少保留一个启用中的管理员，已阻止该操作")
 
     if payload.display_name is not None:
         user.display_name = payload.display_name
@@ -1119,6 +1121,18 @@ def update_user(
         user.password_hash = auth.hash_password(payload.password)
     if payload.assignments is not None:
         _sync_assignments(db, user, payload.assignments)
+
+    # 权威终检：在写锁事务内（BEGIN IMMEDIATE 串行化）把待提交修改一起统计。
+    # 两个管理员并发各自停用自己时，后拿到写锁的一方会在此看到 0 个管理员并回滚，
+    # 杜绝预检通过但最终无人可用的竞态。
+    if removing_last_admin:
+        db.flush()
+        if db.query(models.User).filter(
+            models.User.roles.like("%admin%"), models.User.active.is_(True)
+        ).count() == 0:
+            db.rollback()
+            raise HTTPException(409, "系统必须至少保留一个启用中的管理员，已阻止该操作")
+
     db.commit()
     # 调岗、停用、改密、收回牛舍后：所有现有会话立即失效，强制重新登录拿到新权限
     revoke_sessions(db, user_id)
