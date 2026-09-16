@@ -1677,6 +1677,7 @@ const CourseDetailModal = {
                 </td>
                 <td style="max-width:200px;font-size:12px">
                   <div v-if="d.operator">{{ d.operator }}</div>
+                  <div v-if="d.cancel_reason" style="color:#6b7280">{{ d.cancel_reason }}</div>
                   <div v-if="d.reason" style="color:#b45309">{{ d.reason }}</div>
                   <div v-if="d.note" style="color:#6b7280">{{ d.note }}</div>
                 </td>

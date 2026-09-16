@@ -253,6 +253,9 @@ class CourseDose(Base):
         String(16), nullable=True,
         comment="取消来源：manual 单次取消 / line_stop 停药 / switch 换药 / course_end 结束疗程；"
                 "非 manual 的批量取消只能随用药行/疗程整批恢复")
+    cancel_reason = Column(
+        String(255), nullable=True,
+        comment="批量取消原因（停药/换药/结束疗程的说明）；不覆盖延期/漏用自身原因")
     recorded_by = Column(String(32), nullable=True)
     recorded_at = Column(DateTime, nullable=True)
     note = Column(Text, nullable=True)

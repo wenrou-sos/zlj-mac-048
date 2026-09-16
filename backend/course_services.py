@@ -253,6 +253,7 @@ def dose_to_dict(d: models.CourseDose, line: Optional[models.CourseDrug] = None,
         "reason": d.reason,
         "delayed_to": str(d.delayed_to) if d.delayed_to else None,
         "cancel_scope": d.cancel_scope,
+        "cancel_reason": d.cancel_reason,
         "note": d.note,
         "recorded_at": str(d.recorded_at) if d.recorded_at else None,
         "overdue": overdue,
@@ -486,15 +487,26 @@ def _cancel_pending(db: Session, course: models.TreatmentCourse,
     scope 标记取消来源，决定之后能否逐次恢复：
     manual（单次取消）可逐次恢复；line_stop/switch/course_end 为批量取消，
     只能随用药行恢复 / 疗程重开整批恢复。
+
+    批量取消不清空 delayed_to/reason：若该次原本是“已延期”，恢复后应回到
+    “已延期 + 新日期”，而不是退回原计划日期。批量原因单独存 cancel_reason。
     """
     pending = [d for d in line.doses
                if d.status in (DOSE_PLANNED, DOSE_DELAYED)]
     for d in pending:
+        was_delayed = d.status == DOSE_DELAYED
         d.status = DOSE_CANCELLED
-        d.reason = reason
         d.cancel_scope = scope
-        d.delayed_to = None
         d.recorded_at = datetime.utcnow()
+        if scope == "manual":
+            d.reason = reason
+            d.cancel_reason = None
+            d.delayed_to = None
+        else:
+            d.cancel_reason = reason
+            if not was_delayed:
+                # 普通待给药：清掉残留的延期信息（正常情况下为空）
+                d.delayed_to = None
     if pending:
         db.flush()
 
@@ -681,19 +693,20 @@ def end_course(db: Session, course: models.TreatmentCourse, payload):
 
     # 剩余计划一律取消并注明“结束疗程”，但不动任何已生效的休药窗口
     n = 0
+    end_reason_text = f"结束疗程：{payload.end_reason}"
     for line in course.drug_lines:
         if line.status == "active":
             line.status = "stopped"
-            line.change_reason = f"结束疗程：{payload.end_reason}"
+            line.change_reason = end_reason_text
             line.changed_at = datetime.utcnow()
-        for d in line.doses:
-            if d.status in (DOSE_PLANNED, DOSE_DELAYED):
-                d.status = DOSE_CANCELLED
-                d.reason = f"结束疗程：{payload.end_reason}"
-                d.cancel_scope = "course_end"
-                d.delayed_to = None
-                d.recorded_at = datetime.utcnow()
-                n += 1
+        before = sum(1 for x in line.doses
+                     if x.status in (DOSE_PLANNED, DOSE_DELAYED))
+        if before:
+            # 复用批量取消：延期中的次数保留 delayed_to，重开后回到“已延期”
+            _cancel_pending(db, course, line, reason=end_reason_text,
+                            event_type="ended", operator=None,
+                            scope="course_end")
+            n += before
     _log(db, course, "ended",
          f"结束疗程：{payload.end_reason}",
          detail=f"{n} 次未执行计划已取消；既有休药限制继续有效")
@@ -702,10 +715,28 @@ def end_course(db: Session, course: models.TreatmentCourse, payload):
     return course
 
 
+def _restore_cancelled(d: models.CourseDose, scope: str) -> bool:
+    """把指定来源的批量取消恢复为执行前状态。
+
+    有 delayed_to 的回到 DOSE_DELAYED（保留延期原因），否则回到 DOSE_PLANNED；
+    批量取消原因解除，剂量自身的延期原因保留。
+    返回是否恢复。
+    """
+    if d.status != DOSE_CANCELLED or d.cancel_scope != scope:
+        return False
+    was_delayed = d.delayed_to is not None
+    d.status = DOSE_DELAYED if was_delayed else DOSE_PLANNED
+    d.cancel_scope = None
+    d.cancel_reason = None
+    d.recorded_at = None
+    return True
+
+
 def reopen_course(db: Session, course: models.TreatmentCourse):
     """重开误结束的疗程：恢复疗程、用药行，以及“随结束疗程批量取消”的计划。
 
-    单次手动取消、漏用、换药停用的次数不在此恢复（换药本身仍是既定医嘱）。
+    延期过的次数恢复为“已延期 + 新日期”；单次手动取消、漏用、换药停用的次数
+    不在此恢复（换药本身仍是既定医嘱）。
     """
     if course.status == "active":
         return course
@@ -713,20 +744,21 @@ def reopen_course(db: Session, course: models.TreatmentCourse):
     course.end_date = None
     course.end_reason = None
     restored = 0
+    delayed = 0
     for line in course.drug_lines:
         if line.change_reason and line.change_reason.startswith("结束疗程："):
             line.status = "active"
             line.change_reason = None
             line.changed_at = None
         for d in line.doses:
-            if d.status == DOSE_CANCELLED and d.cancel_scope == "course_end":
-                d.status = DOSE_PLANNED
-                d.reason = None
-                d.cancel_scope = None
-                d.recorded_at = None
+            if _restore_cancelled(d, "course_end"):
                 restored += 1
-    _log(db, course, "note",
-         f"疗程重新打开，恢复 {restored} 次随结束取消的待给药计划")
+                if d.status == DOSE_DELAYED:
+                    delayed += 1
+    parts = f"恢复 {restored} 次待给药"
+    if delayed:
+        parts += f"（其中 {delayed} 次为延期给药，按改期日期执行）"
+    _log(db, course, "note", f"疗程重新打开，{parts}")
     db.commit()
     db.refresh(course)
     return course
@@ -734,8 +766,9 @@ def reopen_course(db: Session, course: models.TreatmentCourse):
 
 def resume_line(db: Session, course: models.TreatmentCourse,
                 line: models.CourseDrug, note: Optional[str] = None):
-    """撤销“提前停药”：恢复用药行，并把随停药批量取消的计划整批复为待给药。
+    """撤销“提前停药”：恢复用药行，并把随停药批量取消的计划整批找回。
 
+    原本已延期的次数回到“已延期 + 新日期”，不会退回原计划日期。
     换药停用（switched）不允许恢复——换药是确定的医嘱变更，需要继续请重新加药。
     """
     if line.status == "active":
@@ -745,18 +778,18 @@ def resume_line(db: Session, course: models.TreatmentCourse,
     if course.status != "active":
         raise HTTPException(400, "疗程已结束，请先重新打开疗程")
     restored = 0
+    delayed = 0
     for d in line.doses:
-        if d.status == DOSE_CANCELLED and d.cancel_scope == "line_stop":
-            d.status = DOSE_PLANNED
-            d.reason = None
-            d.cancel_scope = None
-            d.recorded_at = None
+        if _restore_cancelled(d, "line_stop"):
             restored += 1
+            if d.status == DOSE_DELAYED:
+                delayed += 1
     line.status = "active"
     line.change_reason = None
     line.changed_at = None
+    tail = f"，其中 {delayed} 次保留延期日期" if delayed else ""
     _log(db, course, "note",
-         f"恢复用药 {line.drug_name}，恢复 {restored} 次待给药计划", detail=note)
+         f"恢复用药 {line.drug_name}，找回 {restored} 次待给药计划{tail}", detail=note)
     db.commit()
     db.refresh(course)
     return course

@@ -294,8 +294,8 @@ def seed_database(db: Session) -> None:
     v2 = planned_dose(c1611, ln_vit, 2, -1, "morning")
     give(v1, -2, operator="李兽医", note="首次肌注")
     v2.status = "cancelled"
-    v2.reason = "换药为 葡萄糖酸钙注射液：肌注后精神改善不明显，改静注补钙促采食"
     v2.cancel_scope = "switch"
+    v2.cancel_reason = "换药为 葡萄糖酸钙注射液：肌注后精神改善不明显，改静注补钙促采食"
     v2.recorded_at = datetime.datetime.utcnow()
     ca1 = planned_dose(c1611, ln_ca, 1, -1, "morning")
     ca2 = planned_dose(c1611, ln_ca, 2, 0, "morning")
@@ -385,14 +385,37 @@ def seed_database(db: Session) -> None:
     db.commit()
 
 
+def _infer_cancel_scope(d: models.CourseDose, line: models.CourseDrug) -> str:
+    """为历史已取消剂量推断来源。
+
+    优先看剂量自身原因前缀（最准确），再回退到用药行状态：
+    - “结束疗程：…” 优先于行状态（结束疗程时各行也会被置为 stopped）
+    - “换药为 …” / switched 行 -> switch
+    - “停药：…” / stopped 行 -> line_stop
+    - 其余（含 active 行上的单次取消）-> manual
+    """
+    reason = d.reason or ""
+    change_reason = (line.change_reason if line is not None else "") or ""
+    if reason.startswith("结束疗程：") or change_reason.startswith("结束疗程："):
+        return "course_end"
+    if reason.startswith("换药为") or (line is not None and line.status == "switched"):
+        return "switch"
+    if reason.startswith("停药：") or (line is not None and line.status == "stopped"):
+        return "line_stop"
+    return "manual"
+
+
 def backfill_cancel_scope(db: Session) -> None:
-    """老数据迁移：为已取消但无来源的剂量按其用药行状态推断 cancel_scope。"""
-    line_ids = [
-        row[0] for row in
-        db.query(models.CourseDrug.id).filter(
-            models.CourseDrug.status.in_(["switched", "stopped"])
-        ).all()
-    ]
+    """老数据迁移：补齐取消来源与批量取消原因。
+
+    - 上一版已批量取消但只写了 reason：推断 scope，并把批量原因挪到 cancel_reason，
+      保留延期日期（老版数据延期信息若已丢失则无法找回）。
+    - 单次手动取消保持 reason 不变。
+    """
+    from .migrate import table_exists
+    if not table_exists(engine, "treatment_courses"):
+        return
+    line_ids = [row[0] for row in db.query(models.CourseDrug.id).all()]
     lines = {
         ln.id: ln for ln in
         db.query(models.CourseDrug).filter(models.CourseDrug.id.in_(line_ids)).all()
@@ -404,14 +427,14 @@ def backfill_cancel_scope(db: Session) -> None:
     )
     for d in q.all():
         ln = lines.get(d.course_drug_id)
-        if ln is None:
-            d.cancel_scope = "manual"
-        elif ln.status == "switched":
-            d.cancel_scope = "switch"
-        elif (ln.change_reason or "").startswith("结束疗程："):
-            d.cancel_scope = "course_end"
-        else:
-            d.cancel_scope = "line_stop"
+        scope = _infer_cancel_scope(d, ln)
+        d.cancel_scope = scope
+        if scope in ("line_stop", "switch", "course_end") and d.reason:
+            # 老版把批量取消原因写在了 dose.reason：迁移到专门字段，
+            # 若无延期信息（delayed_to 为空），清空 reason 以免与延期原因混淆
+            d.cancel_reason = d.reason
+            if d.delayed_to is None:
+                d.reason = None
         changed = True
     if changed:
         db.commit()
@@ -420,10 +443,13 @@ def backfill_cancel_scope(db: Session) -> None:
 def init_db(force: bool = False) -> None:
     import os
     from .database import DB_PATH
+    from .migrate import run_lightweight_migrations
 
     if force and DB_PATH.exists():
         os.remove(DB_PATH)
     Base.metadata.create_all(bind=engine)
+    # 老库升级：补齐新增列（create_all 不会改已存在的表）
+    run_lightweight_migrations(engine)
     if force or db_is_empty():
         db = SessionLocal()
         try:
