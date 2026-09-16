@@ -1208,6 +1208,9 @@ const ReproEventFormModal = {
             event_date: m.event.event_date || null,
             event_year: m.event.event_year || null,
             event_month: m.event.event_month || null,
+            // 预产期：默认沿用原归属；自动推算时不提交预产期，交回后端随配种日联动
+            edd_auto: m.event.event_type === "pregnancy_check"
+              && m.event.check_result === "pregnant" && !m.event.edd_manual,
           }
         : {
             cow_id: m.rec?.presetCow || null,
@@ -1223,6 +1226,7 @@ const ReproEventFormModal = {
             check_result: "pregnant",
             expected_calving_date: null,
             edd_manual: false,
+            edd_auto: true,
             end_reason: "abortion",
             calf_count: 1,
             calf_sex: "unknown",
@@ -1242,6 +1246,10 @@ const ReproEventFormModal = {
         const body = { ...f };
         // 日期精度：只有 day 才传 event_date
         if (body.date_precision === "month") body.event_date = null;
+        // 预产期勾选“自动推算”时不提交具体值，交后端按配种日+280 联动；
+        // 这样只改备注不会把自动预产期锁死，之后更正配种日仍会联动
+        if (body.edd_auto) body.expected_calving_date = null;
+        delete body.edd_auto;
         if (body.date_precision !== "day") body.expected_calving_date = null;
         if (body.date_precision === "unknown") { body.event_year = null; body.event_month = null; }
         if (body.event_type !== "calving") body.updates_parity = false;
@@ -1356,9 +1364,17 @@ const ReproEventFormModal = {
               <option value="negative">未孕（本次配种结案，进入返情/复配）</option>
             </select></div>
           <div class="field" v-if="f.check_result==='pregnant' && f.date_precision==='day'">
-            <label>预产期（留空则按配种日+280天自动推算）</label>
-            <input type="date" class="input" v-model="f.expected_calving_date">
+            <label>预产期方式</label>
+            <label style="display:flex;align-items:center;height:38px;gap:8px">
+              <input type="checkbox" v-model="f.edd_auto"
+                     @change="if(f.edd_auto) f.expected_calving_date=null">
+              按配种日+280天自动推算（更正配种日会联动）
+            </label>
           </div>
+        </div>
+        <div class="field" v-if="f.check_result==='pregnant' && f.date_precision==='day' && !f.edd_auto">
+          <label>手工校正预产期 <span class="v-sub">（锁定，不随配种日变动）</span></label>
+          <input type="date" class="input" v-model="f.expected_calving_date">
         </div>
         <div class="field"><label>配种员/检查兽医</label><input class="input" v-model="f.technician"></div>
       </template>

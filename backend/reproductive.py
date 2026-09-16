@@ -107,18 +107,32 @@ def compute_state(events: List[models.ReproEvent], today: date) -> dict:
     for ev in _precise_events(events):
         t = ev.event_type
         if t == "estrus":
+            # 只在当前处于空怀（或配种已结案）时作为待配发情；
+            # 妊娠中/已配待检期间补登的历史发情不翻动阶段
             if phase == "open":
                 last_estrus = ev
         elif t == "insemination":
+            # 只有“晚于最近产犊/终止”的配种才属于当前周期；
+            # 补录旧周期的配种（日期早于边界）不得重置当前周期
+            boundary = last_calving.event_date if last_calving else (
+                last_end.event_date if last_end else None)
+            if boundary and ev.event_date <= boundary:
+                continue
             if phase == "pregnant":
                 warnings.append(
                     f"{ev.event_date} 的配种发生在已确认妊娠之后，未改变妊娠状态，"
                     f"如属妊娠终止后复配，请先补录妊娠终止事件")
                 continue
             phase, current_insem = "bred", ev
+            last_negative = None
             last_estrus = None
         elif t == "pregnancy_check":
             r = ev.check_result
+            # 早于当前周期起点（最近产犊/终止）的旧孕检只归档，不影响当前状态
+            boundary = last_calving.event_date if last_calving else (
+                last_end.event_date if last_end else None)
+            if boundary and ev.event_date <= boundary:
+                continue
             if r == "pregnant":
                 phase = "pregnant"
                 pregnant_insem = ev.linked_event if (
@@ -137,16 +151,22 @@ def compute_state(events: List[models.ReproEvent], today: date) -> dict:
                 current_insem = pregnant_insem = positive_check = None
             # recheck：维持当前阶段（已配待检或妊娠疑似），等待下次孕检
         elif t == "pregnancy_end":
-            phase = "open"
-            last_end = ev
-            current_insem = pregnant_insem = positive_check = None
-            last_estrus = None
+            # 只结束“发生在此终止之前”的妊娠；晚于终止日补录的当前妊娠不受影响
+            if positive_check and ev.event_date >= positive_check.event_date:
+                phase = "open"
+                last_end = ev
+                current_insem = pregnant_insem = positive_check = None
+                last_estrus = None
         elif t == "calving":
-            phase = "open"
-            last_calving = ev
-            last_end = None
-            current_insem = pregnant_insem = positive_check = None
-            last_estrus = None
+            # 只关闭“此次产犊之前”的周期；产犊日之后补录的配种/孕检属于新周期
+            if positive_check and ev.event_date >= positive_check.event_date:
+                phase = "open"
+                last_calving = ev
+                last_end = None
+                current_insem = pregnant_insem = positive_check = None
+                last_estrus = None
+            elif not positive_check:
+                last_calving = ev
 
     expected = None
     days_pregnant = None
@@ -251,27 +271,24 @@ def sync_cow_state(db: Session, cow: models.Cow, events: List[models.ReproEvent]
         "calving_date": cow.calving_date,
     }
     cow.expected_calving_date = state["expected_calving_date"]
-    if state["last_calving"]:
-        cow.calving_date = state["last_calving"].event_date
-    # 无产犊事件时不主动清空（可能是新建档案手填），迁移后历史都有事件
+    # 产犊日只可能由事件决定：重算后没有任何有效产犊事件，就应回退为空
+    cow.calving_date = (
+        state["last_calving"].event_date if state["last_calving"] else None
+    )
 
     # 阶段衔接的牛群状态：产犊/妊娠终止后回到泌乳；妊娠中不强行改状态（孕中期仍在挤奶）
     status_impacts: List[str] = []
     if cow.status != "sold":
-        calving = state["last_calving"]
-        ended = state["last_end"]
-        anchor = calving.event_date if calving else None
-        if (calving or ended) and cow.status in ("dry", "pregnant"):
-            anchor_date = calving.event_date if calving else ended.event_date
-            # 仅当该终止/产犊是牛只最新的有效事件时才衔接泌乳阶段
-            latest = _precise_events(events)[-1] if events else None
-            if latest and (latest.event_type in ("calving", "pregnancy_end")
-                           or latest.event_date <= anchor_date):
-                old = cow.status
-                cow.status = "lactating"
-                status_impacts.append(
-                    f"牛群状态由{'干奶' if old == 'dry' else '待产'}衔接为“泌乳中”，"
-                    f"可登记新泌乳期挤奶记录")
+        latest = _precise_events(events)[-1] if events else None
+        # 只有“最新有效事件”本身就是产犊/终止时才衔接泌乳，
+        # 补录更早的历史事件不得翻动当前牛群状态
+        if latest and latest.event_type in ("calving", "pregnancy_end") \
+                and cow.status in ("dry", "pregnant"):
+            old = cow.status
+            cow.status = "lactating"
+            status_impacts.append(
+                f"牛群状态由{'干奶' if old == 'dry' else '待产'}衔接为“泌乳中”，"
+                f"可登记新泌乳期挤奶记录")
     db.flush()
     impacts = _snapshot_diff(before, snapshot(state)) + status_impacts
     cow._repro_stage_cache = state["stage"]
@@ -408,6 +425,68 @@ def _field_summary(ev: models.ReproEvent) -> str:
     return "，".join(parts) or "无补充字段"
 
 
+# ---------------------------------------------------------------- 预产期 / 提醒差异
+def _resolve_positive_check(ev: models.ReproEvent) -> Tuple[Optional[date], bool, List[str]]:
+    """
+    解析阳性孕检的预产期归属（手工校正 or 自动推算）。
+    关键：不能因前端“随表单带回未改动的预产期”就误锁为手工值——
+    只有提交值与配种日推算值不一致时才算手工校正。
+    返回 (预产期, 是否手工, 提示)
+    """
+    if ev.event_type != "pregnancy_check" or ev.check_result != "pregnant":
+        return None, False, []
+    insem = ev.linked_event if ev.linked_event_id else None
+    auto_edd = None
+    if insem and insem.event_type == "insemination" and insem.event_date:
+        auto_edd = insem.event_date + timedelta(days=GESTATION_DAYS)
+    submitted = ev.expected_calving_date
+    if not submitted:
+        if auto_edd:
+            return auto_edd, False, [
+                f"未手工指定预产期，已按配种日 +{GESTATION_DAYS} 天推算为 "
+                f"{auto_edd}，可在编辑中校正"]
+        return None, False, []
+    if auto_edd and submitted == auto_edd:
+        # 与自动推算一致（常见于编辑时只改备注、表单带回原值）→ 不锁手工
+        return submitted, False, []
+    return submitted, True, []
+
+
+def _cow_repro_reminders(db: Session, cow_id: int, today: date) -> List[dict]:
+    cow = db.get(models.Cow, cow_id)
+    if not cow:
+        return []
+    return [r for r in build_repro_reminders(db, today) if r["cow_id"] == cow_id]
+
+
+REMINDER_KIND_LABELS = {
+    "estrus": "发情待配", "return_estrus": "返情观察", "preg_check": "妊娠检查",
+    "open_cow": "长期空怀", "first_insemination": "产后首配",
+    "dry_off": "干奶", "calving": "待产",
+}
+
+
+def reminder_diff(before: List[dict], after: List[dict]) -> List[str]:
+    """对比同一头牛更正前后的繁殖提醒，输出新增/取消/改期说明（阶段不变也能捕捉提醒切换）"""
+    out: List[str] = []
+    bmap = {r["type"]: r for r in before}
+    amap = {r["type"]: r for r in after}
+    for t in (amap.keys() - bmap.keys()):
+        out.append(f"新增「{REMINDER_KIND_LABELS.get(t, t)}」提醒（{amap[t]['detail']}）")
+    for t in (bmap.keys() - amap.keys()):
+        out.append(f"取消原「{REMINDER_KIND_LABELS.get(t, t)}」提醒")
+    for t in bmap.keys() & amap.keys():
+        if bmap[t]["due_date"] != amap[t]["due_date"]:
+            out.append(
+                f"「{REMINDER_KIND_LABELS.get(t, t)}」提醒由 {bmap[t]['due_date']} "
+                f"调整为 {amap[t]['due_date']}")
+        elif bmap[t]["level"] != amap[t]["level"]:
+            lv = {"danger": "紧急", "warning": "关注", "info": "提示"}
+            out.append(
+                f"「{REMINDER_KIND_LABELS.get(t, t)}」提醒紧急度调整为{lv.get(amap[t]['level'], amap[t]['level'])}")
+    return out
+
+
 # ---------------------------------------------------------------- CRUD
 def create_event(db: Session, payload: schemas.ReproEventCreate, today: date) -> dict:
     cow = db.get(models.Cow, payload.cow_id)
@@ -419,8 +498,7 @@ def create_event(db: Session, payload: schemas.ReproEventCreate, today: date) ->
 
     old_events = _events_for_cow(db, cow.id)
     before = compute_state(old_events, today)
-
-    # 配种时可同步补建一条发情事件
+    rem_before = _cow_repro_reminders(db, cow.id, today)
     paired = None
     if payload.event_type == "insemination" and payload.create_paired_estrus and precision == "day":
         paired = models.ReproEvent(
@@ -455,13 +533,8 @@ def create_event(db: Session, payload: schemas.ReproEventCreate, today: date) ->
     if ev.linked_event and ev.linked_event.cow_id != cow.id:
         raise HTTPException(400, "关联事件必须属于同一头牛")
     if ev.event_type == "pregnancy_check" and ev.check_result == "pregnant":
-        if ev.expected_calving_date:
-            ev.edd_manual = True
-        elif ev.linked_event_id and ev.linked_event.event_date:
-            ev.expected_calving_date = ev.linked_event.event_date + timedelta(days=GESTATION_DAYS)
-            ev.edd_manual = False
-            warnings.append(f"未手工指定预产期，已按配种日 +{GESTATION_DAYS} 天推算为 "
-                            f"{ev.expected_calving_date}，可在编辑中校正")
+        ev.expected_calving_date, ev.edd_manual, edd_hints = _resolve_positive_check(ev)
+        warnings += edd_hints
 
     impacts: List[str] = []
     # 胎次推进（仅在明确勾选中发生，可逆：作废时回退）
@@ -473,6 +546,8 @@ def create_event(db: Session, payload: schemas.ReproEventCreate, today: date) ->
     impacts += state_impacts
     after = compute_state(work_events, today)
     impacts += [w for w in after["warnings"] if w not in impacts]
+    rem_after = _cow_repro_reminders(db, cow.id, today)
+    impacts += reminder_diff(rem_before, rem_after)
 
     # 判断是否落入历史周期：早于当前最近产犊（重算后的最近产犊若不是本次事件）
     if precision == "day":
@@ -507,8 +582,10 @@ def update_event(db: Session, ev_id: int, payload: schemas.ReproEventUpdate,
     data = payload.model_dump(exclude_unset=True)
     old_events = _events_for_cow(db, cow.id)
     before = compute_state(old_events, today)
+    rem_before = _cow_repro_reminders(db, cow.id, today)
     old_summary = f"{_date_text(ev)}：{_field_summary(ev)}"
     old_parity_flag = ev.updates_parity
+    warnings: List[str] = []
 
     if "date_precision" in data or "event_date" in data or \
             "event_year" in data or "event_month" in data:
@@ -522,20 +599,23 @@ def update_event(db: Session, ev_id: int, payload: schemas.ReproEventUpdate,
         ev.event_date, ev.date_precision = ev_date, precision
         ev.event_year, ev.event_month = yr, mo
     for k in ("detection", "score", "semen", "technician", "check_result",
-              "expected_calving_date", "end_reason", "calf_count", "calf_sex",
+              "end_reason", "calf_count", "calf_sex",
               "calf_status", "updates_parity", "linked_event_id", "note"):
         if k in data:
             setattr(ev, k, data[k])
+    # 预产期单独经解析函数处理（见下），避免“表单带回未改动的值”被误判为手工锁定
+    if "expected_calving_date" in data:
+        ev.expected_calving_date = data["expected_calving_date"]
     _validate_type_fields(ev.event_type, {
         "check_result": ev.check_result, "end_reason": ev.end_reason})
     if ev.linked_event and ev.linked_event.cow_id != cow.id:
         raise HTTPException(400, "关联事件必须属于同一头牛")
-    if ev.event_type == "pregnancy_check" and ev.check_result == "pregnant":
-        if ev.expected_calving_date:
-            if "expected_calving_date" in data:
-                ev.edd_manual = True
-        elif ev.linked_event_id and ev.linked_event.event_date:
-            ev.expected_calving_date = ev.linked_event.event_date + timedelta(days=GESTATION_DAYS)
+    if ev.event_type == "pregnancy_check":
+        if ev.check_result == "pregnant":
+            ev.expected_calving_date, ev.edd_manual, edd_hints = _resolve_positive_check(ev)
+            warnings += edd_hints
+        else:
+            # 改为阴性/疑似后，该孕检上携带的预产期只作历史字段，不参与状态计算
             ev.edd_manual = False
 
     # 更正配种日期：级联重算所有“自动推算”的阳性孕检预产期（手工校正的不动）
@@ -554,6 +634,13 @@ def update_event(db: Session, ev_id: int, payload: schemas.ReproEventUpdate,
                     _log(db, chk, "update",
                          f"因关联配种日期更正，预产期 {old_edd} → {chk.expected_calving_date}",
                          "随配种日期自动重算（非手工校正）")
+            # 配种日改后，原先合理的孕检可能落入过早窗口，需提示复查
+            if chk.event_date:
+                gap = (chk.event_date - ev.event_date).days
+                if gap < CHECK_FROM:
+                    warnings.append(
+                        f"配种日更正后，{chk.event_date} 的阳性孕检距配种仅 {gap} 天，"
+                        f"早于常规孕检窗口（{CHECK_FROM} 天后），结果可能不可靠，建议安排复查")
 
     impacts: List[str] = []
     if ev.event_type == "calving" and ev.updates_parity != old_parity_flag:
@@ -564,9 +651,14 @@ def update_event(db: Session, ev_id: int, payload: schemas.ReproEventUpdate,
     _, state_impacts = sync_cow_state(db, cow, new_events, today)
     impacts += state_impacts
     after = compute_state(new_events, today)
-    # 更正早期事件但当前状态不变时给出明确说明
-    if not state_impacts and ev.date_precision == "day":
-        impacts.append("本次更正未改变当前阶段、预产期与后续提醒（仅历史周期内容更新）")
+    impacts += [w for w in after["warnings"] if w not in impacts]
+    # 阶段/预产期快照不变时，提醒仍可能已切换（如配种日 50 天前改到 20 天前）
+    rem_after = _cow_repro_reminders(db, cow.id, today)
+    rem_impacts = reminder_diff(rem_before, rem_after)
+    impacts += rem_impacts
+    # 确实没有任何后续影响时才声明不变；仅改备注等场景走这里
+    if not state_impacts and not rem_impacts and ev.date_precision == "day":
+        impacts.append("本次更正未改变当前阶段、预产期与后续提醒（仅事件内容更新）")
 
     _log(db, ev, "update", f"由 [{old_summary}] 更正为 [{_date_text(ev)}：{_field_summary(ev)}]",
          "；".join(dict.fromkeys(impacts)) or "当前阶段与档案无变化")
@@ -574,7 +666,7 @@ def update_event(db: Session, ev_id: int, payload: schemas.ReproEventUpdate,
     db.refresh(ev)
     return {
         "event": event_json(ev),
-        "warnings": [],
+        "warnings": list(dict.fromkeys(warnings)),
         "impacts": list(dict.fromkeys(impacts)),
     }
 
@@ -585,6 +677,7 @@ def void_event(db: Session, ev_id: int, reason: str, today: date) -> dict:
         raise HTTPException(404, "事件不存在或已作废")
     cow = db.get(models.Cow, ev.cow_id)
     old_events = _events_for_cow(db, cow.id)
+    rem_before = _cow_repro_reminders(db, cow.id, today)
     ev.voided, ev.void_reason = True, reason
 
     impacts: List[str] = []
@@ -594,7 +687,10 @@ def void_event(db: Session, ev_id: int, reason: str, today: date) -> dict:
     new_events = _events_for_cow(db, cow.id)
     _, state_impacts = sync_cow_state(db, cow, new_events, today)
     impacts += state_impacts
-    if not state_impacts:
+    rem_after = _cow_repro_reminders(db, cow.id, today)
+    rem_impacts = reminder_diff(rem_before, rem_after)
+    impacts += rem_impacts
+    if not state_impacts and not rem_impacts:
         impacts.append("作废的是历史周期事件，当前阶段、预产期与提醒不变")
     _log(db, ev, "void",
          f"作废 {EVENT_LABELS[ev.event_type]}（{_date_text(ev)}），原因：{reason}",
