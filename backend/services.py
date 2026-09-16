@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 from sqlalchemy import and_, exists, or_
 from sqlalchemy.orm import Session
 
-from . import models
+from . import models, reproductive
 
 SESSION_LABEL = {"morning": "早班", "noon": "午班", "evening": "晚班"}
 STATUS_LABEL = {
@@ -72,94 +72,13 @@ def check_withdrawal(db: Session, cow_id: int, on_date: date) -> dict:
 
 
 def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
-    """汇总全部提醒（发情、配种孕检、用药、健康复查、待产、长期空怀）"""
+    """汇总全部提醒（繁殖阶段驱动 + 用药 + 健康复查 + 休药期）"""
     today = today or date.today()
-    out: List[dict] = []
+    # 繁殖类提醒（发情/返情/孕检/长期空怀/产后首配/干奶/待产）统一由繁殖周期服务生成，
+    # 同一头牛只保留当前有效周期的提醒，旧周期结果不会再产生待办
+    out: List[dict] = reproductive.build_repro_reminders(db, today)
 
-    # 1) 发情未配种：发情后 24~48 小时为最佳配种窗口，提醒保留 2 天
-    for e in (
-        db.query(models.EstrusRecord)
-        .filter(~models.EstrusRecord.inseminated)
-        .order_by(models.EstrusRecord.date.desc())
-        .all()
-    ):
-        cow = db.get(models.Cow, e.cow_id)
-        if not cow or cow.status == "sold":
-            continue
-        if 0 <= (today - e.date).days <= 2:
-            urgent = (today - e.date).days == 0
-            out.append({
-                "type": "estrus",
-                "level": "danger" if urgent else "warning",
-                "cow_id": cow.id,
-                "cow_tag": cow.ear_tag,
-                "title": f"{cow_label(cow)} 发情待配种",
-                "detail": f"{e.date} 通过{_det_label(e.detection)}发现发情"
-                          f"{f'，强度{e.score}级' if e.score else ''}，"
-                          f"请于发情后 12 小时内适时输精",
-                "due_date": str(e.date + timedelta(days=1)),
-                "days_overdue": max(0, (today - e.date - timedelta(days=1)).days),
-            })
-
-    # 2) 配种后孕检 / 返情
-    seen_cows: set = set()
-    for e in (
-        db.query(models.EstrusRecord)
-        .filter(models.EstrusRecord.inseminated)
-        .order_by(models.EstrusRecord.insemination_date.desc())
-        .all()
-    ):
-        if e.cow_id in seen_cows:
-            continue
-        seen_cows.add(e.cow_id)
-        cow = db.get(models.Cow, e.cow_id)
-        if not cow or cow.status == "sold":
-            continue
-        if e.result == "pregnant":
-            continue
-        insem = e.insemination_date or e.date
-        days = (today - insem).days
-        if days < 18:
-            continue
-        # 18~24天：返情观察；35~45天：孕检；超过60天无结果：长期未确认
-        if 18 <= days <= 24 and e.result in ("pending", None):
-            out.append({
-                "type": "return_estrus",
-                "level": "warning",
-                "cow_id": cow.id,
-                "cow_tag": cow.ear_tag,
-                "title": f"{cow_label(cow)} 进入返情观察期",
-                "detail": f"配种已 {days} 天（冻精 {e.semen or '-'}），"
-                          f"注意观察是否返情，必要时复配",
-                "due_date": str(insem + timedelta(days=24)),
-                "days_overdue": 0,
-            })
-        elif 25 <= days <= 60 and e.result in ("pending", None):
-            overdue = max(0, days - 42)
-            out.append({
-                "type": "preg_check",
-                "level": "danger" if overdue else "warning",
-                "cow_id": cow.id,
-                "cow_tag": cow.ear_tag,
-                "title": f"{cow_label(cow)} 待妊娠检查",
-                "detail": f"配种已 {days} 天，建议尽快做直肠/B超孕检并回填结果",
-                "due_date": str(insem + timedelta(days=42)),
-                "days_overdue": overdue,
-            })
-        elif days > 60 and e.result in ("pending", None, "negative"):
-            out.append({
-                "type": "open_cow",
-                "level": "danger",
-                "cow_id": cow.id,
-                "cow_tag": cow.ear_tag,
-                "title": f"{cow_label(cow)} 长期空怀需处理",
-                "detail": f"上次配种/未孕距今 {days} 天，请兽医评估卵巢与子宫状态，"
-                          f"安排同期发情或淘汰评估",
-                "due_date": str(insem + timedelta(days=60)),
-                "days_overdue": days - 60,
-            })
-
-    # 3) 用药提醒：下次用药 / 休药期进行中
+    # 用药提醒：下次用药 / 休药期进行中
     for m in db.query(models.Medication).all():
         cow = db.get(models.Cow, m.cow_id)
         if not cow or cow.status == "sold":
@@ -220,52 +139,8 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                 "days_overdue": max(0, -delta),
             })
 
-    # 5) 待产 / 预产临近（7 天内）
-    for cow in db.query(models.Cow).filter(models.Cow.expected_calving_date.isnot(None)).all():
-        if cow.status == "sold":
-            continue
-        delta = (cow.expected_calving_date - today).days
-        if -3 <= delta <= 10:
-            out.append({
-                "type": "calving",
-                "level": "danger" if delta <= 2 else "info",
-                "cow_id": cow.id,
-                "cow_tag": cow.ear_tag,
-                "title": f"{cow_label(cow)} 临近预产期",
-                "detail": f"预产期 {cow.expected_calving_date}（{'剩' if delta >= 0 else '超'}"
-                          f" {abs(delta)} 天），做好产房与接产准备",
-                "due_date": str(cow.expected_calving_date),
-                "days_overdue": max(0, -delta),
-            })
-
-    # 6) 产后首配窗口（产后 45~70 天未配种）
-    for cow in db.query(models.Cow).filter(models.Cow.calving_date.isnot(None)).all():
-        if cow.status in ("sold", "dry"):
-            continue
-        dim = (today - cow.calving_date).days
-        if not (40 <= dim <= 80):
-            continue
-        insem = (
-            db.query(models.EstrusRecord)
-            .filter(models.EstrusRecord.cow_id == cow.id)
-            .filter(models.EstrusRecord.inseminated)
-            .order_by(models.EstrusRecord.insemination_date.desc())
-            .first()
-        )
-        if insem and (insem.result == "pregnant"):
-            continue
-        if insem and insem.insemination_date and insem.insemination_date >= cow.calving_date:
-            continue
-        out.append({
-            "type": "first_insemination",
-            "level": "info" if dim < 55 else "warning",
-            "cow_id": cow.id,
-            "cow_tag": cow.ear_tag,
-            "title": f"{cow_label(cow)} 进入产后首配窗口",
-            "detail": f"产后已 {dim} 天，建议加强发情监测并安排首次配种",
-            "due_date": str(cow.calving_date + timedelta(days=60)),
-            "days_overdue": max(0, dim - 60),
-        })
+    # 待产/干奶/产后首配已由繁殖周期服务按“当前阶段”统一生成，
+    # 不再从档案上的静态预产期/产犊日重复计算（避免旧周期结果覆盖当前状态）
 
     level_rank = {"danger": 0, "warning": 1, "info": 2}
     out.sort(key=lambda r: (level_rank.get(r["level"], 9), r.get("days_overdue", 0) * -1))

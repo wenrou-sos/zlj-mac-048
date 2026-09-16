@@ -40,6 +40,28 @@ const SEVERITY = { mild: "轻度", moderate: "中度", severe: "重度" };
 const H_RESULT = { recovered: "已康复", ongoing: "治疗中", observed: "观察中" };
 const INSEM_RESULT = { pending: "待孕检", pregnant: "已孕", negative: "未孕", unknown: "未确认" };
 
+const REPRO_EVENT = {
+  estrus: { ico: "🔥", label: "发情", cls: "red" },
+  insemination: { ico: "💉", label: "配种输精", cls: "blue" },
+  pregnancy_check: { ico: "🤰", label: "妊娠检查", cls: "purple" },
+  pregnancy_end: { ico: "💔", label: "妊娠终止", cls: "amber" },
+  calving: { ico: "🐣", label: "产犊", cls: "green" },
+};
+const REPRO_STAGE = {
+  estrus: { label: "发情待配", cls: "red" },
+  bred_pending: { label: "已配待检", cls: "blue" },
+  pregnant: { label: "妊娠中", cls: "purple" },
+  postpartum_open: { label: "产后空怀", cls: "amber" },
+  open: { label: "空怀待配", cls: "gray" },
+  no_record: { label: "无繁殖记录", cls: "gray" },
+};
+const REPRO_PRECISION = { day: "精确到日", month: "仅年月", unknown: "日期缺失" };
+const REPRO_CHECK = { pregnant: "妊娠阳性", negative: "未孕", recheck: "疑似·需复查" };
+const REPRO_END = { abortion: "流产", stillbirth: "死产终止", cull_pregnant: "孕牛淘汰", other: "其他原因" };
+const REPRO_SEX = { male: "公", female: "母", mixed: "雌雄均有", unknown: "未知" };
+const REPRO_CALF_STATUS = { alive: "全部存活", dead: "全部死亡", mixed: "部分存活" };
+const REPRO_ACTION = { create: "补录", update: "更正", void: "作废", delete: "删除" };
+
 const REMINDER_META = {
   estrus: { ico: "🔥", label: "发情配种" },
   return_estrus: { ico: "🔄", label: "返情观察" },
@@ -49,6 +71,7 @@ const REMINDER_META = {
   withdrawal: { ico: "🚫", label: "休药期" },
   health_followup: { ico: "🏥", label: "健康复查" },
   calving: { ico: "🐣", label: "待产" },
+  dry_off: { ico: "💤", label: "干奶" },
   first_insemination: { ico: "📅", label: "产后首配" },
 };
 
@@ -66,6 +89,8 @@ const S = reactive({
   health: [],
   meds: [],
   estruses: [],
+  reproOverview: [],
+  reproTick: 0,
   loading: { milkings: false },
 });
 
@@ -111,7 +136,7 @@ async function switchView(v) {
   }
   if (v === "repro") {
     if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
-    if (!S.estruses.length) loadEstrusesAll();
+    loadReproOverview();
   }
   if (v === "milkings" && !S.cows.length) {
     loadCows().catch((e) => toast(e.message, "error"));
@@ -128,6 +153,13 @@ async function loadMilkings(q = "") {
 async function loadHealthAll() { S.health = await api("/api/health"); }
 async function loadMedsAll() { S.meds = await api("/api/medications"); }
 async function loadEstrusesAll() { S.estruses = await api("/api/estruses"); }
+async function loadReproOverview() {
+  S.reproOverview = await api("/api/repro/overview");
+}
+async function bumpRepro() {
+  S.reproTick++;
+  try { await loadReproOverview(); } catch (_) {}
+}
 
 /* ---------------- 柱状图 ---------------- */
 const BarChart = {
@@ -598,67 +630,205 @@ const HealthPage = {
   },
 };
 
-/* ---------------- 发情与配种 ---------------- */
-const ReproPage = {
-  setup() { return { S, openModal, DETECTION, INSEM_RESULT }; },
-  template: `
-  <div class="card">
-    <div class="toolbar">
-      <span style="color:#6b7280;font-size:12.5px">发情发现后 12 小时内为最佳输精窗口；配种后 18~24 天观察返情、35~42 天进行孕检。</span>
-      <span class="spacer"></span>
-      <button class="btn btn-primary" @click="openModal({type:'estrusForm', rec:null})">＋ 登记发情/配种</button>
-    </div>
-    <div class="table-wrap"><table class="data">
-      <thead><tr><th>发情日期</th><th>耳标号</th><th>发现方式</th><th>强度</th><th>配种</th>
-        <th>冻精/公牛</th><th>配种员</th><th>孕检结果</th><th>备注</th><th>操作</th></tr></thead>
-      <tbody>
-        <tr v-for="e in S.estruses" :key="e.id">
-          <td>{{ e.date }}</td>
-          <td><b @click="openModal({type:'cowDetail', id:e.cow_id})" class="link">{{ e.cow_ear_tag }}</b> {{ e.cow_name || '' }}</td>
-          <td>{{ DETECTION[e.detection] }}</td>
-          <td>{{ e.score ? '★'.repeat(e.score) : '-' }}</td>
-          <td>
-            <span v-if="e.inseminated" class="badge green">已配 {{ e.insemination_date }}</span>
-            <span v-else class="badge red">待配种</span>
-          </td>
-          <td>{{ e.semen || '-' }}</td><td>{{ e.technician || '-' }}</td>
-          <td>
-            <select class="input" style="padding:4px 8px;width:100px"
-                    :value="e.result || 'pending'" @change="setResult(e, $event.target.value)">
-              <option value="pending">待孕检</option>
-              <option value="pregnant">已孕</option>
-              <option value="negative">未孕</option>
-              <option value="unknown">未确认</option>
-            </select>
-          </td>
-          <td style="max-width:180px;color:#6b7280">{{ e.note || '-' }}</td>
-          <td style="white-space:nowrap">
-            <button class="link" style="margin-right:10px" @click="openModal({type:'estrusForm', rec:e})">编辑</button>
-            <button class="link" style="color:#dc2626" @click="remove(e)">删除</button>
-          </td>
-        </tr>
-        <tr v-if="!S.estruses.length"><td colspan="10" class="empty">暂无发情/配种记录</td></tr>
-      </tbody>
-    </table></div>
-  </div>`,
-  methods: {
-    async setResult(e, result) {
+/* ---------------- 繁殖周期 ---------------- */
+const ReproCycleTimeline = {
+  props: ["cycles", "incomplete", "changes", "embedded"],
+  setup(props) {
+    const openCycles = reactive(new Set());
+    function toggle(i) { openCycles.has(i) ? openCycles.delete(i) : openCycles.add(i); }
+    function opened(i) { return openCycles.has(i); }
+    function editEvent(e) {
+      if (e.source === "legacy") { toast("旧表迁移事件可作废留痕，不支持直接编辑", "error"); return; }
+      openModal({ type: "reproEventForm", event: e });
+    }
+    async function voidEvent(e) {
+      const reason = prompt(`作废「${e.event_type_label}（${e.date_text}）」的原因？\n作废后当前阶段、预产期与提醒将立即重算，事件保留并留痕。`);
+      if (!reason || reason.trim().length < 2) return;
       try {
-        const body = { result };
-        if (result !== "pending") body.result_date = todayStr();
-        await api(`/api/estruses/${e.id}`, { method: "PATCH", body });
-        e.result = result;
-        if (result !== "pending") e.result_date = todayStr();
-        toast("孕检结果已更新");
+        const res = await api(`/api/repro/events/${e.id}/void`, {
+          method: "POST", body: { reason: reason.trim() },
+        });
+        await Promise.all([bumpRepro(), loadCows(), refreshDash()]);
+        openModal({ type: "reproImpact", result: res });
       } catch (err) { toast(err.message, "error"); }
-    },
-    async remove(e) {
-      if (!confirm("确认删除该发情/配种记录？")) return;
-      await api(`/api/estruses/${e.id}`, { method: "DELETE" });
-      S.estruses = S.estruses.filter((x) => x.id !== e.id);
-      toast("已删除");
-    },
+    }
+    return { REPRO_EVENT, REPRO_CHECK, REPRO_END, REPRO_SEX, REPRO_CALF_STATUS,
+             toggle, opened, editEvent, voidEvent, openModal };
   },
+  template: `
+  <div class="repro-tl">
+    <div v-for="c in cycles" :key="c.index" class="cycle" :class="{current:c.current, closed:c.closed}">
+      <div class="cycle-head" @click="toggle(c.index)" :style="{cursor:'pointer'}">
+        <span class="cycle-dot" :class="c.current?'pulse':''"></span>
+        <b>{{ c.current ? '当前周期' : '历史周期' }}</b>
+        <span class="badge" :class="c.closed?'green':'purple'">{{ c.summary.result }}</span>
+        <span class="cycle-range">
+          {{ c.start_date || '建档前' }} <span v-if="c.closed">→ {{ c.end_date }}</span>
+          <span v-else>→ 进行中</span>
+        </span>
+        <span class="spacer"></span>
+        <span class="cycle-stats">
+          发情 {{ c.summary.estrus_count }} · 配种 {{ c.summary.insemination_count }}
+          · 孕检 {{ c.summary.check_count }}<span v-if="c.summary.end_count"> · 终止 {{ c.summary.end_count }}</span>
+        </span>
+        <span class="cycle-toggle">{{ opened(c.index) ? '收起 ▴' : (c.current ? '展开 ▴' : '展开 ▾') }}</span>
+      </div>
+      <div v-show="c.current || opened(c.index)" class="cycle-body">
+        <div v-for="e in [...c.events].reverse()" :key="e.id" class="tl-row">
+          <div class="tl-ico" :class="REPRO_EVENT[e.event_type].cls">{{ REPRO_EVENT[e.event_type].ico }}</div>
+          <div class="tl-line"></div>
+          <div class="tl-card">
+            <div class="tl-top">
+              <b>{{ e.date_text }}</b>
+              <span class="tl-type">{{ REPRO_EVENT[e.event_type].label }}</span>
+              <span v-if="e.voided" class="badge gray">已作废</span>
+              <span v-if="e.source==='legacy'" class="badge gray">旧档迁移</span>
+            </div>
+            <div class="tl-detail">
+              <template v-if="e.event_type==='estrus'">
+                {{ e.detection_label || '' }}<span v-if="e.score"> · 强度 {{ '★'.repeat(e.score) }}</span>
+              </template>
+              <template v-else-if="e.event_type==='insemination'">
+                冻精 {{ e.semen || '-' }}<span v-if="e.technician"> · {{ e.technician }}</span>
+              </template>
+              <template v-else-if="e.event_type==='pregnancy_check'">
+                <span class="badge" :class="{'green':e.check_result==='pregnant','red':e.check_result==='negative','amber':e.check_result==='recheck'}">{{ e.check_result_label }}</span>
+                <span v-if="e.expected_calving_date"> · 预产期 {{ e.expected_calving_date }}<span class="edd-mode">{{ e.edd_manual ? '（手工校正）' : '（配种+280推算）' }}</span></span>
+              </template>
+              <template v-else-if="e.event_type==='pregnancy_end'">
+                <span class="badge amber">{{ e.end_reason_label }}</span>
+              </template>
+              <template v-else-if="e.event_type==='calving'">
+                <span v-if="e.calf_count!=null">{{ e.calf_count }} 头犊牛</span>
+                <span v-if="e.calf_sex && e.calf_sex!=='unknown'"> · {{ REPRO_SEX[e.calf_sex] }}</span>
+                <span v-if="e.calf_status"> · {{ REPRO_CALF_STATUS[e.calf_status] }}</span>
+                <span v-if="e.updates_parity" class="badge blue" style="margin-left:6px">胎次已推进</span>
+              </template>
+              <span v-if="e.note" class="tl-note"> · {{ e.note }}</span>
+              <span v-if="e.void_reason" class="tl-note"> · 作废原因：{{ e.void_reason }}</span>
+            </div>
+            <div class="tl-actions" v-if="!e.voided">
+              <button class="link" @click="editEvent(e)">更正</button>
+              <button class="link" style="color:#dc2626" @click="voidEvent(e)">作废</button>
+            </div>
+          </div>
+        </div>
+        <div v-if="!c.events.length" class="empty" style="padding:8px 0 8px 46px">本周期暂无事件</div>
+      </div>
+    </div>
+
+    <div v-if="incomplete && incomplete.length" class="incomplete-box">
+      <div class="incomplete-head">⚠️ 日期不完整的旧记录（{{ incomplete.length }} 条，仅归档，<b>不会被当作已完成事件</b>参与阶段/预产期/提醒）</div>
+      <div v-for="e in incomplete" :key="e.id" class="inc-row">
+        <span class="inc-date">{{ e.date_text }}</span>
+        {{ REPRO_EVENT[e.event_type].label }}
+        <span v-if="e.semen">· {{ e.semen }}</span>
+        <span v-if="e.check_result_label">· {{ e.check_result_label }}</span>
+        <span v-if="e.note" class="tl-note">· {{ e.note }}</span>
+      </div>
+    </div>
+  </div>`,
+};
+
+const ReproPage = {
+  components: { ReproCycleTimeline },
+  setup() {
+    const selected = ref(null);
+    const profile = ref(null);
+    const loading = ref(false);
+
+    async function choose(cowId) {
+      selected.value = cowId;
+      loading.value = true;
+      try {
+        profile.value = await api(`/api/repro/cows/${cowId}`);
+      } catch (e) { toast(e.message, "error"); profile.value = null; }
+      loading.value = false;
+    }
+    onMounted(() => {
+      if (S.reproOverview.length) choose(S.reproOverview[0].cow_id);
+    });
+    watch(() => S.reproTick, () => { if (selected.value) choose(selected.value); });
+    watch(() => S.reproOverview.length, (n) => {
+      if (n && selected.value == null) choose(S.reproOverview[0].cow_id);
+    });
+
+    function addEvent(preset) {
+      openModal({ type: "reproEventForm", rec: { presetCow: selected.value, presetType: preset || null } });
+    }
+    return {
+      S, selected, profile, loading, choose, addEvent, openModal,
+      REPRO_STAGE,
+    };
+  },
+  template: `
+  <div class="repro-layout">
+    <div class="card repro-side">
+      <div class="card-title">牛只繁殖阶段<span class="sub">当前阶段由有效事件实时重算</span></div>
+      <div class="repro-cow-list">
+        <div v-for="c in S.reproOverview" :key="c.cow_id"
+             class="repro-cow" :class="{active:selected===c.cow_id, sold:c.sold}"
+             @click="choose(c.cow_id)">
+          <div class="rc-head">
+            <b>{{ c.ear_tag }}</b> <span class="rc-name">{{ c.name || '' }}</span>
+            <span class="badge" :class="REPRO_STAGE[c.stage].cls">{{ c.stage_label }}</span>
+            <span v-if="c.incomplete_count" class="badge amber" title="有日期不完整旧记录">⚠{{ c.incomplete_count }}</span>
+          </div>
+          <div class="rc-sub">
+            <span v-if="c.stage==='pregnant'">妊娠 {{ c.days_pregnant }} 天 · 预产 {{ c.expected_calving_date || '-' }}</span>
+            <span v-else-if="c.days_in_milk!=null">产后 {{ c.days_in_milk }} 天<span v-if="c.calving_date"> · 产犊 {{ c.calving_date }}</span></span>
+            <span v-else>{{ c.parity }} 胎 · {{ c.group || '未分群' }}</span>
+          </div>
+        </div>
+        <div v-if="!S.reproOverview.length" class="empty">暂无牛只</div>
+      </div>
+    </div>
+
+    <div class="card repro-main">
+      <div v-if="!profile" class="empty" style="padding:60px">请选择左侧牛只</div>
+      <template v-else>
+        <div class="repro-profile-head">
+          <div>
+            <h2 style="margin:0">{{ profile.ear_tag }} {{ profile.name ? '（'+profile.name+'）' : '' }}</h2>
+            <div class="detail-meta" style="margin-top:6px">
+              <span class="badge" :class="REPRO_STAGE[profile.stage].cls">{{ profile.stage_label }}</span>
+              <span class="badge gray">{{ profile.parity }} 胎</span>
+              <span class="badge purple" v-if="profile.days_pregnant!=null">妊娠 {{ profile.days_pregnant }} 天</span>
+              <span class="badge blue" v-if="profile.days_in_milk!=null">泌乳 {{ profile.days_in_milk }} 天</span>
+              <span class="badge green" v-if="profile.expected_calving_date">预产期 {{ profile.expected_calving_date }}</span>
+              <span class="badge amber" v-if="profile.dry_off_date">计划干奶 {{ profile.dry_off_date }}</span>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+            <button class="btn btn-sm" @click="addEvent('estrus')">＋发情</button>
+            <button class="btn btn-sm" @click="addEvent('insemination')">＋配种</button>
+            <button class="btn btn-sm" @click="addEvent('pregnancy_check')">＋孕检</button>
+            <button class="btn btn-sm" @click="addEvent('pregnancy_end')">＋妊娠终止</button>
+            <button class="btn btn-sm btn-primary" @click="addEvent('calving')">＋产犊登记</button>
+          </div>
+        </div>
+
+        <div v-for="w in profile.warnings" :key="w" class="alert-box warning" style="margin:10px 0">⚠️ {{ w }}</div>
+
+        <div class="card-title" style="margin-top:14px">完整繁殖周期
+          <span class="sub">按产犊自动分周期，历史周期永久保留；旧周期结果不会覆盖当前状态</span>
+        </div>
+        <div v-if="loading" class="empty">加载中…</div>
+        <repro-cycle-timeline v-else :cycles="profile.cycles"
+                              :incomplete="profile.incomplete_events"
+                              :changes="profile.changes" :embedded="false"></repro-cycle-timeline>
+
+        <div v-if="profile.changes.length" class="change-log">
+          <div class="card-title" style="margin-top:18px">补录 / 更正影响留痕</div>
+          <div v-for="ch in profile.changes.slice(0,8)" :key="ch.id" class="ch-row">
+            <span class="badge gray">{{ REPRO_ACTION[ch.action] || ch.action }}</span>
+            <span class="ch-summary">{{ ch.summary }}</span>
+            <div class="ch-impact">影响：{{ ch.impact }}</div>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>`,
 };
 
 /* ---------------- 弹窗：奶牛表单 ---------------- */
@@ -679,7 +849,11 @@ const CowFormModal = {
       err.value = "";
       try {
         if (m.cow) {
-          await api(`/api/cows/${m.cow.id}`, { method: "PATCH", body: { ...f } });
+          const body = { ...f };
+          // 产犊/预产期由繁殖事件维护，档案表单不回写
+          delete body.calving_date;
+          delete body.expected_calving_date;
+          await api(`/api/cows/${m.cow.id}`, { method: "PATCH", body });
           toast("档案已更新");
         } else {
           await api("/api/cows", { method: "POST", body: f });
@@ -722,8 +896,10 @@ const CowFormModal = {
         <div class="field"><label>标定日产奶量 kg</label><input type="number" step="0.1" min="0" class="input" v-model.number="f.avg_yield_kg"></div>
       </div>
       <div class="field-row">
-        <div class="field"><label>最近产犊日期</label><input type="date" class="input" v-model="f.calving_date"></div>
-        <div class="field"><label>预产期</label><input type="date" class="input" v-model="f.expected_calving_date"></div>
+        <div class="field"><label>最近产犊日期 <span class="v-sub">（由产犊事件自动维护）</span></label>
+          <input type="date" class="input" v-model="f.calving_date" disabled></div>
+        <div class="field"><label>预产期 <span class="v-sub">（由阳性孕检维护）</span></label>
+          <input type="date" class="input" v-model="f.expected_calving_date" disabled></div>
       </div>
       <div class="field"><label>备注</label><textarea class="input" rows="2" v-model="f.note"></textarea></div>
     </div>
@@ -873,9 +1049,9 @@ const HealthFormModal = {
       <div class="field"><label>诊断 / 项目</label>
         <input class="input" v-model="f.diagnosis" list="diag-list" placeholder="如 临床型乳房炎">
         <datalist id="diag-list">
-          <option value="临床型乳房炎"><option value="隐性乳房炎"><option value="产后子宫炎">
-          <option value="酮病"><option value="瘤胃酸中毒"><option value="蹄叶炎">
-          <option value="呼吸道感染"><option value="口蹄疫O型灭活疫苗">
+          <option value="临床型乳房炎"></option><option value="隐性乳房炎"></option><option value="产后子宫炎"></option>
+          <option value="酮病"></option><option value="瘤胃酸中毒"></option><option value="蹄叶炎"></option>
+          <option value="呼吸道感染"></option><option value="口蹄疫O型灭活疫苗"></option>
         </datalist></div>
       <div class="field-row">
         <div class="field"><label>严重程度</label>
@@ -1020,109 +1196,269 @@ const MedFormModal = {
   </div></div>`,
 };
 
-/* ---------------- 弹窗：发情/配种表单 ---------------- */
-const EstrusFormModal = {
+/* ---------------- 弹窗：繁殖周期事件表单 ---------------- */
+const ReproEventFormModal = {
   setup() {
     const m = topModal();
+    const isEdit = !!m.event?.id;
     const f = reactive(
-      m.rec?.id
-        ? { ...m.rec }
-        : { cow_id: m.rec?.presetCow || null, date: todayStr(), detection: "observed",
-            score: 3, inseminated: false, insemination_date: null, semen: "",
-            technician: "", result: null, result_date: null, note: "" }
+      isEdit
+        ? {
+            ...m.event,
+            event_date: m.event.event_date || null,
+            event_year: m.event.event_year || null,
+            event_month: m.event.event_month || null,
+          }
+        : {
+            cow_id: m.rec?.presetCow || null,
+            event_type: m.rec?.presetType || "insemination",
+            date_precision: "day",
+            event_date: todayStr(),
+            event_year: null,
+            event_month: null,
+            detection: "observed",
+            score: 3,
+            semen: "",
+            technician: "",
+            check_result: "pregnant",
+            expected_calving_date: null,
+            edd_manual: false,
+            end_reason: "abortion",
+            calf_count: 1,
+            calf_sex: "unknown",
+            calf_status: "alive",
+            updates_parity: true,
+            create_paired_estrus: false,
+            linked_event_id: null,
+            note: "",
+          }
     );
     const err = ref("");
+    const cows = computed(() => S.cows.filter((c) => c.status !== "sold"));
+
     async function save() {
       err.value = "";
       try {
-        if (m.rec?.id) {
-          const body = { ...f };
-          delete body.id; delete body.cow_ear_tag; delete body.cow_name;
-          await api(`/api/estruses/${m.rec.id}`, { method: "PATCH", body });
+        const body = { ...f };
+        // 日期精度：只有 day 才传 event_date
+        if (body.date_precision === "month") body.event_date = null;
+        if (body.date_precision !== "day") body.expected_calving_date = null;
+        if (body.date_precision === "unknown") { body.event_year = null; body.event_month = null; }
+        if (body.event_type !== "calving") body.updates_parity = false;
+        let res;
+        if (isEdit) {
+          delete body.id; delete body.cow_id; delete body.event_type; delete body.source;
+          delete body.voided; delete body.void_reason; delete body.edd_manual;
+          res = await api(`/api/repro/events/${m.event.id}`, { method: "PATCH", body });
         } else {
-          await api("/api/estruses", { method: "POST", body: f });
+          res = await api("/api/repro/events", { method: "POST", body });
         }
-        toast("发情/配种记录已保存");
-        await loadEstrusesAll();
         closeModal();
-        refreshDash();
+        await Promise.all([bumpRepro(), loadCows(), refreshDash()]);
+        // 展示对后续事件 / 当前状态的影响
+        openModal({ type: "reproImpact", result: res, isEdit });
       } catch (e) { err.value = e.message; }
     }
-    return { S, f, err, save, closeModal, DETECTION, INSEM_RESULT };
+    return {
+      f, err, save, closeModal, cows, isEdit,
+      REPRO_EVENT, REPRO_PRECISION, REPRO_CHECK, REPRO_END, REPRO_SEX,
+      REPRO_CALF_STATUS, DETECTION,
+    };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal">
-    <div class="modal-head"><h3>发情 / 配种记录</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-head"><h3>{{ isEdit ? '更正繁殖事件' : '登记繁殖事件' }}</h3>
+      <button class="modal-close" @click="closeModal">×</button></div>
     <div class="modal-body">
       <div class="alert-box danger" v-if="err">{{ err }}</div>
+
       <div class="field-row">
         <div class="field"><label>牛只 <span class="req">*</span></label>
-          <select class="input" v-model="f.cow_id" :disabled="!!f.id">
+          <select class="input" v-model="f.cow_id" :disabled="isEdit">
             <option :value="null" disabled>请选择</option>
-            <option v-for="c in S.cows.filter(x=>['lactating','dry'].includes(x.status))" :key="c.id" :value="c.id">
+            <option v-for="c in cows" :key="c.id" :value="c.id">
               {{ c.ear_tag }} {{ c.name || '' }}
             </option>
           </select></div>
-        <div class="field"><label>发情日期</label><input type="date" class="input" v-model="f.date"></div>
+        <div class="field"><label>事件类型 <span class="req">*</span></label>
+          <select class="input" v-model="f.event_type" :disabled="isEdit">
+            <option v-for="(meta,key) in REPRO_EVENT" :key="key" :value="key">{{ meta.ico }} {{ meta.label }}</option>
+          </select></div>
+      </div>
+
+      <div class="field-row">
+        <div class="field"><label>日期精度</label>
+          <select class="input" v-model="f.date_precision">
+            <option value="day">精确到日（参与阶段/预产期/提醒）</option>
+            <option value="month">仅年月（只归档，不参与计算）</option>
+            <option value="unknown">日期缺失（只归档，不会被猜成已完成）</option>
+          </select></div>
       </div>
       <div class="field-row">
-        <div class="field"><label>发现方式</label>
-          <select class="input" v-model="f.detection">
-            <option value="observed">人工观察</option><option value="activity">计步器活动量</option>
-            <option value="detector">尾根蜡笔/检测器</option>
-          </select></div>
-        <div class="field"><label>发情强度</label>
-          <select class="input" v-model.number="f.score">
-            <option :value="null">未评分</option><option :value="1">★</option><option :value="2">★★</option>
-            <option :value="3">★★★</option><option :value="4">★★★★</option><option :value="5">★★★★★</option>
-          </select></div>
+        <div class="field" v-if="f.date_precision==='day'"><label>事件日期</label>
+          <input type="date" class="input" v-model="f.event_date" :max="new Date().toISOString().slice(0,10)"></div>
+        <template v-if="f.date_precision==='month'">
+          <div class="field"><label>年份</label><input type="number" class="input" v-model.number="f.event_year" min="1990" max="2100"></div>
+          <div class="field"><label>月份</label><input type="number" class="input" v-model.number="f.event_month" min="1" max="12"></div>
+        </template>
       </div>
-      <div class="field"><label><input type="checkbox" v-model="f.inseminated"> 本次发情已配种</label></div>
-      <template v-if="f.inseminated">
+      <div class="alert-box warning" v-if="f.date_precision!=='day'" style="margin:4px 0 12px">
+        该记录日期不完整，只作历史归档展示，<b>不会</b>改变当前阶段、预产期和提醒，系统不会推测其具体日期。
+      </div>
+
+      <!-- 发情 -->
+      <template v-if="f.event_type==='estrus'">
         <div class="field-row">
-          <div class="field"><label>配种日期</label>
-            <input type="date" class="input" v-model="f.insemination_date" :min="f.date"></div>
-          <div class="field"><label>冻精编号 / 公牛号</label><input class="input" v-model="f.semen"></div>
-        </div>
-        <div class="field-row">
-          <div class="field"><label>配种员</label><input class="input" v-model="f.technician"></div>
-          <div class="field"><label>孕检结果</label>
-            <select class="input" v-model="f.result">
-              <option value="pending">待孕检（35~42天后）</option>
-              <option value="pregnant">已确认妊娠</option>
-              <option value="negative">未孕</option>
-              <option value="unknown">未确认</option>
+          <div class="field"><label>发现方式</label>
+            <select class="input" v-model="f.detection">
+              <option value="observed">人工观察</option>
+              <option value="activity">计步器活动量</option>
+              <option value="detector">尾根蜡笔/检测器</option>
+            </select></div>
+          <div class="field"><label>发情强度</label>
+            <select class="input" v-model.number="f.score">
+              <option :value="null">未评分</option>
+              <option v-for="n in 5" :key="n" :value="n">{{ '★'.repeat(n) }}</option>
             </select></div>
         </div>
       </template>
-      <div class="field"><label>备注</label><textarea class="input" rows="2" v-model="f.note"></textarea></div>
+
+      <!-- 配种 -->
+      <template v-if="f.event_type==='insemination'">
+        <div class="field-row">
+          <div class="field"><label>冻精编号 / 公牛号</label><input class="input" v-model="f.semen" placeholder="如 HO-2026-0099"></div>
+          <div class="field"><label>配种员</label><input class="input" v-model="f.technician"></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>发现方式（若同时发情）</label>
+            <select class="input" v-model="f.detection">
+              <option value="observed">人工观察</option>
+              <option value="activity">计步器活动量</option>
+              <option value="detector">尾根蜡笔/检测器</option>
+            </select></div>
+          <div class="field"><label>发情强度</label>
+            <select class="input" v-model.number="f.score">
+              <option :value="null">未评分</option>
+              <option v-for="n in 5" :key="n" :value="n">{{ '★'.repeat(n) }}</option>
+            </select></div>
+        </div>
+        <div class="field"><label><input type="checkbox" v-model="f.create_paired_estrus">
+          此前未单独登记发情，同步补建一条同日发情事件（返情复配无需勾选）</label></div>
+      </template>
+
+      <!-- 孕检（可多次） -->
+      <template v-if="f.event_type==='pregnancy_check'">
+        <div class="field-row">
+          <div class="field"><label>孕检结果</label>
+            <select class="input" v-model="f.check_result">
+              <option value="pregnant">妊娠阳性（确认怀孕，可登记预产期）</option>
+              <option value="recheck">疑似/不确定，安排复查（阶段不变）</option>
+              <option value="negative">未孕（本次配种结案，进入返情/复配）</option>
+            </select></div>
+          <div class="field" v-if="f.check_result==='pregnant' && f.date_precision==='day'">
+            <label>预产期（留空则按配种日+280天自动推算）</label>
+            <input type="date" class="input" v-model="f.expected_calving_date">
+          </div>
+        </div>
+        <div class="field"><label>配种员/检查兽医</label><input class="input" v-model="f.technician"></div>
+      </template>
+
+      <!-- 妊娠终止 -->
+      <template v-if="f.event_type==='pregnancy_end'">
+        <div class="field-row">
+          <div class="field"><label>终止原因</label>
+            <select class="input" v-model="f.end_reason">
+              <option v-for="(lab,key) in REPRO_END" :key="key" :value="key">{{ lab }}</option>
+            </select></div>
+        </div>
+        <div class="alert-box warning" style="margin:4px 0 12px">
+          登记后：预产期与待产/干奶提醒立即取消，阶段回到空怀待配；此前的阳性孕检仍保留在周期中。
+        </div>
+      </template>
+
+      <!-- 产犊 -->
+      <template v-if="f.event_type==='calving'">
+        <div class="field-row">
+          <div class="field"><label>犊牛数</label>
+            <input type="number" min="0" max="5" class="input" v-model.number="f.calf_count"></div>
+          <div class="field"><label>性别</label>
+            <select class="input" v-model="f.calf_sex">
+              <option v-for="(lab,key) in REPRO_SEX" :key="key" :value="key">{{ lab }}</option>
+            </select></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>犊牛存活</label>
+            <select class="input" v-model="f.calf_status">
+              <option v-for="(lab,key) in REPRO_CALF_STATUS" :key="key" :value="key">{{ lab }}</option>
+            </select></div>
+          <div class="field"><label>胎次处理</label>
+            <label style="display:flex;align-items:center;height:38px">
+              <input type="checkbox" v-model="f.updates_parity" style="margin-right:8px"> 本次产犊推进胎次 +1（作废时自动回退）
+            </label></div>
+        </div>
+        <div class="alert-box warning" style="margin:4px 0 12px">
+          登记后：本繁殖周期闭合，阶段进入“产后空怀”，牛群状态衔接为泌乳中，预产期/待产提醒关闭，
+          并开启产后 40–80 天首配窗口；返情复配、再孕检将进入新周期。
+        </div>
+      </template>
+
+      <div class="field"><label>备注</label><textarea class="input" rows="2" v-model="f.note"
+        placeholder="补录旧事件时建议注明资料来源，更正时写明原因"></textarea></div>
     </div>
     <div class="modal-foot">
       <button class="btn" @click="closeModal">取消</button>
-      <button class="btn btn-primary" @click="save">保存</button>
+      <button class="btn btn-primary">{{ isEdit ? '保存更正' : '保存并查看影响' }}</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：事件写入后的影响说明 ---------------- */
+const ReproImpactModal = {
+  setup() {
+    const m = topModal();
+    const res = m.result || {};
+    return { closeModal, res };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal modal-sm">
+    <div class="modal-head"><h3>✅ 已保存 · 对后续事件与当前状态的影响</h3>
+      <button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div v-for="(w,i) in (res.warnings||[])" :key="'w'+i" class="alert-box warning">⚠️ {{ w }}</div>
+      <div v-if="(res.impacts||[]).length" class="impact-list">
+        <div v-for="(im,i) in res.impacts" :key="'i'+i" class="impact-item">
+          <span class="impact-bullet">→</span> {{ im }}
+        </div>
+      </div>
+      <div v-else class="empty">当前阶段、预产期与后续提醒无变化（事件已归入历史周期）。</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" @click="closeModal">知道了</button>
     </div>
   </div></div>`,
 };
 
 /* ---------------- 弹窗：牛只详情 ---------------- */
 const CowDetailModal = {
-  components: { Sparkline },
+  components: { Sparkline, ReproCycleTimeline },
   setup() {
     const m = topModal();
     const d = ref(null);
     const tab = ref("overview");
-    onMounted(async () => {
+    async function reload() {
       try { d.value = await api(`/api/cows/${m.id}`); } catch (e) { toast(e.message, "error"); closeModal(); }
-    });
-    // 从详情中打开的子弹窗关闭后，自动重新拉取详情
+    }
+    onMounted(reload);
+    // 从详情中打开的子弹窗关闭后，或繁殖事件写入后，自动重新拉取详情
     watch(
       () => S.modals.length,
       async (n, old) => {
         if (n < old && n > 0 && topModal()?.type === "cowDetail" && topModal()?.id === m.id) {
-          d.value = await api(`/api/cows/${m.id}`);
+          await reload();
         }
       }
     );
+    watch(() => S.reproTick, reload);
     const spark = computed(() =>
       (d.value?.yield_trend || []).map((t) => ({ label: t.date.slice(8), v: t.yield_kg }))
     );
@@ -1130,7 +1466,10 @@ const CowDetailModal = {
       const preset = { presetCow: d.value.id };
       openModal({ type, rec: preset });
     }
-    return { d, tab, spark, addRecord, closeModal, SESSION, H_TYPE, SEVERITY, H_RESULT, DETECTION, INSEM_RESULT, addDays };
+    const reproStageCls = (s) => (REPRO_STAGE[s]?.cls) || "gray";
+    const reproAction = (a) => ({ create: "补录", update: "更正", void: "作废", delete: "删除" }[a] || a);
+    return { d, tab, spark, addRecord, closeModal, SESSION, H_TYPE, SEVERITY, H_RESULT,
+             addDays, reproStageCls, reproAction };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal wide" v-if="d">
@@ -1152,7 +1491,7 @@ const CowDetailModal = {
           <button class="btn btn-sm" @click="addRecord('milkingForm')">＋挤奶</button>
           <button class="btn btn-sm" @click="addRecord('healthForm')">＋健康</button>
           <button class="btn btn-sm" @click="addRecord('medForm')">＋用药</button>
-          <button class="btn btn-sm" @click="addRecord('estrusForm')">＋发情</button>
+          <button class="btn btn-sm btn-primary" @click="addRecord('reproEventForm')">＋繁殖事件</button>
         </div>
       </div>
 
@@ -1160,23 +1499,41 @@ const CowDetailModal = {
 
       <div class="kv-grid">
         <div><div class="k">出生日期</div><div class="v">{{ d.birth_date }}</div></div>
-        <div><div class="k">最近产犊</div><div class="v">{{ d.calving_date || '-' }}</div></div>
-        <div><div class="k">预产期</div><div class="v">{{ d.expected_calving_date || '-' }}</div></div>
-        <div><div class="k">标定日产</div><div class="v">{{ d.avg_yield_kg ?? '-' }} kg</div></div>
+        <div><div class="k">最近产犊</div><div class="v">{{ d.calving_date || '-' }}
+          <div class="v-sub">由产犊事件自动维护</div></div></div>
+        <div><div class="k">预产期</div><div class="v">{{ d.expected_calving_date || '-' }}
+          <div class="v-sub">由阳性孕检维护</div></div></div>
+        <div><div class="k">当前繁殖阶段</div><div class="v">
+          <span class="badge" :class="reproStageCls(d.repro.stage)">{{ d.repro.stage_label }}</span></div></div>
       </div>
 
       <div class="tabs">
         <button class="tab" :class="{active:tab==='overview'}" @click="tab='overview'">概览</button>
+        <button class="tab" :class="{active:tab==='repro'}" @click="tab='repro'">繁殖周期</button>
         <button class="tab" :class="{active:tab==='milkings'}" @click="tab='milkings'">挤奶记录</button>
         <button class="tab" :class="{active:tab==='health'}" @click="tab='health'">健康</button>
         <button class="tab" :class="{active:tab==='meds'}" @click="tab='meds'">用药/休药</button>
-        <button class="tab" :class="{active:tab==='estruses'}" @click="tab='estruses'">发情配种</button>
       </div>
 
       <div v-if="tab==='overview'">
         <div class="card-title">近7天日产奶量（不含废弃）</div>
         <sparkline :points="spark"></sparkline>
         <p v-if="d.note" style="color:#6b7280;margin-top:14px">备注：{{ d.note }}</p>
+      </div>
+
+      <div v-if="tab==='repro'">
+        <div v-for="w in d.repro.warnings" :key="w" class="alert-box warning">⚠️ {{ w }}</div>
+        <repro-cycle-timeline :cycles="d.repro.cycles"
+                              :incomplete="d.repro.incomplete_events"
+                              :changes="d.repro.changes"></repro-cycle-timeline>
+        <div v-if="d.repro.changes.length" class="change-log" style="margin-top:14px">
+          <div class="card-title">补录 / 更正影响留痕</div>
+          <div v-for="ch in d.repro.changes.slice(0,8)" :key="ch.id" class="ch-row">
+            <span class="badge gray">{{ reproAction(ch.action) }}</span>
+            <span class="ch-summary">{{ ch.summary }}</span>
+            <div class="ch-impact">影响：{{ ch.impact }}</div>
+          </div>
+        </div>
       </div>
 
       <div v-if="tab==='milkings'" class="table-wrap"><table class="data">
@@ -1222,18 +1579,6 @@ const CowDetailModal = {
           <tr v-if="!d.medications.length"><td colspan="6" class="empty">无用药记录</td></tr>
         </tbody></table>
       </div>
-
-      <div v-if="tab==='estruses'" class="table-wrap"><table class="data">
-        <thead><tr><th>发情日</th><th>方式</th><th>配种日</th><th>冻精</th><th>结果</th></tr></thead>
-        <tbody>
-          <tr v-for="e in d.estruses" :key="e.id">
-            <td>{{ e.date }}</td><td>{{ DETECTION[e.detection] }} {{ e.score ? '★'.repeat(e.score) : '' }}</td>
-            <td>{{ e.insemination_date || '未配' }}</td><td>{{ e.semen || '-' }}</td>
-            <td><span class="badge" :class="{'green':e.result==='pregnant','red':!e.inseminated,'gray':e.result==='negative'}">{{ INSEM_RESULT[e.result] || (e.inseminated ? '待检' : '待配') }}</span></td>
-          </tr>
-          <tr v-if="!d.estruses.length"><td colspan="5" class="empty">无记录</td></tr>
-        </tbody></table>
-      </div>
     </div>
   </div></div>`,
 };
@@ -1242,7 +1587,7 @@ const CowDetailModal = {
 const App = {
   components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage,
     CowFormModal, MilkingFormModal, HealthFormModal, DrugFormModal,
-    MedFormModal, EstrusFormModal, CowDetailModal },
+    MedFormModal, ReproEventFormModal, ReproImpactModal, CowDetailModal },
   setup() {
     onMounted(async () => {
       try {
@@ -1299,7 +1644,8 @@ const App = {
       <health-form-modal v-else-if="md.type==='healthForm'"></health-form-modal>
       <drug-form-modal v-else-if="md.type==='drugForm'"></drug-form-modal>
       <med-form-modal v-else-if="md.type==='medForm'"></med-form-modal>
-      <estrus-form-modal v-else-if="md.type==='estrusForm'"></estrus-form-modal>
+      <repro-event-form-modal v-else-if="md.type==='reproEventForm'"></repro-event-form-modal>
+      <repro-impact-modal v-else-if="md.type==='reproImpact'"></repro-impact-modal>
       <cow-detail-modal v-else-if="md.type==='cowDetail'"></cow-detail-modal>
     </template>
 

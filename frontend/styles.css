@@ -316,3 +316,77 @@ table.data .num { text-align: right; font-variant-numeric: tabular-nums; }
   .main { margin-left: 0; }
   .grid-4, .grid-2, .field-row { grid-template-columns: 1fr; }
 }
+
+/* ---------- 繁殖周期 ---------- */
+.alert-box.warning { background: var(--amber-100); color: #92400e; border: 1px solid #fde68a; }
+.v-sub { font-size: 11px; color: var(--gray-500); font-weight: 400; }
+.modal.modal-sm { width: 560px; }
+
+.repro-layout { display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }
+.repro-side { position: sticky; top: 12px; }
+.repro-cow-list { max-height: calc(100vh - 180px); overflow-y: auto; }
+.repro-cow { padding: 9px 12px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; margin-bottom: 4px; }
+.repro-cow:hover { background: var(--gray-100); }
+.repro-cow.active { background: #ecfdf5; border-color: var(--green-600); }
+.repro-cow.sold { opacity: .55; }
+.rc-head { display: flex; align-items: center; gap: 6px; font-size: 13.5px; }
+.rc-name { color: var(--gray-500); font-weight: 400; margin-right: auto; }
+.rc-sub { font-size: 12px; color: var(--gray-500); margin-top: 3px; }
+
+.repro-profile-head { display: flex; justify-content: space-between; gap: 16px;
+                      align-items: flex-start; flex-wrap: wrap; }
+
+.repro-tl { margin-top: 8px; }
+.cycle { border: 1px solid var(--gray-100); border-radius: 10px; margin-bottom: 12px; overflow: hidden; }
+.cycle.current { border-color: #a7f3d0; background: #f8fffb; }
+.cycle.closed { opacity: .92; }
+.cycle-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+              background: #f9fafb; font-size: 13.5px; }
+.cycle.current .cycle-head { background: #ecfdf5; }
+.cycle-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--gray-300); }
+.cycle.current .cycle-dot { background: var(--green-600); }
+.cycle-dot.pulse { box-shadow: 0 0 0 0 rgba(5,150,105,.5); animation: pulse 1.8s infinite; }
+@keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(5,150,105,.45)} 70%{box-shadow:0 0 0 8px rgba(5,150,105,0)} 100%{box-shadow:0 0 0 0 rgba(5,150,105,0)} }
+.cycle-range { color: var(--gray-500); font-size: 12.5px; }
+.cycle-stats { font-size: 12px; color: var(--gray-500); }
+.cycle-toggle { font-size: 12px; color: var(--green-700); }
+.spacer { flex: 1; }
+.cycle-body { padding: 12px 14px 4px; }
+
+.tl-row { position: relative; display: flex; padding-left: 2px; }
+.tl-ico { width: 30px; height: 30px; border-radius: 50%; flex: 0 0 30px; display: flex;
+         align-items: center; justify-content: center; font-size: 14px; background: #fff;
+         border: 2px solid var(--gray-200); z-index: 1; }
+.tl-ico.green { border-color: var(--green-600); background: #ecfdf5; }
+.tl-ico.blue { border-color: #3b82f6; background: #eff6ff; }
+.tl-ico.red { border-color: var(--red-500); background: var(--red-100); }
+.tl-ico.purple { border-color: #7c3aed; background: #f5f3ff; }
+.tl-ico.amber { border-color: #d97706; background: var(--amber-100); }
+.tl-line { position: absolute; left: 16px; top: 30px; bottom: -8px; width: 2px; background: var(--gray-200); }
+.tl-row:last-child .tl-line { display: none; }
+.tl-card { flex: 1; margin: 0 0 14px 12px; padding: 8px 12px; border: 1px solid var(--gray-100);
+           border-radius: 8px; background: #fff; }
+.tl-top { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.tl-type { color: var(--green-700); font-weight: 600; }
+.tl-detail { font-size: 12.5px; color: #374151; margin-top: 3px; }
+.tl-note { color: var(--gray-500); }
+.edd-mode { color: var(--gray-400); font-size: 11.5px; }
+.tl-actions { margin-top: 6px; display: flex; gap: 14px; font-size: 12px; }
+
+.incomplete-box { margin: 10px 0; padding: 10px 14px; border: 1px dashed #d97706;
+                  border-radius: 8px; background: #fffbeb; }
+.incomplete-head { font-size: 12.5px; color: #92400e; margin-bottom: 6px; }
+.inc-row { font-size: 12.5px; color: #78350f; padding: 2px 0; }
+.inc-date { font-weight: 600; margin-right: 8px; }
+
+.change-log { border-top: 1px dashed var(--gray-200); padding-top: 6px; }
+.ch-row { font-size: 12.5px; padding: 8px 0; border-bottom: 1px dashed var(--gray-100); }
+.ch-summary { margin-left: 8px; color: #374151; }
+.ch-impact { color: var(--green-700); margin-top: 3px; padding-left: 52px; }
+
+.impact-list { display: flex; flex-direction: column; gap: 10px; }
+.impact-item { font-size: 13.5px; color: #374151; padding: 8px 12px; background: #ecfdf5;
+               border-radius: 8px; border-left: 3px solid var(--green-600); }
+.impact-bullet { color: var(--green-700); font-weight: 700; margin-right: 6px; }
+
+@media (max-width: 1100px) { .repro-layout { grid-template-columns: 1fr; } }

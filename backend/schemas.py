@@ -212,3 +212,59 @@ class EstrusOut(EstrusCreate):
 
     class Config:
         from_attributes = True
+
+
+# ---------- 繁殖周期事件 ----------
+_EVENT_TYPES = "^(estrus|insemination|pregnancy_check|pregnancy_end|calving)$"
+_DATE_PRECISION = "^(day|month|unknown)$"
+_CHECK_RESULTS = "^(pregnant|negative|recheck)$"
+_END_REASONS = "^(abortion|stillbirth|cull_pregnant|other)$"
+_CALF_SEX = "^(male|female|mixed|unknown)$"
+_CALF_STATUS = "^(alive|dead|mixed)$"
+
+
+class ReproEventCreate(BaseModel):
+    cow_id: int
+    event_type: str = Field(..., pattern=_EVENT_TYPES)
+    event_date: Optional[date] = None
+    date_precision: str = Field("day", pattern=_DATE_PRECISION)
+    event_year: Optional[int] = Field(None, ge=1990, le=2100)
+    event_month: Optional[int] = Field(None, ge=1, le=12)
+    detection: Optional[str] = Field(None, pattern="^(observed|activity|detector)$")
+    score: Optional[int] = Field(None, ge=1, le=5)
+    semen: Optional[str] = Field(None, max_length=64)
+    technician: Optional[str] = Field(None, max_length=32)
+    check_result: Optional[str] = Field(None, pattern=_CHECK_RESULTS)
+    expected_calving_date: Optional[date] = None
+    end_reason: Optional[str] = Field(None, pattern=_END_REASONS)
+    calf_count: Optional[int] = Field(None, ge=0, le=5)
+    calf_sex: Optional[str] = Field(None, pattern=_CALF_SEX)
+    calf_status: Optional[str] = Field(None, pattern=_CALF_STATUS)
+    updates_parity: bool = False
+    linked_event_id: Optional[int] = None
+    create_paired_estrus: bool = False
+    note: Optional[str] = None
+
+
+class ReproEventUpdate(BaseModel):
+    event_date: Optional[date] = None
+    date_precision: Optional[str] = Field(None, pattern=_DATE_PRECISION)
+    event_year: Optional[int] = Field(None, ge=1990, le=2100)
+    event_month: Optional[int] = Field(None, ge=1, le=12)
+    detection: Optional[str] = Field(None, pattern="^(observed|activity|detector)$")
+    score: Optional[int] = Field(None, ge=1, le=5)
+    semen: Optional[str] = Field(None, max_length=64)
+    technician: Optional[str] = Field(None, max_length=32)
+    check_result: Optional[str] = Field(None, pattern=_CHECK_RESULTS)
+    expected_calving_date: Optional[date] = None
+    end_reason: Optional[str] = Field(None, pattern=_END_REASONS)
+    calf_count: Optional[int] = Field(None, ge=0, le=5)
+    calf_sex: Optional[str] = Field(None, pattern=_CALF_SEX)
+    calf_status: Optional[str] = Field(None, pattern=_CALF_STATUS)
+    updates_parity: Optional[bool] = None
+    linked_event_id: Optional[int] = None
+    note: Optional[str] = None
+
+
+class ReproEventVoid(BaseModel):
+    reason: str = Field(..., min_length=2, max_length=300)

@@ -9,6 +9,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    JSON,
     String,
     Text,
 )
@@ -45,6 +46,9 @@ class Cow(Base):
     health_records = relationship("HealthRecord", back_populates="cow", cascade="all, delete-orphan")
     medications = relationship("Medication", back_populates="cow", cascade="all, delete-orphan")
     estruses = relationship("EstrusRecord", back_populates="cow", cascade="all, delete-orphan")
+    reproductive_events = relationship(
+        "ReproEvent", back_populates="cow", cascade="all, delete-orphan"
+    )
 
 
 class MilkingRecord(Base):
@@ -146,3 +150,91 @@ class EstrusRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     cow = relationship("Cow", back_populates="estruses")
+
+
+class AppMeta(Base):
+    """系统级迁移标记"""
+
+    __tablename__ = "app_meta"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ReproEvent(Base):
+    """
+    繁殖周期内的不可覆盖业务事件。
+
+    日期支持 day/month/unknown 三种精度：旧资料只有年月或日期缺失时仍可归档，
+    但不参与当前阶段、预产期和提醒计算，避免把不完整记录猜成已完成。
+    """
+
+    __tablename__ = "reproductive_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    cow_id = Column(Integer, ForeignKey("cows.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(
+        String(24),
+        nullable=False,
+        index=True,
+        comment="estrus 发情 / insemination 配种 / pregnancy_check 孕检 "
+                "/ pregnancy_end 妊娠终止 / calving 产犊",
+    )
+    event_date = Column(Date, nullable=True, index=True, comment="精确日期；月/未知时可为空")
+    date_precision = Column(
+        String(8), nullable=False, default="day",
+        comment="day 精确到日 / month 精确到月 / unknown 日期缺失",
+    )
+    event_year = Column(Integer, nullable=True)
+    event_month = Column(Integer, nullable=True)
+
+    detection = Column(String(16), nullable=True, comment="发情发现方式")
+    score = Column(Integer, nullable=True, comment="发情强度 1-5")
+    semen = Column(String(64), nullable=True, comment="冻精编号/公牛号")
+    technician = Column(String(32), nullable=True)
+    check_result = Column(
+        String(16), nullable=True,
+        comment="pregnant 妊娠阳性 / negative 未孕 / recheck 疑似需复查",
+    )
+    expected_calving_date = Column(Date, nullable=True, comment="本次孕检确认/手工校正的预产期")
+    edd_manual = Column(Boolean, default=False, comment="预产期是否手工校正；否则随配种日自动推算")
+    end_reason = Column(
+        String(24), nullable=True,
+        comment="abortion 流产 / stillbirth 死产终止 / cull_pregnant 孕牛淘汰 / other 其他",
+    )
+    calf_count = Column(Integer, nullable=True, comment="产犊数")
+    calf_sex = Column(String(16), nullable=True, comment="male/female/mixed/unknown")
+    calf_status = Column(String(16), nullable=True, comment="alive/dead/mixed")
+    updates_parity = Column(Boolean, default=False, comment="产犊事件是否推进档案胎次")
+    linked_event_id = Column(
+        Integer, ForeignKey("reproductive_events.id", ondelete="SET NULL"),
+        nullable=True, index=True, comment="孕检/终止关联的配种，发情关联上一事件等",
+    )
+    source = Column(String(24), default="manual", comment="manual 手工 / legacy 旧表迁移")
+    voided = Column(Boolean, default=False, index=True, comment="作废而非物理删除")
+    void_reason = Column(Text, nullable=True)
+    extras = Column(JSON, nullable=True)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    cow = relationship("Cow", back_populates="reproductive_events")
+    linked_event = relationship("ReproEvent", remote_side=[id], foreign_keys=[linked_event_id])
+
+
+class ReproEventChange(Base):
+    """繁殖事件补录、更正、作废的影响说明留痕"""
+
+    __tablename__ = "reproductive_event_changes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(
+        Integer, ForeignKey("reproductive_events.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    cow_id = Column(Integer, ForeignKey("cows.id", ondelete="CASCADE"), nullable=False, index=True)
+    action = Column(String(16), nullable=False, comment="create/update/void/delete")
+    change_summary = Column(Text, nullable=True, comment="字段变化摘要")
+    impact = Column(Text, nullable=True, comment="对后续事件和当前状态的影响")
+    created_at = Column(DateTime, default=datetime.utcnow)

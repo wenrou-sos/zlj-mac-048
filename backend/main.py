@@ -9,12 +9,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from . import models, schemas, services
-from .database import Base, engine, get_db
+from . import models, schemas, services, reproductive
+from .database import Base, SessionLocal, engine, get_db
 from .seed import init_db
 
 Base.metadata.create_all(bind=engine)
 init_db()
+
+# 旧发情/配种表 → 繁殖周期事件的一次性幂等迁移
+_db = SessionLocal()
+try:
+    reproductive.migrate_legacy(_db, date.today())
+finally:
+    _db.close()
 
 app = FastAPI(title="牧场管理系统 API", version="1.0.0")
 
@@ -193,6 +200,7 @@ def cow_detail(cow_id: int, db: Session) -> dict:
             "result_date": str(e.result_date) if e.result_date else None, "note": e.note,
         } for e in estruses],
         "yield_trend": trend,
+        "repro": reproductive.build_profile(db, cow, today),
     }
 
 
@@ -548,6 +556,40 @@ def delete_estrus(rec_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "未找到该记录")
     db.delete(e)
     db.commit()
+
+
+# ---------------- 繁殖周期事件 ----------------
+@app.get("/api/repro/overview")
+def repro_overview(db: Session = Depends(get_db)):
+    return reproductive.overview(db, date.today())
+
+
+@app.get("/api/repro/cows/{cow_id}")
+def repro_cow_profile(cow_id: int, db: Session = Depends(get_db)):
+    cow = db.get(models.Cow, cow_id)
+    if not cow:
+        raise HTTPException(404, "未找到该牛")
+    return reproductive.build_profile(db, cow, date.today())
+
+
+@app.post("/api/repro/events", status_code=201)
+def repro_create(payload: schemas.ReproEventCreate, db: Session = Depends(get_db)):
+    return reproductive.create_event(db, payload, date.today())
+
+
+@app.patch("/api/repro/events/{event_id}")
+def repro_update(event_id: int, payload: schemas.ReproEventUpdate, db: Session = Depends(get_db)):
+    return reproductive.update_event(db, event_id, payload, date.today())
+
+
+@app.post("/api/repro/events/{event_id}/void")
+def repro_void(event_id: int, payload: schemas.ReproEventVoid, db: Session = Depends(get_db)):
+    return reproductive.void_event(db, event_id, payload.reason, date.today())
+
+
+@app.delete("/api/repro/events/{event_id}", status_code=204)
+def repro_delete(event_id: int, db: Session = Depends(get_db)):
+    reproductive.delete_event(db, event_id, date.today())
 
 
 # ---------------- 提醒 / 异常 / 仪表盘 ----------------
