@@ -302,6 +302,19 @@ def _lightweight_migrations() -> None:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE medications ADD COLUMN voucher_id INTEGER"))
 
+    # 修复历史浮点尾数：REAL 列多次 0.1 加减后可能出现 0.09999999999999998
+    # （与 0.1 的差仅约 2.8e-17），会把最后一点库存误判为不足。
+    # 无条件幂等规整到千分位、±1e-9 内归零；干净值 ROUND 后双精度不变。
+    if "drug_batches" in tables:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE drug_batches SET "
+                "qty_ok = CASE WHEN ABS(ROUND(qty_ok,3)) < 1e-9 THEN 0 "
+                "             ELSE ROUND(qty_ok,3) END, "
+                "qty_quarantine = CASE WHEN ABS(ROUND(qty_quarantine,3)) < 1e-9 THEN 0 "
+                "             ELSE ROUND(qty_quarantine,3) END"
+            ))
+
 
 def init_db(force: bool = False) -> None:
     import os

@@ -11,7 +11,7 @@
 from datetime import date
 from typing import Dict, List, Optional
 
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from . import models
@@ -29,20 +29,33 @@ VOUCHER_LABEL = {
     "writeoff": "报损", "check": "盘点", "revoke": "撤销领用",
 }
 
+# 库存数量统一以千分之一为最小记账单位；小于该值的差异视为浮点尾数而非真实差异。
+# 否则 0.3-0.1-0.1 在 REAL 列里变成 0.09999999999999998，领最后 0.1 会被误判不足。
+QTY_EPS = 1e-9
+QTY_DIGITS = 3
+
+
+def r3(x: float) -> float:
+    return round(float(x), QTY_DIGITS)
+
+
+def enough(balance: float, need: float) -> bool:
+    """余额是否足以扣减 need（容忍浮点尾数），但绝不容忍真实超扣。"""
+    return float(balance) + QTY_EPS >= float(need)
+
 
 class StockError(Exception):
     """库存业务规则错误（映射为 HTTP 400/409）"""
 
 
 # ---------------- 单号 ----------------
-def new_voucher_no(db: Session, vtype: str, on_date: date) -> str:
-    prefix = VOUCHER_PREFIX[vtype]
-    day = on_date.strftime("%Y%m%d")
-    like = f"{prefix}-{day}-%"
-    count = db.query(models.StockVoucher).filter(
-        models.StockVoucher.voucher_no.like(like)
-    ).count()
-    return f"{prefix}-{day}-{count + 1:03d}"
+def assign_voucher_no(v: models.StockVoucher) -> None:
+    """
+    用插入后才分配的全局自增 id 生成单号（前缀-日期-id）。
+    不能用 count()+1：并发时两次 count 都发生在拿到写锁之前，会撞号。
+    自增 id 在 IMMEDIATE 写锁内串行分配，天然唯一。
+    """
+    v.voucher_no = f"{VOUCHER_PREFIX[v.voucher_type]}-{v.voucher_date:%Y%m%d}-{v.id:04d}"
 
 
 # ---------------- 批次查询 / FEFO ----------------
@@ -69,22 +82,22 @@ def suggest_issue(db: Session, drug_id: int, qty: float, on_date: date) -> dict:
     """FEFO 自动凑量：从近效期批次开始分配，支持跨批次凑齐"""
     if qty <= 0:
         raise StockError("领用数量必须大于 0")
-    allocations, remain = [], qty
+    allocations, remain = [], r3(qty)
     for b in available_batches(db, drug_id, on_date):
-        if remain <= 0:
+        if remain <= QTY_EPS:
             break
-        take = round(min(b.qty_ok, remain), 3)
+        take = r3(min(b.qty_ok, remain))
         if take > 0:
             allocations.append({
                 "batch_id": b.id, "batch_no": b.batch_no,
                 "expiry_date": str(b.expiry_date),
-                "available": b.qty_ok, "qty": take,
+                "available": r3(b.qty_ok), "qty": take,
             })
-            remain = round(remain - take, 3)
+            remain = r3(remain - take)
     return {
         "allocations": allocations,
-        "shortage": max(0.0, remain),
-        "fulfilled": remain <= 0,
+        "shortage": r3(max(0.0, remain)),
+        "fulfilled": remain <= QTY_EPS,
     }
 
 
@@ -100,19 +113,34 @@ def _adjust_batch(
     values = {}
     if delta_ok:
         if delta_ok < 0:
-            conds.append(models.DrugBatch.qty_ok >= -delta_ok)
-        values["qty_ok"] = models.DrugBatch.qty_ok + delta_ok
+            # 留 QTY_EPS 容差：账面 0.09999999999999998 允许扣掉 0.1；
+            # 条件 UPDATE 仍是“不能扣成负数”的硬保证，真实超扣照样 rowcount=0
+            conds.append(models.DrugBatch.qty_ok + QTY_EPS >= -delta_ok)
+        values["qty_ok"] = func.round(models.DrugBatch.qty_ok + delta_ok, QTY_DIGITS)
     if delta_quar:
         if delta_quar < 0:
-            conds.append(models.DrugBatch.qty_quarantine >= -delta_quar)
-        values["qty_quarantine"] = models.DrugBatch.qty_quarantine + delta_quar
+            conds.append(models.DrugBatch.qty_quarantine + QTY_EPS >= -delta_quar)
+        values["qty_quarantine"] = func.round(
+            models.DrugBatch.qty_quarantine + delta_quar, QTY_DIGITS)
     if not values:
         raise StockError("变动数量为 0")
     result = db.execute(update(models.DrugBatch).where(*conds).values(**values))
     if result.rowcount != 1:
         raise StockError("库存不足或批次不存在，操作被拒绝")
     db.expire_all()
-    return db.get(models.DrugBatch, batch_id)
+    batch = db.get(models.DrugBatch, batch_id)
+    # 把 -0.0 / 正的极小尾数归零，避免界面出现 0.10000000000000003
+    changed = {}
+    if abs(batch.qty_ok) < QTY_EPS:
+        changed["qty_ok"] = 0.0
+    if abs(batch.qty_quarantine) < QTY_EPS:
+        changed["qty_quarantine"] = 0.0
+    if changed:
+        db.execute(update(models.DrugBatch).where(
+            models.DrugBatch.id == batch_id).values(**changed))
+        db.expire_all()
+        batch = db.get(models.DrugBatch, batch_id)
+    return batch
 
 
 def _append_ledger(
@@ -137,13 +165,16 @@ def _create_voucher(db: Session, *, vtype: str, on_date: date,
                     purpose: Optional[str] = None,
                     operator: Optional[str] = None,
                     note: Optional[str] = None) -> models.StockVoucher:
+    # 先占位，flush 拿到自增 id 后回填单号（避免并发 count()+1 撞号）
     v = models.StockVoucher(
-        voucher_no=new_voucher_no(db, vtype, on_date), voucher_type=vtype,
+        voucher_no="", voucher_type=vtype,
         voucher_date=on_date, drug_id=drug_id, cow_id=cow_id, status="posted",
         disposition=disposition, related_voucher_id=related_voucher_id,
         purpose=purpose, operator=operator, note=note,
     )
     db.add(v)
+    db.flush()
+    assign_voucher_no(v)
     db.flush()
     return v
 
@@ -228,10 +259,10 @@ def create_issue(db: Session, *, drug_id: int, lines: List[dict], voucher_date: 
             raise StockError(
                 f"批号 {b.batch_no} 已于 {b.expiry_date} 过期，禁止发出"
             )
-        if b.qty_ok < qty:
+        if not enough(b.qty_ok, qty):
             raise StockError(
-                f"批号 {b.batch_no} 可发库存仅 {b.qty_ok}{drug.unit}，"
-                f"不足 {qty}{drug.unit}，整单未出库"
+                f"批号 {b.batch_no} 可发库存仅 {r3(b.qty_ok)}{drug.unit}，"
+                f"不足 {r3(qty)}{drug.unit}，整单未出库"
             )
         batches[bid] = (b, qty)
 
@@ -395,12 +426,19 @@ def create_stocktake(db: Session, items: List[dict], *, voucher_date: date,
         operator=operator, note=note,
     )
     for b, actual_ok, actual_quar in rows:
-        delta_ok = round(actual_ok - b.qty_ok, 3)
-        delta_quar = round(actual_quar - b.qty_quarantine, 3)
+        # 账面先按记账精度规整，避免历史浮点尾数（0.09999999999999998）
+        # 在实盘录入 0.1 时被误判成盘亏
+        book_ok, book_quar = r3(b.qty_ok), r3(b.qty_quarantine)
+        delta_ok = r3(actual_ok - book_ok)
+        delta_quar = r3(actual_quar - book_quar)
+        if abs(delta_ok) < QTY_EPS:
+            delta_ok = 0.0
+        if abs(delta_quar) < QTY_EPS:
+            delta_quar = 0.0
         db.add(models.StockVoucherLine(
-            voucher_id=voucher.id, batch_id=b.id, qty=b.qty_ok,
+            voucher_id=voucher.id, batch_id=b.id, qty=book_ok,
             qty_actual=actual_ok, qty_opened=actual_quar,
-            note=f"待毁账面 {b.qty_quarantine:g} 实盘 {actual_quar:g}",
+            note=f"待毁账面 {book_quar:g} 实盘 {actual_quar:g}",
         ))
         if delta_ok == 0 and delta_quar == 0:
             db.add(models.StockLedger(
@@ -493,7 +531,7 @@ def batch_to_dict(b: models.DrugBatch, today: Optional[date] = None,
         "unit": drug.unit if drug else None,
         "batch_no": b.batch_no, "expiry_date": str(b.expiry_date),
         "inbound_date": str(b.inbound_date),
-        "qty_ok": b.qty_ok, "qty_quarantine": b.qty_quarantine,
+        "qty_ok": r3(b.qty_ok), "qty_quarantine": r3(b.qty_quarantine),
         "supplier": b.supplier, "active": b.active, "note": b.note,
         "days_to_expiry": days, "status": status,
     }
