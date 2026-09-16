@@ -42,6 +42,24 @@
 - 休药期内登记挤奶：**自动标记为废弃奶**并给出警告，从根本上杜绝违规混装
 - 挤奶列表/仪表盘可筛查历史**违规混装**记录（休药期内却未废弃），一键补标废弃
 
+### 🧾 记录版本化与可追溯（挤奶 / 健康 / 用药）
+
+所有挤奶、健康、用药记录改为**只追加、可追溯**，不再“改完只剩新值、误删无法追查”：
+
+- **更正留痕**：每次更正记录操作人、原因、变更前后内容，版本号 +1，历史版本永久保留
+- **作废替代删除**：删除即**软作废**，记录从业务视图隐藏但不丢失，可随时恢复
+- **撤销更正**：可沿版本链回到任一历史版本内容（以新版本方式回退，不抹掉历史）
+- **牛只时间线**：牛只详情「🕓 变更时间线」按牛只聚合三类记录的全部版本（含已作废）
+- **操作前影响预览**：作废 / 恢复 / 撤销前先模拟，清晰展示对
+  **奶量统计（上市/废弃 kg）、休药期校验（违规混装条数）、各类提醒**的增删影响
+- **防覆盖与原子性**：基于版本号的乐观锁，他人已改动会拒绝覆盖；恢复时若与现有记录冲突
+  （如同日同班已有挤奶记录）整单失败；全部写操作单事务提交，**失败不恢复一半**
+- **历史起点**：启用版本管理前的存量数据自动标注为「历史起点」，**不虚构过去的操作人**，
+  历史起点条目的操作人显式留空
+- **免账号体系**：操作人在顶栏手填、仅记忆在本机浏览器（localStorage），无需登录即可留痕
+
+> 发情/配种记录暂未纳入版本化；删除奶牛档案仍为硬删除（其业务记录随级联删除，审计日志保留）。
+
 ## 🚀 快速开始
 
 ```bash
@@ -79,10 +97,12 @@ python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 ```
 dairy-farm/
 ├── backend/
-│   ├── main.py        # FastAPI 路由（CRUD + 仪表盘 + 校验）
-│   ├── models.py      # SQLAlchemy 模型
+│   ├── main.py        # FastAPI 路由（CRUD + 仪表盘 + 校验 + 版本化审计 API）
+│   ├── models.py      # SQLAlchemy 模型（含审计字段与 audit_logs 追加式流水）
 │   ├── schemas.py     # Pydantic 模型
-│   ├── services.py    # 提醒引擎 / 异常发现 / 休药期规则
+│   ├── audit.py       # 更正/作废/恢复/撤销、乐观锁、历史与牛只时间线、存量基线迁移
+│   ├── impact.py      # 操作影响预览（奶量统计/休药校验/提醒，探针事务回滚实现）
+│   ├── services.py    # 提醒引擎 / 异常发现 / 休药期规则（均排除已作废记录）
 │   ├── seed.py        # 建库与样例数据
 │   ├── database.py    # 引擎与会话
 │   └── data/dairy.db  # SQLite（运行后生成）
@@ -105,9 +125,15 @@ dairy-farm/
 | GET/POST/PATCH/DELETE | `/api/cows[...]` | 奶牛档案 |
 | GET/POST/PATCH/DELETE | `/api/milkings[...]` | 挤奶记录 |
 | POST | `/api/milkings/check-withdrawal` | 录入前休药期预检 |
-| GET/POST/PATCH/DELETE | `/api/health[...]` | 健康记录 |
+| GET/POST/PATCH/DELETE | `/api/health[...]` | 健康记录（PATCH=更正留痕，DELETE=作废） |
 | GET/POST | `/api/drugs` | 药品目录 |
-| GET/POST/PATCH/DELETE | `/api/medications[...]` | 用药记录 |
+| GET/POST/PATCH/DELETE | `/api/medications[...]` | 用药记录（更正/作废，休药截止日联动） |
 | GET/POST/PATCH/DELETE | `/api/estruses[...]` | 发情/配种记录 |
+| GET | `/api/audit/{type}/{id}/history` | 某记录的版本历史（type=milking/health/medication） |
+| POST | `/api/audit/{type}/{id}/void` | 作废（软删除，需 operator+reason） |
+| POST | `/api/audit/{type}/{id}/restore` | 恢复作废记录（冲突时整单失败） |
+| POST | `/api/audit/{type}/{id}/revert` | 撤销更正，回到指定版本（target_version） |
+| POST | `/api/audit/{type}/{id}/impact/{action}` | 操作影响预览（correct/void/restore/undo，不写库） |
+| GET | `/api/cows/{cow_id}/timeline` | 沿牛只时间线查看全部记录版本 |
 
 > 说明：系统为单机演示应用，未做登录鉴权；生产部署请置于内网并自行增加认证与 HTTPS。

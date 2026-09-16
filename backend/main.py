@@ -9,11 +9,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from . import models, schemas, services
+from . import audit, impact, models, schemas, services
 from .database import Base, engine, get_db
 from .seed import init_db
 
 Base.metadata.create_all(bind=engine)
+audit.run_migrations()
 init_db()
 
 app = FastAPI(title="牧场管理系统 API", version="1.0.0")
@@ -42,6 +43,8 @@ def milking_to_dict(r: models.MilkingRecord, db: Session, check_date: bool = Tru
         "session_label": SESSION_LABEL.get(r.session, r.session),
         "yield_kg": r.yield_kg, "scc": r.scc, "discarded": r.discarded,
         "note": r.note, "created_at": str(r.created_at) if r.created_at else None,
+        "version": r.version, "is_void": r.is_void,
+        "voided_at": r.voided_at.isoformat() if r.voided_at else None,
         "cow_ear_tag": cow.ear_tag if cow else None,
         "cow_name": cow.name if cow else None,
         "in_withdrawal": in_w,
@@ -57,7 +60,9 @@ def med_to_dict(m: models.Medication, today: date) -> dict:
         "route": m.route, "reason": m.reason, "withdrawal_days": m.withdrawal_days,
         "withdrawal_end": str(m.withdrawal_end), "next_dose_date": str(m.next_dose_date) if m.next_dose_date else None,
         "treated": m.treated, "operator": m.operator, "note": m.note,
-        "active_withdrawal": m.date <= today <= m.withdrawal_end,
+        "active_withdrawal": (not m.is_void) and m.date <= today <= m.withdrawal_end,
+        "version": m.version, "is_void": m.is_void,
+        "voided_at": m.voided_at.isoformat() if m.voided_at else None,
     }
 
 
@@ -135,16 +140,22 @@ def cow_detail(cow_id: int, db: Session) -> dict:
     cow = db.get(models.Cow, cow_id)
     today = date.today()
     milkings = (
-        db.query(models.MilkingRecord).filter_by(cow_id=cow_id)
+        db.query(models.MilkingRecord)
+        .filter_by(cow_id=cow_id)
+        .filter(models.MilkingRecord.is_void.is_(False))
         .order_by(models.MilkingRecord.date.desc(), models.MilkingRecord.id.desc())
         .limit(30).all()
     )
     health = (
-        db.query(models.HealthRecord).filter_by(cow_id=cow_id)
+        db.query(models.HealthRecord)
+        .filter_by(cow_id=cow_id)
+        .filter(models.HealthRecord.is_void.is_(False))
         .order_by(models.HealthRecord.date.desc()).limit(20).all()
     )
     meds = (
-        db.query(models.Medication).filter_by(cow_id=cow_id)
+        db.query(models.Medication)
+        .filter_by(cow_id=cow_id)
+        .filter(models.Medication.is_void.is_(False))
         .order_by(models.Medication.date.desc()).limit(20).all()
     )
     estruses = (
@@ -156,7 +167,9 @@ def cow_detail(cow_id: int, db: Session) -> dict:
     trend = []
     for off in range(6, -1, -1):
         d = today - timedelta(days=off)
-        rows = db.query(models.MilkingRecord).filter_by(cow_id=cow_id, date=d).all()
+        rows = (db.query(models.MilkingRecord)
+                .filter_by(cow_id=cow_id, date=d)
+                .filter(models.MilkingRecord.is_void.is_(False)).all())
         trend.append({
             "date": str(d),
             "yield_kg": round(sum(r.yield_kg for r in rows if not r.discarded), 1),
@@ -206,7 +219,7 @@ def list_milkings(
     limit: int = Query(200, le=1000),
     db: Session = Depends(get_db),
 ):
-    query = db.query(models.MilkingRecord)
+    query = db.query(models.MilkingRecord).filter(models.MilkingRecord.is_void.is_(False))
     if cow_id:
         query = query.filter_by(cow_id=cow_id)
     if date_from:
@@ -235,6 +248,7 @@ def annotate_milkings(rows: list, db: Session) -> list:
         .filter(
             models.Medication.cow_id.in_(cow_ids),
             models.Medication.withdrawal_days > 0,
+            models.Medication.is_void.is_(False),
             models.Medication.date <= max_d,
             models.Medication.withdrawal_end >= min_d,
         )
@@ -260,6 +274,8 @@ def annotate_milkings(rows: list, db: Session) -> list:
             "session_label": SESSION_LABEL.get(r.session, r.session),
             "yield_kg": r.yield_kg, "scc": r.scc, "discarded": r.discarded,
             "note": r.note, "created_at": str(r.created_at) if r.created_at else None,
+            "version": r.version, "is_void": r.is_void,
+            "voided_at": r.voided_at.isoformat() if r.voided_at else None,
             "cow_ear_tag": cow.ear_tag if cow else None,
             "cow_name": cow.name if cow else None,
             "in_withdrawal": in_w,
@@ -298,8 +314,11 @@ def create_milking(payload: schemas.MilkingCreate, db: Session = Depends(get_db)
         raise HTTPException(404, "未找到该牛")
     if cow.status != "lactating":
         raise HTTPException(400, f"该牛当前状态为{cow.status}，不能登记挤奶")
-    dup = db.query(models.MilkingRecord).filter_by(
-        cow_id=payload.cow_id, date=payload.date, session=payload.session
+    dup = db.query(models.MilkingRecord).filter(
+        models.MilkingRecord.cow_id == payload.cow_id,
+        models.MilkingRecord.date == payload.date,
+        models.MilkingRecord.session == payload.session,
+        models.MilkingRecord.is_void.is_(False),
     ).first()
     if dup:
         raise HTTPException(409, "该牛当日该班次已有挤奶记录")
@@ -322,6 +341,8 @@ def create_milking(payload: schemas.MilkingCreate, db: Session = Depends(get_db)
         **payload.model_dump(exclude={"discarded"}), discarded=discarded
     )
     db.add(rec)
+    db.flush()
+    audit.log_create(db, "milking", rec)
     db.commit()
     db.refresh(rec)
     result = milking_to_dict(rec, db)
@@ -330,33 +351,38 @@ def create_milking(payload: schemas.MilkingCreate, db: Session = Depends(get_db)
 
 
 @app.patch("/api/milkings/{rec_id}")
-def update_milking(rec_id: int, payload: schemas.MilkingUpdate, db: Session = Depends(get_db)):
+def update_milking(rec_id: int, payload: schemas.MilkingCorrect, db: Session = Depends(get_db)):
+    """更正挤奶记录：记录操作人、原因及前后内容，版本号+1"""
     rec = db.get(models.MilkingRecord, rec_id)
     if not rec:
         raise HTTPException(404, "未找到该记录")
-    data = payload.model_dump(exclude_unset=True)
-    for k, v in data.items():
-        setattr(rec, k, v)
-    db.commit()
+    changes = payload.model_dump(exclude={"operator", "reason", "expected_version"},
+                                 exclude_unset=True)
+    # 日期/班次不允许通过更正修改（会改变业务归属），需作废后重新登记
+    changes.pop("date", None)
+    changes.pop("cow_id", None)
+    audit.correct(db, "milking", rec_id, changes,
+                  payload.operator, payload.reason, payload.expected_version)
     db.refresh(rec)
     return milking_to_dict(rec, db)
 
 
 @app.delete("/api/milkings/{rec_id}", status_code=204)
-def delete_milking(rec_id: int, db: Session = Depends(get_db)):
-    rec = db.get(models.MilkingRecord, rec_id)
-    if not rec:
-        raise HTTPException(404, "未找到该记录")
-    db.delete(rec)
-    db.commit()
+def delete_milking(rec_id: int, payload: schemas.AuditAction, db: Session = Depends(get_db)):
+    """作废挤奶记录（软删除，可在版本历史中恢复）"""
+    audit.void_record(db, "milking", rec_id, payload.operator, payload.reason,
+                      payload.expected_version)
 
 
 # ---------------- 健康记录 ----------------
 @app.get("/api/health")
-def list_health(cow_id: Optional[int] = None, db: Session = Depends(get_db)):
+def list_health(cow_id: Optional[int] = None, include_void: bool = False,
+                db: Session = Depends(get_db)):
     query = db.query(models.HealthRecord)
     if cow_id:
         query = query.filter_by(cow_id=cow_id)
+    if not include_void:
+        query = query.filter(models.HealthRecord.is_void.is_(False))
     rows = query.order_by(models.HealthRecord.date.desc()).limit(300).all()
     cows = {c.id: c for c in db.query(models.Cow).all()}
     return [{
@@ -365,6 +391,8 @@ def list_health(cow_id: Optional[int] = None, db: Session = Depends(get_db)):
         "temperature": h.temperature, "severity": h.severity,
         "follow_up_date": str(h.follow_up_date) if h.follow_up_date else None,
         "result": h.result, "note": h.note,
+        "version": h.version, "is_void": h.is_void,
+        "voided_at": h.voided_at.isoformat() if h.voided_at else None,
         "cow_ear_tag": cows[h.cow_id].ear_tag if h.cow_id in cows else None,
         "cow_name": cows[h.cow_id].name if h.cow_id in cows else None,
     } for h in rows]
@@ -376,30 +404,37 @@ def create_health(payload: schemas.HealthCreate, db: Session = Depends(get_db)):
         raise HTTPException(404, "未找到该牛")
     h = models.HealthRecord(**payload.model_dump())
     db.add(h)
+    db.flush()
+    audit.log_create(db, "health", h)
     db.commit()
     db.refresh(h)
     return h
 
 
-@app.patch("/api/health/{rec_id}", response_model=schemas.HealthOut)
-def update_health(rec_id: int, payload: schemas.HealthUpdate, db: Session = Depends(get_db)):
+@app.patch("/api/health/{rec_id}")
+def update_health(rec_id: int, payload: schemas.HealthCorrect, db: Session = Depends(get_db)):
     h = db.get(models.HealthRecord, rec_id)
     if not h:
         raise HTTPException(404, "未找到该记录")
-    for k, v in payload.model_dump(exclude_unset=True).items():
-        setattr(h, k, v)
-    db.commit()
+    changes = payload.model_dump(exclude={"operator", "reason", "expected_version"},
+                                 exclude_unset=True)
+    audit.correct(db, "health", rec_id, changes,
+                  payload.operator, payload.reason, payload.expected_version)
     db.refresh(h)
-    return h
+    return {
+        "id": h.id, "cow_id": h.cow_id, "date": str(h.date),
+        "record_type": h.record_type, "diagnosis": h.diagnosis,
+        "temperature": h.temperature, "severity": h.severity,
+        "follow_up_date": str(h.follow_up_date) if h.follow_up_date else None,
+        "result": h.result, "note": h.note,
+        "version": h.version, "is_void": h.is_void,
+    }
 
 
 @app.delete("/api/health/{rec_id}", status_code=204)
-def delete_health(rec_id: int, db: Session = Depends(get_db)):
-    h = db.get(models.HealthRecord, rec_id)
-    if not h:
-        raise HTTPException(404, "未找到该记录")
-    db.delete(h)
-    db.commit()
+def delete_health(rec_id: int, payload: schemas.AuditAction, db: Session = Depends(get_db)):
+    audit.void_record(db, "health", rec_id, payload.operator, payload.reason,
+                      payload.expected_version)
 
 
 # ---------------- 药品目录 ----------------
@@ -423,10 +458,13 @@ def create_drug(payload: schemas.DrugCreate, db: Session = Depends(get_db)):
 
 # ---------------- 用药记录 ----------------
 @app.get("/api/medications")
-def list_medications(cow_id: Optional[int] = None, db: Session = Depends(get_db)):
+def list_medications(cow_id: Optional[int] = None, include_void: bool = False,
+                     db: Session = Depends(get_db)):
     query = db.query(models.Medication)
     if cow_id:
         query = query.filter_by(cow_id=cow_id)
+    if not include_void:
+        query = query.filter(models.Medication.is_void.is_(False))
     rows = query.order_by(models.Medication.date.desc()).limit(300).all()
     return [med_to_dict(m, date.today()) for m in rows]
 
@@ -464,34 +502,50 @@ def create_medication(payload: schemas.MedicationCreate, db: Session = Depends(g
         operator=payload.operator, note=payload.note,
     )
     db.add(m)
+    db.flush()
+    audit.log_create(db, "medication", m, payload.operator)
     db.commit()
     db.refresh(m)
     return med_to_dict(m, date.today())
 
 
 @app.patch("/api/medications/{med_id}")
-def update_medication(med_id: int, payload: schemas.MedicationUpdate, db: Session = Depends(get_db)):
+def update_medication(med_id: int, payload: schemas.MedicationCorrect,
+                      db: Session = Depends(get_db)):
+    """更正用药记录：休药截止日随用药日/休药天数自动重算"""
     m = db.get(models.Medication, med_id)
     if not m:
         raise HTTPException(404, "未找到该记录")
-    data = payload.model_dump(exclude_unset=True)
-    if "withdrawal_days" in data:
-        m.withdrawal_days = data.pop("withdrawal_days")
-        m.withdrawal_end = m.date + timedelta(days=m.withdrawal_days)
-    for k, v in data.items():
-        setattr(m, k, v)
-    db.commit()
+    raw = payload.model_dump(exclude_unset=True)
+    data = {k: v for k, v in raw.items()
+            if k not in ("audit_operator", "audit_reason", "expected_version")}
+
+    # 改选药品目录时同步药名与默认休药期
+    if data.get("drug_id") is not None:
+        drug = db.get(models.DrugCatalog, data["drug_id"])
+        if not drug:
+            raise HTTPException(404, "未找到该药品")
+        data["drug_name"] = drug.name
+        data.setdefault("withdrawal_days", drug.default_withdrawal_days)
+    if "drug_name" in data and not data["drug_name"]:
+        raise HTTPException(400, "药品名称不能为空")
+
+    new_date = data.get("date") or m.date
+    new_next = data.get("next_dose_date", m.next_dose_date)
+    if new_next and new_next < new_date:
+        raise HTTPException(400, "下次用药日期不能早于本次用药日期")
+
+    audit.correct(db, "medication", med_id, data,
+                  payload.audit_operator, payload.audit_reason,
+                  payload.expected_version)
     db.refresh(m)
     return med_to_dict(m, date.today())
 
 
 @app.delete("/api/medications/{med_id}", status_code=204)
-def delete_medication(med_id: int, db: Session = Depends(get_db)):
-    m = db.get(models.Medication, med_id)
-    if not m:
-        raise HTTPException(404, "未找到该记录")
-    db.delete(m)
-    db.commit()
+def delete_medication(med_id: int, payload: schemas.AuditAction, db: Session = Depends(get_db)):
+    audit.void_record(db, "medication", med_id, payload.operator, payload.reason,
+                      payload.expected_version)
 
 
 # ---------------- 发情/配种 ----------------
@@ -550,6 +604,124 @@ def delete_estrus(rec_id: int, db: Session = Depends(get_db)):
     db.commit()
 
 
+# ---------------- 版本化审计：历史 / 作废 / 恢复 / 撤销 / 影响预览 ----------------
+VALID_ENTITY = set(audit.ENTITY_FIELDS.keys())
+
+
+def _validate_entity(entity_type: str):
+    if entity_type not in VALID_ENTITY:
+        raise HTTPException(400, f"不支持的记录类型：{entity_type}")
+
+
+def _milking_restore_conflicts(db: Session, entity_id: int) -> list:
+    """恢复/撤销挤奶记录时，检查同牛同日同班是否已存在另一条有效记录"""
+    rec = db.get(models.MilkingRecord, entity_id)
+    if not rec:
+        raise HTTPException(404, "未找到该记录")
+    clash = (
+        db.query(models.MilkingRecord)
+        .filter(
+            models.MilkingRecord.cow_id == rec.cow_id,
+            models.MilkingRecord.date == rec.date,
+            models.MilkingRecord.session == rec.session,
+            models.MilkingRecord.is_void.is_(False),
+            models.MilkingRecord.id != rec.id,
+        ).first()
+    )
+    if clash:
+        return [{
+            "type": "duplicate_milking",
+            "message": f"{rec.date} {SESSION_LABEL.get(rec.session, rec.session)}"
+                       f"已有另一条有效记录（#{clash.id}，{clash.yield_kg}kg），"
+                       f"不能直接恢复，请先处理现有记录",
+            "conflict_id": clash.id,
+        }]
+    return []
+
+
+@app.get("/api/audit/{entity_type}/{entity_id}/history")
+def get_history(entity_type: str, entity_id: int, db: Session = Depends(get_db)):
+    _validate_entity(entity_type)
+    obj = db.get(audit.ENTITY_FIELDS[entity_type]["model"], entity_id)
+    if not obj:
+        raise HTTPException(404, "未找到该记录")
+    return {
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "current_version": obj.version,
+        "is_void": obj.is_void,
+        "voided_at": obj.voided_at.isoformat() if obj.voided_at else None,
+        "logs": audit.history(db, entity_type, entity_id),
+    }
+
+
+@app.post("/api/audit/{entity_type}/{entity_id}/void", status_code=204)
+def void_entity(entity_type: str, entity_id: int, payload: schemas.AuditAction,
+                db: Session = Depends(get_db)):
+    _validate_entity(entity_type)
+    audit.void_record(db, entity_type, entity_id, payload.operator, payload.reason,
+                      payload.expected_version)
+
+
+@app.post("/api/audit/{entity_type}/{entity_id}/restore")
+def restore_entity(entity_type: str, entity_id: int, payload: schemas.AuditAction,
+                   db: Session = Depends(get_db)):
+    """恢复已作废记录。挤奶记录恢复前做班次唯一冲突校验，冲突则整单失败。"""
+    _validate_entity(entity_type)
+    conflicts = []
+    if entity_type == "milking":
+        conflicts = _milking_restore_conflicts(db, entity_id)
+    obj = audit.restore_record(db, entity_type, entity_id,
+                               payload.operator, payload.reason,
+                               payload.expected_version, conflicts)
+    return {"id": obj.id, "version": obj.version, "is_void": obj.is_void, "conflicts": []}
+
+
+@app.post("/api/audit/{entity_type}/{entity_id}/revert")
+def revert_entity(entity_type: str, entity_id: int, payload: schemas.RevertRequest,
+                  db: Session = Depends(get_db)):
+    """
+    撤销更正：以 target_version 的内容生成新版本。
+    后续已有改动（版本号不匹配）或缺奶班次冲突时拒绝，不做任何部分写入。
+    """
+    _validate_entity(entity_type)
+    # 撤销后会覆盖当前内容，先用目标版本快照在探针事务里做冲突预检
+    prev = impact.preview(db, entity_type, entity_id, "undo",
+                          target_version=payload.target_version)
+    if prev["conflicts"]:
+        raise HTTPException(409, {"message": "撤销后与现有记录冲突",
+                                  "conflicts": prev["conflicts"]})
+    obj = audit.revert_to_version(db, entity_type, entity_id,
+                                  payload.target_version, payload.operator,
+                                  payload.reason, payload.expected_version)
+    return {"id": obj.id, "version": obj.version, "is_void": obj.is_void,
+            "impact": prev["deltas"]}
+
+
+@app.post("/api/audit/{entity_type}/{entity_id}/impact/{action}")
+def impact_preview(entity_type: str, entity_id: int, action: str,
+                   payload: Optional[schemas.ImpactCorrectRequest] = None,
+                   db: Session = Depends(get_db)):
+    """操作前影响预览（不写库）：奶量统计 / 休药校验 / 提醒变化"""
+    _validate_entity(entity_type)
+    if action not in ("correct", "void", "restore", "undo"):
+        raise HTTPException(400, "action 仅支持 correct/void/restore/undo")
+    changes = (payload.changes if payload else {}) or {}
+    target_version = changes.pop("target_version", None)
+    if not target_version and action == "undo":
+        raise HTTPException(400, "撤销更正预览需提供 target_version")
+    return impact.preview(db, entity_type, entity_id, action,
+                          changes=changes, target_version=target_version)
+
+
+@app.get("/api/cows/{cow_id}/timeline")
+def get_cow_timeline(cow_id: int, db: Session = Depends(get_db)):
+    """沿牛只时间线查看挤奶/健康/用药记录的历次版本（含已作废）"""
+    if not db.get(models.Cow, cow_id):
+        raise HTTPException(404, "未找到该牛")
+    return {"cow_id": cow_id, "items": audit.cow_timeline(db, cow_id)}
+
+
 # ---------------- 提醒 / 异常 / 仪表盘 ----------------
 @app.get("/api/reminders")
 def get_reminders(db: Session = Depends(get_db)):
@@ -572,7 +744,9 @@ def dashboard(db: Session = Depends(get_db)):
         by_status[c.status] += 1
 
     def day_milk(d: date):
-        rows = db.query(models.MilkingRecord).filter_by(date=d).all()
+        rows = (db.query(models.MilkingRecord)
+                .filter_by(date=d)
+                .filter(models.MilkingRecord.is_void.is_(False)).all())
         valid = [r for r in rows if not r.discarded]
         discard = [r for r in rows if r.discarded]
         cows_milked = len({r.cow_id for r in valid})
@@ -600,6 +774,7 @@ def dashboard(db: Session = Depends(get_db)):
         db.query(models.Medication.cow_id)
         .filter(
             models.Medication.withdrawal_days > 0,
+            models.Medication.is_void.is_(False),
             models.Medication.date <= today,
             models.Medication.withdrawal_end >= today,
         )

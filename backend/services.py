@@ -18,15 +18,18 @@ def withdrawal_violation_clause(on_column=None, cow_column=None):
     """
     生成“该挤奶记录当日处于休药期内且未标记废弃”的 SQL EXISTS 条件，
     可直接用于 WHERE 过滤，避免先 limit 截断再在内存里漏判。
+    作废的挤奶记录与作废的用药均不参与判定。
     """
     on_column = on_column or models.MilkingRecord.date
     cow_column = cow_column or models.MilkingRecord.cow_id
     med = models.Medication
     return and_(
         models.MilkingRecord.discarded.is_(False),
+        models.MilkingRecord.is_void.is_(False),
         exists().where(
             med.cow_id == cow_column,
             med.withdrawal_days > 0,
+            med.is_void.is_(False),
             med.date <= on_column,
             med.withdrawal_end >= on_column,
         ),
@@ -47,6 +50,7 @@ def latest_medication_window(
         .filter(
             models.Medication.cow_id == cow_id,
             models.Medication.withdrawal_days > 0,
+            models.Medication.is_void.is_(False),
             models.Medication.date <= on_date,
             models.Medication.withdrawal_end >= on_date,
         )
@@ -160,7 +164,7 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             })
 
     # 3) 用药提醒：下次用药 / 休药期进行中
-    for m in db.query(models.Medication).all():
+    for m in db.query(models.Medication).filter(models.Medication.is_void.is_(False)).all():
         cow = db.get(models.Cow, m.cow_id)
         if not cow or cow.status == "sold":
             continue
@@ -196,6 +200,7 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
     #    注意 SQL 三值逻辑：NULL != 'recovered' 结果为 NULL 会被 WHERE 过滤掉）
     for h in (
         db.query(models.HealthRecord)
+        .filter(models.HealthRecord.is_void.is_(False))
         .filter(models.HealthRecord.follow_up_date.isnot(None))
         .filter(or_(
             models.HealthRecord.result.is_(None),
@@ -293,7 +298,10 @@ def detect_yield_anomalies(db: Session, days: int = 7, today: Optional[date] = N
 
     records = (
         db.query(models.MilkingRecord)
-        .filter(models.MilkingRecord.date >= start)
+        .filter(
+            models.MilkingRecord.date >= start,
+            models.MilkingRecord.is_void.is_(False),
+        )
         .order_by(models.MilkingRecord.date.asc(), models.MilkingRecord.id.asc())
         .all()
     )

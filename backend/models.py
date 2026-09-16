@@ -8,13 +8,18 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
+    JSON,
     String,
     Text,
 )
 from sqlalchemy.orm import relationship
 
 from .database import Base
+
+# 受版本化审计管理的实体类型
+AUDIT_ENTITIES = ("milking", "health", "medication")
 
 
 class Cow(Base):
@@ -61,6 +66,10 @@ class MilkingRecord(Base):
     discarded = Column(Boolean, default=False, comment="是否因休药期废弃")
     note = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # ---- 版本化审计字段 ----
+    version = Column(Integer, nullable=False, default=1, comment="当前版本号，每次更正+1")
+    is_void = Column(Boolean, nullable=False, default=False, index=True, comment="是否已作废（软删除，可恢复）")
+    voided_at = Column(DateTime, nullable=True)
 
     cow = relationship("Cow", back_populates="milkings")
 
@@ -82,6 +91,10 @@ class HealthRecord(Base):
     result = Column(String(16), nullable=True, comment="recovered 已康复 / ongoing 治疗中 / observed 观察中")
     note = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # ---- 版本化审计字段 ----
+    version = Column(Integer, nullable=False, default=1)
+    is_void = Column(Boolean, nullable=False, default=False, index=True)
+    voided_at = Column(DateTime, nullable=True)
 
     cow = relationship("Cow", back_populates="health_records")
 
@@ -119,6 +132,10 @@ class Medication(Base):
     operator = Column(String(32), nullable=True)
     note = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # ---- 版本化审计字段 ----
+    version = Column(Integer, nullable=False, default=1)
+    is_void = Column(Boolean, nullable=False, default=False, index=True)
+    voided_at = Column(DateTime, nullable=True)
 
     cow = relationship("Cow", back_populates="medications")
     drug = relationship("DrugCatalog")
@@ -146,3 +163,29 @@ class EstrusRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     cow = relationship("Cow", back_populates="estruses")
+
+
+class AuditLog(Base):
+    """记录更正/作废/恢复/撤销的审计流水（只追加，不修改不删除）"""
+
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    entity_type = Column(String(16), nullable=False, index=True,
+                         comment="milking / health / medication")
+    entity_id = Column(Integer, nullable=False, index=True)
+    cow_id = Column(Integer, nullable=False, index=True)
+    seq = Column(Integer, nullable=False, comment="该实体上的操作序号，从1开始")
+    action = Column(String(16), nullable=False,
+                    comment="create 录入 / correct 更正 / void 作废 / restore 恢复 / undo 撤销更正 / baseline 历史起点")
+    version_before = Column(Integer, nullable=True, comment="操作前版本号")
+    version_after = Column(Integer, nullable=True, comment="操作后版本号")
+    operator = Column(String(32), nullable=True, comment="操作人（手填，不接入账号体系）")
+    reason = Column(Text, nullable=True, comment="操作原因")
+    before_data = Column(JSON, nullable=True, comment="操作前业务字段快照")
+    after_data = Column(JSON, nullable=True, comment="操作后业务字段快照")
+    operated_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_audit_entity", "entity_type", "entity_id", "seq"),
+    )

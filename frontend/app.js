@@ -53,6 +53,10 @@ const REMINDER_META = {
 };
 
 /* ---------------- 全局状态 ---------------- */
+const OPERATOR_KEY = "dairy_operator";
+const getOperator = () => localStorage.getItem(OPERATOR_KEY) || "";
+const setOperator = (v) => localStorage.setItem(OPERATOR_KEY, (v || "").trim());
+
 const S = reactive({
   view: "dashboard",
   toasts: [],
@@ -67,7 +71,10 @@ const S = reactive({
   meds: [],
   estruses: [],
   loading: { milkings: false },
+  operator: getOperator(),
 });
+
+function saveOperator() { setOperator(S.operator); }
 
 let toastSeq = 0;
 function toast(message, type = "success") {
@@ -433,7 +440,7 @@ const MilkingsPage = {
         </tr></thead>
         <tbody>
           <tr v-for="r in S.milkings" :key="r.id" :style="r.violation ? 'background:#fff5f5' : ''">
-            <td>{{ r.date }}</td>
+            <td>{{ r.date }}<span class="ver-badge">v{{ r.version }}</span></td>
             <td>{{ SESSION[r.session] }}</td>
             <td><b>{{ r.cow_ear_tag }}</b></td>
             <td>{{ r.cow_name || '-' }}</td>
@@ -451,8 +458,10 @@ const MilkingsPage = {
             <td style="white-space:nowrap">
               <button v-if="r.violation" class="btn btn-sm btn-danger" style="margin-right:8px"
                 @click="markDiscard(r)">标记废弃</button>
-              <button class="link" style="margin-right:10px" @click="openModal({type:'milkingForm', rec:r})">编辑</button>
-              <button class="link" style="color:#dc2626" @click="remove(r)">删除</button>
+              <button class="link" style="margin-right:10px" @click="openModal({type:'milkingForm', rec:r})">更正</button>
+              <button class="link" style="margin-right:10px"
+                @click="openModal({type:'historyModal', entityType:'milking', entityId:r.id, onDone:reload})">历史</button>
+              <button class="link" style="color:#dc2626" @click="voidRec(r)">作废</button>
             </td>
           </tr>
           <tr v-if="!S.milkings.length"><td colspan="9" class="empty">暂无记录</td></tr>
@@ -462,19 +471,17 @@ const MilkingsPage = {
   </div>`,
   methods: {
     async markDiscard(r) {
-      try {
-        await api(`/api/milkings/${r.id}`, { method: "PATCH", body: { discarded: true } });
-        toast(`已将 ${r.cow_ear_tag} ${r.date}${this.SESSION[r.session]} 奶标记废弃`);
-        await this.reload();
-      } catch (e) { toast(e.message, "error"); }
+      // “补标废弃”本质是一次更正：记录原因并进入版本历史
+      openModal({
+        type: "milkingForm", rec: r, presetDiscarded: true,
+        presetReason: "休药期违规混装补标废弃",
+      });
     },
-    async remove(r) {
-      if (!confirm("确认删除该挤奶记录？")) return;
-      try {
-        await api(`/api/milkings/${r.id}`, { method: "DELETE" });
-        toast("已删除");
-        await this.reload();
-      } catch (e) { toast(e.message, "error"); }
+    voidRec(r) {
+      openAuditModal({
+        entityType: "milking", entityId: r.id, action: "void", version: r.version,
+        onDone: () => this.reload(),
+      });
     },
   },
 };
@@ -502,7 +509,8 @@ const HealthPage = {
         <thead><tr><th>日期</th><th>耳标号</th><th>类型</th><th>诊断/项目</th><th>体温</th><th>程度</th><th>复查日</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="h in S.health" :key="h.id">
-            <td>{{ h.date }}</td><td><b>{{ h.cow_ear_tag }}</b> {{ h.cow_name || '' }}</td>
+            <td>{{ h.date }}<span class="ver-badge">v{{ h.version }}</span></td>
+            <td><b>{{ h.cow_ear_tag }}</b> {{ h.cow_name || '' }}</td>
             <td>{{ H_TYPE[h.record_type] }}</td>
             <td>{{ h.diagnosis || '-' }}</td>
             <td><span :class="h.temperature >= 39.5 ? 'badge red' : ''">{{ h.temperature ? h.temperature + '℃' : '-' }}</span></td>
@@ -510,8 +518,10 @@ const HealthPage = {
             <td>{{ h.follow_up_date || '-' }}</td>
             <td><span class="badge" :class="{'green':h.result==='recovered','amber':h.result==='ongoing','blue':h.result==='observed','gray':!h.result}">{{ H_RESULT[h.result] || '未结案' }}</span></td>
             <td style="white-space:nowrap">
-              <button class="link" style="margin-right:10px" @click="openModal({type:'healthForm', rec:h})">编辑</button>
-              <button class="link" style="color:#dc2626" @click="removeHealth(h)">删除</button>
+              <button class="link" style="margin-right:10px" @click="openModal({type:'healthForm', rec:h})">更正</button>
+              <button class="link" style="margin-right:10px"
+                @click="openModal({type:'historyModal', entityType:'health', entityId:h.id, onDone:loadHealthAll})">历史</button>
+              <button class="link" style="color:#dc2626" @click="voidHealth(h)">作废</button>
             </td>
           </tr>
           <tr v-if="!S.health.length"><td colspan="9" class="empty">暂无健康记录</td></tr>
@@ -529,7 +539,7 @@ const HealthPage = {
           <th>休药期</th><th>鲜奶可售日</th><th>下次用药</th><th>兽医</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="m in S.meds" :key="m.id" :style="m.active_withdrawal ? 'background:#fffbeb' : ''">
-            <td>{{ m.date }}</td>
+            <td>{{ m.date }}<span class="ver-badge">v{{ m.version }}</span></td>
             <td><b @click="openModal({type:'cowDetail', id:m.cow_id})" class="link">{{ cowTag(m.cow_id) }}</b></td>
             <td>{{ m.drug_name }}<span v-if="m.active_withdrawal" class="badge red" style="margin-left:6px">休药中</span></td>
             <td>{{ m.dose || '-' }}</td><td>{{ m.route || '-' }}</td><td>{{ m.reason || '-' }}</td>
@@ -546,7 +556,11 @@ const HealthPage = {
             <td style="white-space:nowrap">
               <button v-if="m.next_dose_date && !m.treated" class="btn btn-sm" style="margin-right:8px"
                 @click="doneDose(m)">已执行</button>
-              <button class="link" style="color:#dc2626" @click="removeMed(m)">删除</button>
+              <button class="link" style="margin-right:10px"
+                @click="openModal({type:'medForm', rec:m})">更正</button>
+              <button class="link" style="margin-right:10px"
+                @click="openModal({type:'historyModal', entityType:'medication', entityId:m.id, onDone:loadMedsAll})">历史</button>
+              <button class="link" style="color:#dc2626" @click="removeMed(m)">作废</button>
             </td>
           </tr>
           <tr v-if="!S.meds.length"><td colspan="11" class="empty">暂无用药记录</td></tr>
@@ -577,23 +591,23 @@ const HealthPage = {
     addDays,
     cowTag(id) { const c = S.cows.find((x) => x.id === id); return c ? c.ear_tag : id; },
     async doneDose(m) {
-      try {
-        await api(`/api/medications/${m.id}`, { method: "PATCH", body: { treated: true } });
-        toast("已标记为执行，提醒将关闭");
-        await loadMedsAll();
-      } catch (e) { toast(e.message, "error"); }
+      openAuditModal({
+        entityType: "medication", entityId: m.id, action: "correct", version: m.version,
+        changes: { treated: true }, onDone: loadMedsAll,
+      });
     },
     async removeHealth(h) {
-      if (!confirm("确认删除该健康记录？")) return;
-      await api(`/api/health/${h.id}`, { method: "DELETE" });
-      S.health = S.health.filter((x) => x.id !== h.id);
-      toast("已删除");
+      openAuditModal({
+        entityType: "health", entityId: h.id, action: "void", version: h.version,
+        onDone: async () => { await loadHealthAll(); refreshDash(); },
+      });
     },
+    voidHealth(h) { this.removeHealth(h); },
     async removeMed(m) {
-      if (!confirm("确认删除该用药记录？休药期校验将立即失效。")) return;
-      await api(`/api/medications/${m.id}`, { method: "DELETE" });
-      S.meds = S.meds.filter((x) => x.id !== m.id);
-      toast("已删除");
+      openAuditModal({
+        entityType: "medication", entityId: m.id, action: "void", version: m.version,
+        onDone: async () => { await loadMedsAll(); refreshDash(); },
+      });
     },
   },
 };
@@ -741,8 +755,12 @@ const MilkingFormModal = {
     const f = reactive(
       m.rec
         ? { ...m.rec }
-        : { cow_id: null, date: todayStr(), session: "morning", yield_kg: null, scc: null, note: "" }
+        : { cow_id: null, date: todayStr(), session: "morning", yield_kg: null, scc: null,
+            discarded: false, note: "" }
     );
+    if (m.presetDiscarded) f.discarded = true;
+    const operator = ref(S.operator);
+    const reason = ref(m.presetReason || "");
     const err = ref("");
     const check = ref(null);
     const lactating = computed(() => S.cows.filter((c) => c.status === "lactating"));
@@ -760,11 +778,19 @@ const MilkingFormModal = {
       try {
         let res;
         if (m.rec) {
+          if (!operator.value.trim()) throw new Error("请填写操作人");
+          if (!reason.value.trim()) throw new Error("请填写更正原因（将记入版本历史）");
+          setOperator(operator.value); S.operator = operator.value.trim();
           res = await api(`/api/milkings/${m.rec.id}`, {
             method: "PATCH",
-            body: { session: f.session, yield_kg: f.yield_kg, scc: f.scc, note: f.note, discarded: f.discarded },
+            body: {
+              session: f.session, yield_kg: f.yield_kg, scc: f.scc, note: f.note,
+              discarded: f.discarded,
+              operator: operator.value.trim(), reason: reason.value.trim(),
+              expected_version: m.rec.version,
+            },
           });
-          toast("记录已更新");
+          toast("记录已更正，新版本已生成");
         } else {
           res = await api("/api/milkings", { method: "POST", body: f });
           if (res.warnings?.length) toast(res.warnings[0].message, "warn");
@@ -776,17 +802,23 @@ const MilkingFormModal = {
       } catch (e) { err.value = e.message; }
     }
     nextTick(runCheck);
-    return { f, err, check, save, closeModal, runCheck, lactating, SESSION };
+    return { f, m, operator, reason, err, check, save, closeModal, runCheck,
+             lactating, SESSION, saveOperator };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal">
-    <div class="modal-head"><h3>登记挤奶记录</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-head">
+      <h3>{{ m.rec ? '更正挤奶记录' : '登记挤奶记录' }}
+        <span class="ver-badge" v-if="m.rec">基于 v{{ m.rec.version }}</span>
+      </h3>
+      <button class="modal-close" @click="closeModal">×</button>
+    </div>
     <div class="modal-body">
       <div class="alert-box danger" v-if="err">{{ err }}</div>
-      <div class="alert-box warn" v-if="check && check.in_withdrawal">
+      <div class="alert-box warn" v-if="!m.rec && check && check.in_withdrawal">
         🚫 {{ check.message }} —— 保存时将<strong>自动标记为废弃奶</strong>，不计入大罐产量。
       </div>
-      <div class="alert-box info" v-if="check && !check.in_withdrawal">✅ {{ check.message }}</div>
+      <div class="alert-box info" v-if="!m.rec && check && !check.in_withdrawal">✅ {{ check.message }}</div>
       <div class="field-row">
         <div class="field"><label>牛只 <span class="req">*</span></label>
           <select class="input" v-model="f.cow_id" @change="runCheck" :disabled="!!f.id">
@@ -798,7 +830,7 @@ const MilkingFormModal = {
       </div>
       <div class="field-row">
         <div class="field"><label>班次</label>
-          <select class="input" v-model="f.session">
+          <select class="input" v-model="f.session" :disabled="!!f.id">
             <option value="morning">早班</option><option value="noon">午班</option><option value="evening">晚班</option>
           </select></div>
         <div class="field"><label>产奶量 kg <span class="req">*</span></label>
@@ -809,10 +841,20 @@ const MilkingFormModal = {
         <div class="hint">≥ 50 万将触发乳房炎风险提示</div></div>
       <div class="field" v-if="f.id"><label><input type="checkbox" v-model="f.discarded"> 该批奶废弃不计入上市奶</label></div>
       <div class="field"><label>备注</label><textarea class="input" rows="2" v-model="f.note"></textarea></div>
+
+      <template v-if="m.rec">
+        <div class="field-row">
+          <div class="field"><label>操作人 <span class="req">*</span></label>
+            <input class="input" v-model="operator" @change="saveOperator" placeholder="姓名，本机记忆"></div>
+          <div class="field"><label>更正原因 <span class="req">*</span></label>
+            <input class="input" v-model="reason" placeholder="如：电子秤读数录入错误"></div>
+        </div>
+        <div class="hint">更正会保留原内容快照并生成新版本；如需撤销可在“历史”中操作。牛只、日期、班次不可改，请作废后重新登记。</div>
+      </template>
     </div>
     <div class="modal-foot">
       <button class="btn" @click="closeModal">取消</button>
-      <button class="btn btn-primary" @click="save">保存</button>
+      <button class="btn btn-primary" @click="save">{{ m.rec ? '确认更正' : '保存' }}</button>
     </div>
   </div></div>`,
 };
@@ -821,37 +863,278 @@ async function refreshDash() {
   try { await Promise.all([loadDashboard(), loadAnomalies(), loadReminders()]); } catch (_) {}
 }
 
+/* ---------------- 版本化审计：通用操作弹窗 ---------------- */
+const ENTITY_LABEL = { milking: "挤奶记录", health: "健康记录", medication: "用药记录" };
+const IMPACT_ICO = { danger: "🚨", warn: "⚠️", ok: "✅", info: "ℹ️" };
+
+/* 打开审计操作弹窗（作废/恢复/撤销）。opts: {entityType, entityId, action, version, targetVersion, onDone} */
+function openAuditModal(opts) {
+  if (!S.operator) {
+    const name = prompt("请先填写操作人姓名（仅本机记忆，无需登录）：");
+    if (name === null) return;
+    S.operator = name.trim();
+    saveOperator();
+    if (!S.operator) return;
+  }
+  openModal({ type: "auditAction", ...opts });
+}
+
+const AuditActionModal = {
+  setup() {
+    const m = topModal();
+    const operator = ref(S.operator);
+    const reason = ref("");
+    const err = ref("");
+    const impact = ref(null);
+    const loading = ref(false);
+    const submitting = ref(false);
+
+    async function loadImpact() {
+      loading.value = true;
+      err.value = "";
+      try {
+        const body = {};
+        if (m.action === "correct") body.changes = m.changes || {};
+        if (m.action === "undo" || m.targetVersion) body.changes = { target_version: m.targetVersion };
+        impact.value = await api(
+          `/api/audit/${m.entityType}/${m.entityId}/impact/${m.action}`,
+          { method: "POST", body }
+        );
+      } catch (e) { err.value = e.message; }
+      loading.value = false;
+    }
+    onMounted(loadImpact);
+
+    async function confirm() {
+      err.value = "";
+      if (!operator.value.trim()) { err.value = "请填写操作人"; return; }
+      if (!reason.value.trim()) { err.value = "请填写操作原因"; return; }
+      setOperator(operator.value);
+      S.operator = operator.value.trim();
+      try {
+        if (m.action === "correct") {
+          // 通用更正：由调用方指定接口路径与字段，审计信息统一附加
+          const body = { ...(m.changes || {}) };
+          if (m.entityType === "medication") {
+            body.audit_operator = operator.value.trim();
+            body.audit_reason = reason.value.trim();
+          } else {
+            body.operator = operator.value.trim();
+            body.reason = reason.value.trim();
+          }
+          body.expected_version = m.version ?? null;
+          await api(m.url || `/api/${m.entityType === "milking" ? "milkings"
+              : m.entityType === "health" ? "health" : "medications"}/${m.entityId}`,
+            { method: "PATCH", body });
+        } else {
+          const payload = {
+            operator: operator.value.trim(),
+            reason: reason.value.trim(),
+            expected_version: m.version ?? null,
+          };
+          if (m.action === "undo") payload.target_version = m.targetVersion;
+          const path = { void: "void", restore: "restore", undo: "revert" }[m.action];
+          await api(`/api/audit/${m.entityType}/${m.entityId}/${path}`, {
+            method: "POST", body: payload,
+          });
+        }
+        toast({
+          correct: "更正已完成，新版本已生成",
+          void: "已作废，可在版本历史中恢复",
+          restore: "记录已恢复，生成新版本",
+          undo: "已按历史版本生成新版本",
+        }[m.action], "success");
+        closeModal();
+        if (typeof m.onDone === "function") await m.onDone();
+      } catch (e) {
+        // 409 冲突/版本过期：展示后端信息，不关闭弹窗
+        err.value = e.message;
+      }
+      submitting.value = false;
+    }
+    const title = computed(() => ({
+      correct: "更正", void: "作废", restore: "恢复", undo: "撤销更正",
+    }[m.action] + ENTITY_LABEL[m.entityType]));
+    return { m, title, operator, reason, err, impact, loading, submitting, confirm,
+             closeModal, saveOperator, IMPACT_ICO };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal">
+    <div class="modal-head"><h3>{{ title }}</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+
+      <template v-if="loading"><div class="empty">正在评估对奶量统计、休药校验与提醒的影响…</div></template>
+      <template v-else-if="impact">
+        <div v-if="impact.conflicts && impact.conflicts.length" class="alert-box danger">
+          <strong>无法{{ {void:'作废',restore:'恢复',undo:'撤销'}[m.action] }}，存在冲突：</strong>
+          <div v-for="(c,i) in impact.conflicts" :key="i" style="margin-top:4px">🚫 {{ c.message }}</div>
+        </div>
+        <div class="impact-box">
+          <div class="imp-head">操作影响预览（基于当前数据模拟，尚未生效）</div>
+          <div v-for="(d,i) in impact.deltas" :key="i" class="imp-row" :class="d.level">
+            <span class="imp-ico">{{ IMPACT_ICO[d.level] || '•' }}</span><span>{{ d.message }}</span>
+          </div>
+        </div>
+        <div class="impact-box" v-if="m.entityType==='milking'">
+          <div class="imp-head">近 21 天奶量统计</div>
+          <div class="imp-row"><span>上市奶量</span><span style="margin-left:auto">
+            {{ impact.before.market_kg }}kg → <b>{{ impact.after.market_kg }}kg</b></span></div>
+          <div class="imp-row"><span>废弃奶量</span><span style="margin-left:auto">
+            {{ impact.before.discard_kg }}kg → <b>{{ impact.after.discard_kg }}kg</b></span></div>
+          <div class="imp-row"><span>休药期违规混装</span><span style="margin-left:auto">
+            {{ impact.before.violation_count }} 条 → <b>{{ impact.after.violation_count }} 条</b></span></div>
+        </div>
+      </template>
+
+      <div class="field-row">
+        <div class="field"><label>操作人 <span class="req">*</span></label>
+          <input class="input" v-model="operator" @change="saveOperator" placeholder="姓名，本机记忆"></div>
+      </div>
+      <div class="field"><label>操作原因 <span class="req">*</span></label>
+        <textarea class="input" rows="2" v-model="reason"
+          :placeholder="{void:'如：重复登记 / 记录有误，作废原因会保留在审计日志',
+                         restore:'如：经核实记录有效，恢复原因会保留在审计日志',
+                         undo:'如：上次更正依据有误，说明撤销原因'}[m.action]"></textarea></div>
+      <div class="hint">该操作在单事务内完成：冲突或校验失败时不会产生任何部分修改；历史版本均可追溯。</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn" :class="m.action==='void' ? 'btn-danger' : 'btn-primary'"
+              :disabled="submitting || (impact && impact.conflicts && impact.conflicts.length)"
+              @click="confirm">
+        {{ submitting ? '处理中…' : '确认' + ({correct:'更正',void:'作废',restore:'恢复',undo:'撤销'}[m.action]) }}
+      </button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 版本历史弹窗 ---------------- */
+const HistoryModal = {
+  setup() {
+    const m = topModal();
+    const h = ref(null);
+    const err = ref("");
+    async function reload() {
+      try { h.value = await api(`/api/audit/${m.entityType}/${m.entityId}/history`); }
+      catch (e) { err.value = e.message; }
+    }
+    onMounted(reload);
+    // 从历史中打开的撤销弹窗关闭后，自动重新拉取版本链
+    watch(
+      () => S.modals.length,
+      (n, old) => { if (n < old && topModal() === m) reload(); }
+    );
+    function canUndo(log) {
+      if (!h.value) return false;
+      // 只能基于内容版本（create/correct/restore/undo/baseline 之后）撤销，且不能撤到当前版本
+      return ["create", "correct", "restore", "undo", "baseline"].includes(log.action)
+        && log.version_after && log.version_after !== h.value.current_version
+        && !h.value.is_void;
+    }
+    return { h, err, m, closeModal, canUndo, openAuditModal, ENTITY_LABEL };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal">
+    <div class="modal-head">
+      <h3>版本历史 · {{ ENTITY_LABEL[m.entityType] }} #{{ m.entityId }}
+        <span class="ver-badge" v-if="h">当前 v{{ h.current_version }}<span v-if="h.is_void"> · 已作废</span></span>
+      </h3>
+      <button class="modal-close" @click="closeModal">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div v-if="!h" class="empty">加载中…</div>
+      <div class="history-list" v-else>
+        <div v-for="log in [...h.logs].reverse()" :key="log.id"
+             class="history-item"
+             :class="{baseline: log.is_baseline,
+                      'action-void': log.action==='void',
+                      'action-restore': ['restore','undo'].includes(log.action)}">
+          <div class="h-head">
+            <span class="h-action">
+              {{ log.action_label }}
+              <span class="ver-badge" v-if="log.version_after">v{{ log.version_before }} → v{{ log.version_after }}</span>
+            </span>
+            <span class="h-meta">{{ log.operator_display }}</span>
+            <span class="h-meta">· {{ (log.operated_at || '').replace('T',' ').slice(0,16) }}</span>
+            <span style="flex:1"></span>
+            <button v-if="canUndo(log)" class="link" style="font-size:12px"
+              @click="openAuditModal({entityType:m.entityType, entityId:m.entityId, action:'undo',
+                version:h.current_version, targetVersion:log.version_after, onDone:m.onDone})">
+              按此版本撤销更正
+            </button>
+          </div>
+          <div class="h-reason" v-if="log.reason">原因：{{ log.reason }}</div>
+          <ul class="change-list" v-if="log.changes.length">
+            <li class="ch" v-for="ch in log.changes" :key="ch.field">
+              {{ ch.label }}：
+              <span class="old" v-if="log.action!=='create' && log.action!=='baseline'">{{ ch.old }}</span>
+              <span class="arrow" v-if="log.action!=='create' && log.action!=='baseline'">→</span>
+              <span class="new">{{ ch.new }}</span>
+            </li>
+          </ul>
+          <div class="h-reason" v-if="log.is_baseline" style="color:#6b7280">
+            系统启用版本管理前的存量记录，作为历史起点，未虚构当时的操作人。
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" @click="closeModal">关闭</button>
+    </div>
+  </div></div>`,
+};
+
 /* ---------------- 弹窗：健康表单 ---------------- */
 const HealthFormModal = {
   setup() {
     const m = topModal();
+    const isEdit = !!m.rec?.id;
     const f = reactive(
-      m.rec?.id ? { ...m.rec }
+      isEdit
+        ? { ...m.rec }
         : { cow_id: m.rec?.presetCow || null, date: todayStr(), record_type: "checkup",
             diagnosis: "", temperature: null, severity: null, follow_up_date: null,
             result: null, note: "" }
     );
+    const operator = ref(S.operator);
+    const reason = ref("");
     const err = ref("");
     async function save() {
       err.value = "";
       try {
         const body = { ...f };
-        if (m.rec?.id) {
+        if (isEdit) {
+          if (!operator.value.trim()) throw new Error("请填写操作人");
+          if (!reason.value.trim()) throw new Error("请填写更正原因");
+          setOperator(operator.value); S.operator = operator.value.trim();
           delete body.id; delete body.cow_ear_tag; delete body.cow_name;
+          delete body.version; delete body.is_void; delete body.voided_at;
+          body.operator = operator.value.trim();
+          body.reason = reason.value.trim();
+          body.expected_version = m.rec.version;
           await api(`/api/health/${m.rec.id}`, { method: "PATCH", body });
+          toast("健康记录已更正");
         } else {
           await api("/api/health", { method: "POST", body });
+          toast("健康记录已保存（复查日将生成提醒）");
         }
-        toast("健康记录已保存（复查日将生成提醒）");
         await loadHealthAll();
         closeModal();
       } catch (e) { err.value = e.message; }
     }
-    return { S: S, f, err, save, closeModal, H_TYPE, SEVERITY, H_RESULT };
+    return { S: S, m, isEdit, f, operator, reason, err, save, closeModal,
+             H_TYPE, SEVERITY, H_RESULT, saveOperator };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal">
-    <div class="modal-head"><h3>健康记录</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-head">
+      <h3>{{ isEdit ? '更正健康记录' : '健康记录' }}
+        <span class="ver-badge" v-if="isEdit">基于 v{{ m.rec.version }}</span>
+      </h3>
+      <button class="modal-close" @click="closeModal">×</button>
+    </div>
     <div class="modal-body">
       <div class="alert-box danger" v-if="err">{{ err }}</div>
       <div class="field-row">
@@ -891,10 +1174,20 @@ const HealthFormModal = {
           <option value="ongoing">治疗中</option><option value="recovered">已康复</option>
         </select></div>
       <div class="field"><label>备注</label><textarea class="input" rows="2" v-model="f.note"></textarea></div>
+
+      <template v-if="isEdit">
+        <div class="field-row">
+          <div class="field"><label>操作人 <span class="req">*</span></label>
+            <input class="input" v-model="operator" @change="saveOperator"></div>
+          <div class="field"><label>更正原因 <span class="req">*</span></label>
+            <input class="input" v-model="reason" placeholder="如：复查后补充诊断"></div>
+        </div>
+        <div class="hint">更正会保留前后内容与原因，复查提醒按新版本重新计算；误改可在“历史”中撤销。</div>
+      </template>
     </div>
     <div class="modal-foot">
       <button class="btn" @click="closeModal">取消</button>
-      <button class="btn btn-primary" @click="save">保存</button>
+      <button class="btn btn-primary" @click="save">{{ isEdit ? '确认更正' : '保存' }}</button>
     </div>
   </div></div>`,
 };
@@ -933,15 +1226,28 @@ const DrugFormModal = {
   </div></div>`,
 };
 
-/* ---------------- 弹窗：用药表单（自动休药期） ---------------- */
+/* ---------------- 弹窗：用药表单（自动休药期；支持更正） ---------------- */
 const MedFormModal = {
   setup() {
     const m = topModal();
-    const f = reactive({
-      cow_id: m.rec?.presetCow || null, drug_id: null, drug_name: "",
-      date: todayStr(), dose: "", route: "颈部肌注", reason: "",
-      withdrawal_days: null, next_dose_date: null, operator: "", note: "",
-    });
+    const isEdit = !!(m.rec?.id);
+    const f = reactive(isEdit
+      ? {
+          cow_id: m.rec.cow_id, drug_id: m.rec.drug_id ?? null,
+          drug_name: m.rec.drug_name, date: m.rec.date, dose: m.rec.dose || "",
+          route: m.rec.route || "颈部肌注", reason: m.rec.reason || "",
+          withdrawal_days: m.rec.withdrawal_days,
+          next_dose_date: m.rec.next_dose_date, operator: m.rec.operator || "",
+          note: m.rec.note || "", treated: m.rec.treated,
+        }
+      : {
+          cow_id: m.rec?.presetCow || null, drug_id: null, drug_name: "",
+          date: todayStr(), dose: "", route: "颈部肌注", reason: "",
+          withdrawal_days: null, next_dose_date: null, operator: S.operator || "", note: "",
+        }
+    );
+    const auditOperator = ref(S.operator);
+    const auditReason = ref("");
     const err = ref("");
     const wdEnd = computed(() =>
       f.date && f.withdrawal_days != null ? addDays(f.date, f.withdrawal_days) : null);
@@ -954,23 +1260,48 @@ const MedFormModal = {
     async function save() {
       err.value = "";
       try {
-        await api("/api/medications", { method: "POST", body: f });
-        toast("用药记录已保存，休药期校验已生效");
+        if (isEdit) {
+          if (!auditOperator.value.trim()) throw new Error("请填写更正操作人");
+          if (!auditReason.value.trim()) throw new Error("请填写更正原因");
+          setOperator(auditOperator.value); S.operator = auditOperator.value.trim();
+          const changes = {
+            drug_id: f.drug_id ?? null, drug_name: f.drug_name, date: f.date,
+            dose: f.dose || null, route: f.route || null, reason: f.reason || null,
+            withdrawal_days: f.withdrawal_days,
+            next_dose_date: f.next_dose_date || null, operator: f.operator || null,
+            note: f.note || null,
+            audit_operator: auditOperator.value.trim(),
+            audit_reason: auditReason.value.trim(),
+            expected_version: m.rec.version,
+          };
+          await api(`/api/medications/${m.rec.id}`, { method: "PATCH", body: changes });
+          toast("用药记录已更正，休药截止日已联动重算");
+        } else {
+          setOperator(f.operator); S.operator = (f.operator || "").trim();
+          await api("/api/medications", { method: "POST", body: f });
+          toast("用药记录已保存，休药期校验已生效");
+        }
         await loadMedsAll();
         closeModal();
         refreshDash();
       } catch (e) { err.value = e.message; }
     }
-    return { S, f, err, save, closeModal, pickDrug, wdEnd, saleDate };
+    return { S, m, isEdit, f, auditOperator, auditReason, err, save, closeModal,
+             pickDrug, wdEnd, saleDate, saveOperator };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal">
-    <div class="modal-head"><h3>登记用药</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-head">
+      <h3>{{ isEdit ? '更正用药记录' : '登记用药' }}
+        <span class="ver-badge" v-if="isEdit">基于 v{{ m.rec.version }}</span>
+      </h3>
+      <button class="modal-close" @click="closeModal">×</button>
+    </div>
     <div class="modal-body">
       <div class="alert-box danger" v-if="err">{{ err }}</div>
       <div class="field-row">
         <div class="field"><label>牛只 <span class="req">*</span></label>
-          <select class="input" v-model="f.cow_id">
+          <select class="input" v-model="f.cow_id" :disabled="isEdit">
             <option :value="null" disabled>请选择</option>
             <option v-for="c in S.cows.filter(x=>x.status!=='sold')" :key="c.id" :value="c.id">{{ c.ear_tag }} {{ c.name || '' }}</option>
           </select></div>
@@ -1009,13 +1340,23 @@ const MedFormModal = {
           <input type="date" class="input" v-model="f.next_dose_date" :min="f.date"></div>
       </div>
       <div class="field-row">
-        <div class="field"><label>兽医/操作人</label><input class="input" v-model="f.operator"></div>
+        <div class="field"><label>兽医/操作人</label><input class="input" v-model="f.operator" @change="saveOperator"></div>
         <div class="field"><label>备注</label><input class="input" v-model="f.note"></div>
       </div>
+
+      <template v-if="isEdit">
+        <div class="field-row">
+          <div class="field"><label>本次更正操作人 <span class="req">*</span></label>
+            <input class="input" v-model="auditOperator" @change="saveOperator" placeholder="谁在做这次更正"></div>
+          <div class="field"><label>更正原因 <span class="req">*</span></label>
+            <input class="input" v-model="auditReason" placeholder="如：休药天数按说明书应为7天"></div>
+        </div>
+        <div class="hint">更正后休药截止日自动重算，影响休药校验、违规拦截与提醒；原内容保留在版本历史，可撤销。</div>
+      </template>
     </div>
     <div class="modal-foot">
       <button class="btn" @click="closeModal">取消</button>
-      <button class="btn btn-primary" @click="save">保存</button>
+      <button class="btn btn-primary" @click="save">{{ isEdit ? '确认更正' : '保存' }}</button>
     </div>
   </div></div>`,
 };
@@ -1114,23 +1455,57 @@ const CowDetailModal = {
     onMounted(async () => {
       try { d.value = await api(`/api/cows/${m.id}`); } catch (e) { toast(e.message, "error"); closeModal(); }
     });
-    // 从详情中打开的子弹窗关闭后，自动重新拉取详情
+    // 从详情中打开的子弹窗关闭后，自动重新拉取详情与时间线
+    async function reloadDetail() {
+      d.value = await api(`/api/cows/${m.id}`);
+      tl.value = await api(`/api/cows/${m.id}/timeline`).then((r) => r.items);
+    }
     watch(
       () => S.modals.length,
       async (n, old) => {
         if (n < old && n > 0 && topModal()?.type === "cowDetail" && topModal()?.id === m.id) {
-          d.value = await api(`/api/cows/${m.id}`);
+          await reloadDetail();
         }
       }
     );
     const spark = computed(() =>
       (d.value?.yield_trend || []).map((t) => ({ label: t.date.slice(8), v: t.yield_kg }))
     );
+    const tl = ref([]);
+    const tlOpen = reactive({});
+    async function loadTimeline() {
+      const r = await api(`/api/cows/${m.id}/timeline`);
+      tl.value = r.items;
+    }
+    function switchTab(t) {
+      tab.value = t;
+      if (t === "timeline" && !tl.value.length) loadTimeline().catch((e) => toast(e.message, "error"));
+    }
     function addRecord(type) {
       const preset = { presetCow: d.value.id };
       openModal({ type, rec: preset });
     }
-    return { d, tab, spark, addRecord, closeModal, SESSION, H_TYPE, SEVERITY, H_RESULT, DETECTION, INSEM_RESULT, addDays };
+    function entryAction(ent, act) {
+      const opts = {
+        entityType: ent.entity_type, entityId: ent.entity_id, action: act,
+        version: ent.version, onDone: reloadDetail,
+      };
+      if (act === "restore") opts.version = ent.version;
+      openAuditModal(opts);
+    }
+    function undoFromLog(ent, log) {
+      openAuditModal({
+        entityType: ent.entity_type, entityId: ent.entity_id, action: "undo",
+        version: ent.version, targetVersion: log.version_after, onDone: reloadDetail,
+      });
+    }
+    function undoable(ent, log) {
+      return ["create", "correct", "restore", "undo", "baseline"].includes(log.action)
+        && log.version_after && log.version_after !== ent.version && !ent.is_void;
+    }
+    return { d, tab, spark, tl, tlOpen, addRecord, closeModal, switchTab, loadTimeline,
+             entryAction, undoFromLog, undoable, openModal, openAuditModal,
+             SESSION, H_TYPE, SEVERITY, H_RESULT, DETECTION, INSEM_RESULT, addDays };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal wide" v-if="d">
@@ -1166,11 +1541,12 @@ const CowDetailModal = {
       </div>
 
       <div class="tabs">
-        <button class="tab" :class="{active:tab==='overview'}" @click="tab='overview'">概览</button>
-        <button class="tab" :class="{active:tab==='milkings'}" @click="tab='milkings'">挤奶记录</button>
-        <button class="tab" :class="{active:tab==='health'}" @click="tab='health'">健康</button>
-        <button class="tab" :class="{active:tab==='meds'}" @click="tab='meds'">用药/休药</button>
-        <button class="tab" :class="{active:tab==='estruses'}" @click="tab='estruses'">发情配种</button>
+        <button class="tab" :class="{active:tab==='overview'}" @click="switchTab('overview')">概览</button>
+        <button class="tab" :class="{active:tab==='milkings'}" @click="switchTab('milkings')">挤奶记录</button>
+        <button class="tab" :class="{active:tab==='health'}" @click="switchTab('health')">健康</button>
+        <button class="tab" :class="{active:tab==='meds'}" @click="switchTab('meds')">用药/休药</button>
+        <button class="tab" :class="{active:tab==='estruses'}" @click="switchTab('estruses')">发情配种</button>
+        <button class="tab" :class="{active:tab==='timeline'}" @click="switchTab('timeline')">🕓 变更时间线</button>
       </div>
 
       <div v-if="tab==='overview'">
@@ -1234,6 +1610,60 @@ const CowDetailModal = {
           <tr v-if="!d.estruses.length"><td colspan="5" class="empty">无记录</td></tr>
         </tbody></table>
       </div>
+
+      <div v-if="tab==='timeline'">
+        <p style="color:#6b7280;font-size:12.5px;margin-bottom:12px">
+          沿本牛时间线汇总挤奶/健康/用药记录的历次版本，含已作废记录。作废可恢复，更正可撤销；
+          存量数据以「历史起点」标注，不虚构操作人。
+        </p>
+        <div v-if="!tl.length" class="empty">暂无记录</div>
+        <div v-for="(ent,i) in tl" :key="ent.entity_type+ent.entity_id" class="tl-group" :class="{void:ent.is_void}">
+          <div class="tl-head" @click="tlOpen[i]=!tlOpen[i]">
+            <span style="font-size:12px">{{ tlOpen[i] ? '▼' : '▶' }}</span>
+            <span class="badge gray">{{ ent.entity_type_label }}</span>
+            <b :style="ent.is_void ? 'text-decoration:line-through' : ''">{{ ent.summary }}</b>
+            <span class="ver-badge">v{{ ent.version }}</span>
+            <span v-if="ent.is_void" class="badge red">已作废</span>
+            <span style="flex:1"></span>
+            <button class="link btn-sm" style="font-size:12px" @click.stop="tlOpen[i]=!tlOpen[i]">
+              {{ ent.logs.length }} 个版本
+            </button>
+            <button v-if="ent.is_void" class="btn btn-sm" @click.stop="entryAction(ent,'restore')">恢复</button>
+            <button v-else-if="ent.entity_type!=='estrus'" class="btn btn-sm btn-danger"
+              @click.stop="entryAction(ent,'void')">作废</button>
+          </div>
+          <div v-show="tlOpen[i]" class="tl-body">
+            <div v-for="log in ent.logs" :key="log.id" class="history-item"
+                 :class="{baseline: log.is_baseline,
+                          'action-void': log.action==='void',
+                          'action-restore': ['restore','undo'].includes(log.action)}"
+                 style="margin-bottom:8px">
+              <div class="h-head">
+                <span class="h-action">{{ log.action_label }}
+                  <span class="ver-badge" v-if="log.version_after">v{{ log.version_before }} → v{{ log.version_after }}</span>
+                </span>
+                <span class="h-meta">{{ log.operator_display }}</span>
+                <span class="h-meta">· {{ (log.operated_at || '').replace('T',' ').slice(0,16) }}</span>
+                <span style="flex:1"></span>
+                <button v-if="undoable(ent, log)" class="link" style="font-size:12px"
+                  @click="undoFromLog(ent, log)">按此版本撤销</button>
+              </div>
+              <div class="h-reason" v-if="log.reason">原因：{{ log.reason }}</div>
+              <ul class="change-list" v-if="log.changes.length">
+                <li class="ch" v-for="ch in log.changes" :key="ch.field">
+                  {{ ch.label }}：
+                  <span class="old" v-if="!log.is_baseline && log.action!=='create'">{{ ch.old }}</span>
+                  <span class="arrow" v-if="!log.is_baseline && log.action!=='create'">→</span>
+                  <span class="new">{{ ch.new }}</span>
+                </li>
+              </ul>
+              <div class="h-reason" v-if="log.is_baseline" style="color:#6b7280">
+                系统启用版本管理前的存量记录，作为历史起点，未虚构当时的操作人。
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div></div>`,
 };
@@ -1242,7 +1672,7 @@ const CowDetailModal = {
 const App = {
   components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage,
     CowFormModal, MilkingFormModal, HealthFormModal, DrugFormModal,
-    MedFormModal, EstrusFormModal, CowDetailModal },
+    MedFormModal, EstrusFormModal, CowDetailModal, AuditActionModal, HistoryModal },
   setup() {
     onMounted(async () => {
       try {
@@ -1262,7 +1692,7 @@ const App = {
       { key: "health", ico: "🏥", label: "健康与用药" },
       { key: "repro", ico: "💕", label: "发情与配种" },
     ];
-    return { S, switchView, nav, topModal };
+    return { S, switchView, nav, topModal, saveOperator };
   },
   template: `
   <div class="layout">
@@ -1281,7 +1711,14 @@ const App = {
     <main class="main">
       <div class="topbar">
         <h1>{{ nav.find(n=>n.key===S.view)?.label }}</h1>
-        <div class="date">📅 {{ S.dashboard?.today || '' }} · 牧场管理系统</div>
+        <div style="display:flex;align-items:center;gap:14px">
+          <label class="operator-box" title="操作人仅保存在本机浏览器，用于审计留痕，无需登录">
+            👤
+            <input :value="S.operator" @input="S.operator=$event.target.value"
+                   @change="saveOperator()" placeholder="填写操作人">
+          </label>
+          <div class="date">📅 {{ S.dashboard?.today || '' }} · 牧场管理系统</div>
+        </div>
       </div>
       <div class="content">
         <dashboard v-if="S.view==='dashboard'"></dashboard>
@@ -1301,6 +1738,8 @@ const App = {
       <med-form-modal v-else-if="md.type==='medForm'"></med-form-modal>
       <estrus-form-modal v-else-if="md.type==='estrusForm'"></estrus-form-modal>
       <cow-detail-modal v-else-if="md.type==='cowDetail'"></cow-detail-modal>
+      <audit-action-modal v-else-if="md.type==='auditAction'"></audit-action-modal>
+      <history-modal v-else-if="md.type==='historyModal'"></history-modal>
     </template>
 
     <div class="toast-wrap">

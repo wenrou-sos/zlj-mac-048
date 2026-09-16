@@ -1,5 +1,6 @@
 """Pydantic 请求/响应模型"""
 from datetime import date, datetime
+from datetime import date as date_type
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
@@ -212,3 +213,65 @@ class EstrusOut(EstrusCreate):
 
     class Config:
         from_attributes = True
+
+
+# ---------- 版本化审计 ----------
+class AuditAction(BaseModel):
+    """作废 / 恢复 共用请求体"""
+    operator: str = Field(..., min_length=1, max_length=32, description="操作人（手填）")
+    reason: str = Field(..., min_length=1, max_length=500, description="操作原因")
+    expected_version: Optional[int] = Field(None, ge=1, description="乐观锁：基于的当前版本号")
+
+
+class MilkingCorrect(BaseModel):
+    session: Optional[str] = Field(None, pattern="^(morning|noon|evening)$")
+    yield_kg: Optional[float] = Field(None, ge=0)
+    scc: Optional[int] = Field(None, ge=0)
+    discarded: Optional[bool] = None
+    note: Optional[str] = None
+    operator: str = Field(..., min_length=1, max_length=32)
+    reason: str = Field(..., min_length=1, max_length=500)
+    expected_version: Optional[int] = Field(None, ge=1)
+
+
+class HealthCorrect(BaseModel):
+    record_type: Optional[str] = Field(None, pattern="^(checkup|diagnosis|vaccination)$")
+    diagnosis: Optional[str] = None
+    temperature: Optional[float] = Field(None, ge=30, le=45)
+    severity: Optional[str] = Field(None, pattern="^(mild|moderate|severe)$")
+    follow_up_date: Optional[date] = None
+    result: Optional[str] = Field(None, pattern="^(recovered|ongoing|observed)$")
+    note: Optional[str] = None
+    operator: str = Field(..., min_length=1, max_length=32)
+    reason: str = Field(..., min_length=1, max_length=500)
+    expected_version: Optional[int] = Field(None, ge=1)
+
+
+class MedicationCorrect(BaseModel):
+    """用药更正：允许调整药品、用药日与休药期；休药截止日随日期/天数重算"""
+    drug_id: Optional[int] = None
+    drug_name: Optional[str] = Field(None, max_length=64)
+    date: Optional[date_type] = None
+    dose: Optional[str] = None
+    route: Optional[str] = None
+    reason: Optional[str] = None
+    withdrawal_days: Optional[int] = Field(None, ge=0, le=365)
+    next_dose_date: Optional[date_type] = None
+    treated: Optional[bool] = None
+    operator: Optional[str] = Field(None, max_length=32, description="用药兽医（更正药品兽医时使用）")
+    note: Optional[str] = None
+    audit_operator: str = Field(..., min_length=1, max_length=32, description="本次更正操作人")
+    audit_reason: str = Field(..., min_length=1, max_length=500, description="更正原因")
+    expected_version: Optional[int] = Field(None, ge=1)
+
+
+class RevertRequest(BaseModel):
+    target_version: int = Field(..., ge=1, description="要回退到的历史版本号")
+    operator: str = Field(..., min_length=1, max_length=32)
+    reason: str = Field(..., min_length=1, max_length=500)
+    expected_version: Optional[int] = Field(None, ge=1)
+
+
+class ImpactCorrectRequest(BaseModel):
+    changes: dict = Field(default_factory=dict)
+    expected_version: Optional[int] = Field(None, ge=1)
