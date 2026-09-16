@@ -249,6 +249,10 @@ class CourseDose(Base):
     # —— 异常/变更说明（漏用、延期、取消、换药）——
     reason = Column(String(255), nullable=True, comment="漏用/延期/取消原因")
     delayed_to = Column(Date, nullable=True, comment="延期后的新计划日期")
+    cancel_scope = Column(
+        String(16), nullable=True,
+        comment="取消来源：manual 单次取消 / line_stop 停药 / switch 换药 / course_end 结束疗程；"
+                "非 manual 的批量取消只能随用药行/疗程整批恢复")
     recorded_by = Column(String(32), nullable=True)
     recorded_at = Column(DateTime, nullable=True)
     note = Column(Text, nullable=True)

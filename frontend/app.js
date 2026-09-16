@@ -1518,6 +1518,15 @@ const CourseDetailModal = {
         await reload();
       } catch (e) { toast(e.message, "error"); }
     }
+    async function resumeLine(line) {
+      if (!confirm(`恢复用药「${line.drug_name}」？随停药取消的待给药计划将整批复为待给药。`)) return;
+      try {
+        await api(`/api/courses/drugs/${line.id}/resume`, { method: "POST", body: {} });
+        toast("已恢复用药，原计划已找回");
+        await reload();
+        await Promise.all([loadReminders(), loadCourses()]);
+      } catch (e) { toast(e.message, "error"); }
+    }
 
     async function endCourse() {
       const reason = prompt("结束疗程的原因（剩余未执行计划将全部取消，已生效休药限制继续有效）：");
@@ -1530,9 +1539,13 @@ const CourseDetailModal = {
       } catch (e) { toast(e.message, "error"); }
     }
     async function reopen() {
-      if (!confirm("重新打开疗程？（已取消计划不会自动恢复）")) return;
-      await api(`/api/courses/${m.id}/reopen`, { method: "POST" });
-      await reload();
+      if (!confirm("重新打开疗程？随“结束疗程”取消的待给药计划将整批恢复。")) return;
+      try {
+        await api(`/api/courses/${m.id}/reopen`, { method: "POST" });
+        toast("疗程已重新打开");
+        await reload();
+        await Promise.all([loadReminders(), loadCourses()]);
+      } catch (e) { toast(e.message, "error"); }
     }
     async function saveNote() {
       try {
@@ -1542,11 +1555,18 @@ const CourseDetailModal = {
       } catch (e) { toast(e.message, "error"); }
     }
     async function remove() {
-      if (!confirm("确认删除整个疗程及其全部计划/执行记录？此操作不可恢复。")) return;
-      await api(`/api/courses/${m.id}`, { method: "DELETE" });
-      await Promise.all([loadCourses(), loadReminders(), loadDashboard()]);
-      closeModal();
-      toast("疗程已删除");
+      // 有实际给药记录的疗程后端会拒绝删除；这里提前给明确提示
+      if (co.value.counts.administered > 0) {
+        toast("该疗程已有实际给药记录，不能删除（休药限制须保留）；请改为结束疗程", "warn");
+        return;
+      }
+      if (!confirm("该疗程尚无实际给药，确认删除其全部计划？此操作不可恢复。")) return;
+      try {
+        await api(`/api/courses/${m.id}`, { method: "DELETE" });
+        await Promise.all([loadCourses(), loadReminders(), loadDashboard()]);
+        closeModal();
+        toast("疗程已删除");
+      } catch (e) { toast(e.message, "error"); }
     }
 
     const grouped = computed(() => {
@@ -1561,7 +1581,7 @@ const CourseDetailModal = {
 
     return {
       S, co, tab, grouped, action, actionErr, noteDraft,
-      openDose, submitDose, resetDose, openLine, stopLine,
+      openDose, submitDose, resetDose, openLine, stopLine, resumeLine,
       endCourse, reopen, saveNote, remove, closeModal,
       SESSION_FULL, DOSE_STATUS, addDays,
     };
@@ -1617,6 +1637,9 @@ const CourseDetailModal = {
               <button class="btn btn-sm" style="margin-right:6px" @click="openLine('switch', g.line)">🔄 换药</button>
               <button class="btn btn-sm" @click="stopLine(g.line)">⏹ 停药</button>
             </template>
+            <template v-else-if="co.status==='active' && g.line.status==='stopped'">
+              <button class="btn btn-sm btn-primary" @click="resumeLine(g.line)">▶ 恢复用药</button>
+            </template>
           </div>
           <div class="table-wrap"><table class="data">
             <thead><tr><th>次数</th><th>计划日期/班次</th><th>状态</th><th>实际给药</th>
@@ -1658,7 +1681,7 @@ const CourseDetailModal = {
                   <div v-if="d.note" style="color:#6b7280">{{ d.note }}</div>
                 </td>
                 <td style="white-space:nowrap">
-                  <template v-if="co.status==='active'">
+                  <template v-if="co.status==='active' && g.line.status==='active'">
                     <button v-if="['planned','delayed','missed'].includes(d.status)"
                             class="btn btn-sm btn-primary" style="margin-right:5px"
                             @click="openDose('administer', d)">给药</button>
@@ -1667,10 +1690,18 @@ const CourseDetailModal = {
                       <button class="link" style="margin-right:8px;color:#b45309" @click="openDose('miss', d)">漏用</button>
                       <button class="link" style="margin-right:8px;color:#6b7280" @click="openDose('cancel', d)">取消</button>
                     </template>
-                    <button v-if="['missed','delayed','cancelled'].includes(d.status)"
+                    <!-- 仅单次漏用/延期/手动取消可逐次恢复；停药·换药·结束疗程的批量取消请到用药行/疗程层级恢复 -->
+                    <button v-if="d.status==='cancelled' && d.cancel_scope==='manual'"
+                            class="link" style="margin-right:8px" @click="resetDose(d)">恢复</button>
+                    <button v-if="['missed','delayed'].includes(d.status)"
                             class="link" style="margin-right:8px" @click="resetDose(d)">恢复</button>
                   </template>
-                  <span v-else class="badge gray">疗程已结束</span>
+                  <span v-else-if="d.status==='cancelled' && d.cancel_scope!=='manual'" class="badge gray">
+                    {{ {line_stop:'随停药取消', switch:'随换药取消', course_end:'随结束取消'}[d.cancel_scope] || '已取消' }}
+                  </span>
+                  <span v-else-if="co.status!=='active'" class="badge gray">疗程已结束</span>
+                  <span v-else-if="g.line.status==='switched'" class="badge gray">已换药</span>
+                  <span v-else-if="g.line.status==='stopped'" class="badge gray">已停药</span>
                 </td>
               </tr>
             </tbody>
@@ -1703,9 +1734,12 @@ const CourseDetailModal = {
       <div v-if="tab==='note'">
         <textarea class="input" rows="5" v-model="noteDraft"
           placeholder="写给下一班：剩余怎么打、重点观察什么、何时复查"></textarea>
-        <div style="margin-top:10px;display:flex;gap:8px">
+        <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
           <button class="btn btn-primary" @click="saveNote">保存交班备注</button>
-          <button class="btn btn-danger" @click="remove">删除整个疗程</button>
+          <button v-if="co.counts.administered===0" class="btn btn-danger" @click="remove">删除整个疗程</button>
+          <span v-else style="font-size:12px;color:#6b7280">
+            已有 {{ co.counts.administered }} 次实际给药，疗程不可删除；治疗结束请使用“结束疗程”，实际给药与休药记录会继续保留。
+          </span>
         </div>
       </div>
     </div>

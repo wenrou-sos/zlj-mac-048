@@ -251,6 +251,11 @@ class LineChangePayload(BaseModel):
     reason: str = Field(..., min_length=1, max_length=255)
 
 
+class LineResumePayload(BaseModel):
+    """恢复用药（撤销停药）：备注可选"""
+    reason: Optional[str] = Field(None, max_length=255)
+
+
 # ---------- 发情/配种 ----------
 class EstrusCreate(BaseModel):
     cow_id: int

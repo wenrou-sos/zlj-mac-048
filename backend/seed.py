@@ -295,6 +295,7 @@ def seed_database(db: Session) -> None:
     give(v1, -2, operator="李兽医", note="首次肌注")
     v2.status = "cancelled"
     v2.reason = "换药为 葡萄糖酸钙注射液：肌注后精神改善不明显，改静注补钙促采食"
+    v2.cancel_scope = "switch"
     v2.recorded_at = datetime.datetime.utcnow()
     ca1 = planned_dose(c1611, ln_ca, 1, -1, "morning")
     ca2 = planned_dose(c1611, ln_ca, 2, 0, "morning")
@@ -384,6 +385,38 @@ def seed_database(db: Session) -> None:
     db.commit()
 
 
+def backfill_cancel_scope(db: Session) -> None:
+    """老数据迁移：为已取消但无来源的剂量按其用药行状态推断 cancel_scope。"""
+    line_ids = [
+        row[0] for row in
+        db.query(models.CourseDrug.id).filter(
+            models.CourseDrug.status.in_(["switched", "stopped"])
+        ).all()
+    ]
+    lines = {
+        ln.id: ln for ln in
+        db.query(models.CourseDrug).filter(models.CourseDrug.id.in_(line_ids)).all()
+    } if line_ids else {}
+    changed = False
+    q = db.query(models.CourseDose).filter(
+        models.CourseDose.status == "cancelled",
+        models.CourseDose.cancel_scope.is_(None),
+    )
+    for d in q.all():
+        ln = lines.get(d.course_drug_id)
+        if ln is None:
+            d.cancel_scope = "manual"
+        elif ln.status == "switched":
+            d.cancel_scope = "switch"
+        elif (ln.change_reason or "").startswith("结束疗程："):
+            d.cancel_scope = "course_end"
+        else:
+            d.cancel_scope = "line_stop"
+        changed = True
+    if changed:
+        db.commit()
+
+
 def init_db(force: bool = False) -> None:
     import os
     from .database import DB_PATH
@@ -395,6 +428,12 @@ def init_db(force: bool = False) -> None:
         db = SessionLocal()
         try:
             seed_database(db)
+        finally:
+            db.close()
+    else:
+        db = SessionLocal()
+        try:
+            backfill_cancel_scope(db)
         finally:
             db.close()
 

@@ -697,6 +697,18 @@ def stop_course_drug(line_id: int, payload: schemas.LineChangePayload,
     return course_services.course_to_dict(c, date.today())
 
 
+@app.post("/api/courses/drugs/{line_id}/resume")
+def resume_course_drug(line_id: int, payload: schemas.LineResumePayload = None,
+                       db: Session = Depends(get_db)):
+    line = db.get(models.CourseDrug, line_id)
+    if not line:
+        raise HTTPException(404, "未找到该用药行")
+    c = _get_course_or_404(line.course_id, db)
+    note = payload.reason if payload else None
+    c = course_services.resume_line(db, c, line, note)
+    return course_services.course_to_dict(c, date.today())
+
+
 def _dose_response(d: models.CourseDose, db: Session):
     c = _get_course_or_404(d.course_id, db)
     return course_services.course_to_dict(c, date.today())
@@ -739,6 +751,8 @@ def reset_dose(dose_id: int, db: Session = Depends(get_db)):
 @app.delete("/api/courses/{course_id}", status_code=204)
 def delete_course(course_id: int, db: Session = Depends(get_db)):
     c = _get_course_or_404(course_id, db)
+    # 已有实际给药记录的疗程禁止删除：实际给药与休药窗口是既成医疗事实
+    course_services.ensure_course_deletable(db, c)
     db.delete(c)
     db.commit()
 
