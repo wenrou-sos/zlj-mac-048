@@ -13,6 +13,7 @@ class CowBase(BaseModel):
     birth_date: date
     parity: int = Field(1, ge=0, le=20)
     status: str = "lactating"
+    shed_id: Optional[int] = None
     group: Optional[str] = None
     calving_date: Optional[date] = None
     expected_calving_date: Optional[date] = None
@@ -30,6 +31,7 @@ class CowUpdate(BaseModel):
     birth_date: Optional[date] = None
     parity: Optional[int] = Field(None, ge=0, le=20)
     status: Optional[str] = None
+    shed_id: Optional[int] = None
     group: Optional[str] = None
     calving_date: Optional[date] = None
     expected_calving_date: Optional[date] = None
@@ -209,6 +211,86 @@ class EstrusOut(EstrusCreate):
     id: int
     created_at: Optional[datetime] = None
     cow_ear_tag: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ---------- 认证 ----------
+class LoginIn(BaseModel):
+    username: str = Field(..., min_length=1, max_length=32)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class ChangePasswordIn(BaseModel):
+    old_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6, max_length=128)
+
+
+# ---------- 牛舍 ----------
+class ShedIn(BaseModel):
+    code: str = Field(..., max_length=32)
+    name: str = Field(..., max_length=64)
+    active: bool = True
+
+
+class ShedOut(BaseModel):
+    id: int
+    code: str
+    name: str
+    active: bool
+    cow_count: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ---------- 用户与授权 ----------
+class AssignmentIn(BaseModel):
+    shed_id: int
+    valid_from: Optional[date] = None
+    valid_to: Optional[date] = None
+    note: Optional[str] = Field(None, max_length=128)
+
+
+class AssignmentOut(AssignmentIn):
+    id: int
+    shed_code: Optional[str] = None
+    shed_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserCreate(BaseModel):
+    username: str = Field(..., min_length=2, max_length=32)
+    display_name: str = Field(..., min_length=1, max_length=32)
+    password: str = Field(..., min_length=6, max_length=128)
+    roles: List[str]
+    assignments: List[AssignmentIn] = []
+    active: bool = True
+    note: Optional[str] = Field(None, max_length=255)
+
+
+class UserUpdate(BaseModel):
+    display_name: Optional[str] = Field(None, max_length=32)
+    password: Optional[str] = Field(None, min_length=6, max_length=128)
+    roles: Optional[List[str]] = None
+    assignments: Optional[List[AssignmentIn]] = None
+    active: Optional[bool] = None
+    note: Optional[str] = Field(None, max_length=255)
+
+
+class UserOut(BaseModel):
+    id: int
+    username: str
+    display_name: str
+    roles: List[str]
+    active: bool
+    note: Optional[str] = None
+    assignments: List[AssignmentOut] = []
+    global_scope: bool = False
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

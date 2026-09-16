@@ -5,12 +5,21 @@ const { createApp, reactive, ref, computed, onMounted, watch, nextTick } = Vue;
 const API = "";
 async function api(path, opts = {}) {
   const res = await fetch(API + path, {
+    credentials: "same-origin",
     headers: opts.body ? { "Content-Type": "application/json" } : {},
     ...opts,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    // 会话失效/被停用/被改密：立即回到登录页
+    if (path !== "/api/auth/login") {
+      sessionExpired(data.detail || "登录已失效，请重新登录");
+    }
+    throw Object.assign(new Error(typeof data.detail === "string" ? data.detail : "请先登录"),
+      { status: 401, data });
+  }
   if (!res.ok) {
     const msg = typeof data.detail === "string" ? data.detail : "请求失败（" + res.status + "）";
     throw new Error(msg);
@@ -54,10 +63,15 @@ const REMINDER_META = {
 
 /* ---------------- 全局状态 ---------------- */
 const S = reactive({
+  authed: false,
+  bootstrapping: true,
+  user: null,           // /api/auth/me
+  loginMessage: "",
   view: "dashboard",
   toasts: [],
   modals: [],
   cows: [],
+  sheds: [],
   drugs: [],
   dashboard: null,
   reminders: [],
@@ -66,8 +80,84 @@ const S = reactive({
   health: [],
   meds: [],
   estruses: [],
+  users: [],
   loading: { milkings: false },
 });
+
+/* ---------------- 登录 / 权限辅助 ---------------- */
+function can(perm) {
+  const perms = S.user?.permissions || [];
+  return S.user?.is_admin || perms.includes(perm);
+}
+function isRole(role) {
+  return (S.user?.roles || []).includes(role);
+}
+// 挤奶员只能改/删本人录入的挤奶记录
+function canModifyMilking(r) {
+  if (!can("milking:write")) return false;
+  if (S.user.global_scope) return true;
+  return r.created_by === S.user.id;
+}
+function shedName(id) {
+  const s = S.sheds.find((x) => x.id === id);
+  return s ? `${s.code} ${s.name}` : "—";
+}
+async function refreshMe() {
+  S.user = await api("/api/auth/me");
+  S.authed = true;
+}
+async function bootstrap() {
+  S.bootstrapping = true;
+  try {
+    await refreshMe();
+    await Promise.all([
+      loadSheds().catch(() => {}),
+      loadDashboard().catch((e) => toast(e.message, "error")),
+      loadReminders().catch(() => {}),
+      loadAnomalies().catch(() => {}),
+      loadCows().catch(() => {}),
+      loadDrugs().catch(() => {}),
+    ]);
+  } catch (e) {
+    S.authed = false;
+  }
+  S.bootstrapping = false;
+}
+function sessionExpired(msg) {
+  S.authed = false;
+  S.user = null;
+  S.loginMessage = msg;
+}
+async function doLogin(username, password) {
+  // 登录接口单独处理 401，避免触发全局跳登录的死循环
+  const res = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ username, password }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || "登录失败");
+  S.user = data;
+  S.authed = true;
+  S.loginMessage = "";
+  await Promise.all([
+    loadSheds().catch(() => {}),
+    loadDashboard().catch(() => {}),
+    loadReminders().catch(() => {}),
+    loadAnomalies().catch(() => {}),
+    loadCows().catch(() => {}),
+    loadDrugs().catch(() => {}),
+  ]);
+}
+async function doLogout() {
+  try { await api("/api/auth/logout", { method: "POST" }); } catch (e) { /* ignore */ }
+  S.authed = false;
+  S.user = null;
+}
+async function loadSheds() {
+  S.sheds = await api("/api/sheds");
+}
 
 let toastSeq = 0;
 function toast(message, type = "success") {
@@ -313,7 +403,7 @@ const CowsPage = {
       const days = Math.floor((Date.now() - new Date(b).getTime()) / 86400000);
       return (days / 365).toFixed(1) + " 岁";
     };
-    return { S, q, status, filtered, reload, openModal, STATUS, age };
+    return { S, q, status, filtered, reload, openModal, STATUS, age, can, shedName };
   },
   template: `
   <div class="card">
@@ -329,7 +419,7 @@ const CowsPage = {
         <option value="sold">已离场</option>
       </select>
       <span class="spacer"></span>
-      <button class="btn btn-primary" @click="openModal({type:'cowForm', cow:null})">＋ 新建档案</button>
+      <button v-if="can('cow:write')" class="btn btn-primary" @click="openModal({type:'cowForm', cow:null})">＋ 新建档案</button>
     </div>
     <div class="table-wrap">
       <table class="data">
@@ -346,7 +436,7 @@ const CowsPage = {
             <td>{{ c.parity }}</td>
             <td>{{ age(c.birth_date) }}</td>
             <td><span class="badge" :class="STATUS[c.status].cls">{{ STATUS[c.status].label }}</span></td>
-            <td>{{ c.group || '-' }}</td>
+            <td>{{ c.shed_id ? shedName(c.shed_id) : '—' }}<span v-if="c.group" style="color:#9ca3af"> · {{ c.group }}</span></td>
             <td>
               <template v-if="c.calving_date">{{ c.calving_date }} ·
                 <span class="badge gray">DIM {{ Math.floor((Date.now()-new Date(c.calving_date).getTime())/86400000) }}</span>
@@ -357,8 +447,8 @@ const CowsPage = {
             <td class="num">{{ c.avg_yield_kg ?? '-' }}</td>
             <td style="white-space:nowrap">
               <button class="link" style="margin-right:10px" @click="openModal({type:'cowDetail', id:c.id})">详情</button>
-              <button class="link" style="margin-right:10px" @click="openModal({type:'cowForm', cow:c})">编辑</button>
-              <button class="link" style="color:#dc2626" @click="removeCow(c)">删除</button>
+              <button v-if="can('cow:write')" class="link" style="margin-right:10px" @click="openModal({type:'cowForm', cow:c})">编辑</button>
+              <button v-if="can('cow:write')" class="link" style="color:#dc2626" @click="removeCow(c)">删除</button>
             </td>
           </tr>
           <tr v-if="!S.cows.length"><td colspan="11" class="empty">没有符合条件的牛只</td></tr>
@@ -400,7 +490,8 @@ const MilkingsPage = {
       await loadMilkings("&" + p.toString());
     }
     const lactatingCows = computed(() => S.cows.filter((c) => c.status === "lactating"));
-    return { S, dateFrom, dateTo, cowId, onlyV, reload, openModal, SESSION, lactatingCows };
+    return { S, dateFrom, dateTo, cowId, onlyV, reload, openModal, SESSION, lactatingCows,
+             can, canModifyMilking };
   },
   template: `
   <div class="card">
@@ -422,7 +513,7 @@ const MilkingsPage = {
         <span v-if="onlyV" style="color:#6b7280;font-weight:400">（全历史筛查，最多1000条）</span>
       </label>
       <span class="spacer"></span>
-      <button class="btn btn-primary" @click="openModal({type:'milkingForm', rec:null})">＋ 登记挤奶</button>
+      <button v-if="can('milking:write')" class="btn btn-primary" @click="openModal({type:'milkingForm', rec:null})">＋ 登记挤奶</button>
     </div>
     <div class="table-wrap">
       <table class="data">
@@ -449,10 +540,11 @@ const MilkingsPage = {
             </td>
             <td style="max-width:180px;color:#6b7280">{{ r.note || '-' }}</td>
             <td style="white-space:nowrap">
-              <button v-if="r.violation" class="btn btn-sm btn-danger" style="margin-right:8px"
+              <button v-if="r.violation && can('milking:discard')" class="btn btn-sm btn-danger" style="margin-right:8px"
                 @click="markDiscard(r)">标记废弃</button>
-              <button class="link" style="margin-right:10px" @click="openModal({type:'milkingForm', rec:r})">编辑</button>
-              <button class="link" style="color:#dc2626" @click="remove(r)">删除</button>
+              <button v-if="canModifyMilking(r)" class="link" style="margin-right:10px" @click="openModal({type:'milkingForm', rec:r})">编辑</button>
+              <button v-if="canModifyMilking(r)" class="link" style="color:#dc2626" @click="remove(r)">删除</button>
+              <span v-if="!canModifyMilking(r) && !(r.violation && can('milking:discard'))" style="color:#9ca3af">—</span>
             </td>
           </tr>
           <tr v-if="!S.milkings.length"><td colspan="9" class="empty">暂无记录</td></tr>
@@ -463,7 +555,7 @@ const MilkingsPage = {
   methods: {
     async markDiscard(r) {
       try {
-        await api(`/api/milkings/${r.id}`, { method: "PATCH", body: { discarded: true } });
+        await api(`/api/milkings/${r.id}/discard`, { method: "POST" });
         toast(`已将 ${r.cow_ear_tag} ${r.date}${this.SESSION[r.session]} 奶标记废弃`);
         await this.reload();
       } catch (e) { toast(e.message, "error"); }
@@ -483,7 +575,7 @@ const MilkingsPage = {
 const HealthPage = {
   setup() {
     const tab = ref("health");
-    return { S, tab, openModal, H_TYPE, SEVERITY, H_RESULT };
+    return { S, tab, openModal, H_TYPE, SEVERITY, H_RESULT, can };
   },
   template: `
   <div class="card">
@@ -496,7 +588,7 @@ const HealthPage = {
     <div v-if="tab==='health'">
       <div class="toolbar">
         <span class="spacer"></span>
-        <button class="btn btn-primary" @click="openModal({type:'healthForm', rec:null})">＋ 登记健康记录</button>
+        <button v-if="can('health:write')" class="btn btn-primary" @click="openModal({type:'healthForm', rec:null})">＋ 登记健康记录</button>
       </div>
       <div class="table-wrap"><table class="data">
         <thead><tr><th>日期</th><th>耳标号</th><th>类型</th><th>诊断/项目</th><th>体温</th><th>程度</th><th>复查日</th><th>状态</th><th>操作</th></tr></thead>
@@ -510,8 +602,9 @@ const HealthPage = {
             <td>{{ h.follow_up_date || '-' }}</td>
             <td><span class="badge" :class="{'green':h.result==='recovered','amber':h.result==='ongoing','blue':h.result==='observed','gray':!h.result}">{{ H_RESULT[h.result] || '未结案' }}</span></td>
             <td style="white-space:nowrap">
-              <button class="link" style="margin-right:10px" @click="openModal({type:'healthForm', rec:h})">编辑</button>
-              <button class="link" style="color:#dc2626" @click="removeHealth(h)">删除</button>
+              <button v-if="can('health:write')" class="link" style="margin-right:10px" @click="openModal({type:'healthForm', rec:h})">编辑</button>
+              <button v-if="can('health:write')" class="link" style="color:#dc2626" @click="removeHealth(h)">删除</button>
+              <span v-if="!can('health:write')" style="color:#9ca3af">—</span>
             </td>
           </tr>
           <tr v-if="!S.health.length"><td colspan="9" class="empty">暂无健康记录</td></tr>
@@ -522,7 +615,7 @@ const HealthPage = {
     <div v-if="tab==='meds'">
       <div class="toolbar">
         <span class="spacer"></span>
-        <button class="btn btn-primary" @click="openModal({type:'medForm', rec:null})">＋ 登记用药</button>
+        <button v-if="can('medication:write')" class="btn btn-primary" @click="openModal({type:'medForm', rec:null})">＋ 登记用药</button>
       </div>
       <div class="table-wrap"><table class="data">
         <thead><tr><th>用药日期</th><th>耳标号</th><th>药品</th><th>剂量</th><th>途径</th><th>原因</th>
@@ -544,9 +637,11 @@ const HealthPage = {
             </td>
             <td>{{ m.operator || '-' }}</td>
             <td style="white-space:nowrap">
-              <button v-if="m.next_dose_date && !m.treated" class="btn btn-sm" style="margin-right:8px"
+              <button v-if="m.next_dose_date && !m.treated && can('medication:write')" class="btn btn-sm" style="margin-right:8px"
                 @click="doneDose(m)">已执行</button>
-              <button class="link" style="color:#dc2626" @click="removeMed(m)">删除</button>
+              <button v-if="can('medication:write')" class="link" style="margin-right:10px" @click="openModal({type:'medForm', rec:m})">编辑</button>
+              <button v-if="can('medication:write')" class="link" style="color:#dc2626" @click="removeMed(m)">删除</button>
+              <span v-if="!can('medication:write')" style="color:#9ca3af">—</span>
             </td>
           </tr>
           <tr v-if="!S.meds.length"><td colspan="11" class="empty">暂无用药记录</td></tr>
@@ -558,7 +653,7 @@ const HealthPage = {
       <div class="toolbar">
         <span style="color:#6b7280;font-size:12.5px">登记用药时选择药品将自动套用默认牛奶休药期；休药期含用药当天，结束日次日方可上市。</span>
         <span class="spacer"></span>
-        <button class="btn btn-primary" @click="openModal({type:'drugForm'})">＋ 新增药品</button>
+        <button v-if="can('drug:write')" class="btn btn-primary" @click="openModal({type:'drugForm'})">＋ 新增药品</button>
       </div>
       <div class="table-wrap"><table class="data">
         <thead><tr><th>药品名称</th><th>类别</th><th class="num">默认休药期(天)</th><th>鲜奶可售日(用药后)</th><th>备注</th></tr></thead>
@@ -600,13 +695,13 @@ const HealthPage = {
 
 /* ---------------- 发情与配种 ---------------- */
 const ReproPage = {
-  setup() { return { S, openModal, DETECTION, INSEM_RESULT }; },
+  setup() { return { S, openModal, DETECTION, INSEM_RESULT, can }; },
   template: `
   <div class="card">
     <div class="toolbar">
       <span style="color:#6b7280;font-size:12.5px">发情发现后 12 小时内为最佳输精窗口；配种后 18~24 天观察返情、35~42 天进行孕检。</span>
       <span class="spacer"></span>
-      <button class="btn btn-primary" @click="openModal({type:'estrusForm', rec:null})">＋ 登记发情/配种</button>
+      <button v-if="can('estrus:write')" class="btn btn-primary" @click="openModal({type:'estrusForm', rec:null})">＋ 登记发情/配种</button>
     </div>
     <div class="table-wrap"><table class="data">
       <thead><tr><th>发情日期</th><th>耳标号</th><th>发现方式</th><th>强度</th><th>配种</th>
@@ -623,18 +718,20 @@ const ReproPage = {
           </td>
           <td>{{ e.semen || '-' }}</td><td>{{ e.technician || '-' }}</td>
           <td>
-            <select class="input" style="padding:4px 8px;width:100px"
+            <select v-if="can('estrus:write')" class="input" style="padding:4px 8px;width:100px"
                     :value="e.result || 'pending'" @change="setResult(e, $event.target.value)">
               <option value="pending">待孕检</option>
               <option value="pregnant">已孕</option>
               <option value="negative">未孕</option>
               <option value="unknown">未确认</option>
             </select>
+            <span v-else>{{ INSEM_RESULT[e.result] || '待孕检' }}</span>
           </td>
           <td style="max-width:180px;color:#6b7280">{{ e.note || '-' }}</td>
           <td style="white-space:nowrap">
-            <button class="link" style="margin-right:10px" @click="openModal({type:'estrusForm', rec:e})">编辑</button>
-            <button class="link" style="color:#dc2626" @click="remove(e)">删除</button>
+            <button v-if="can('estrus:write')" class="link" style="margin-right:10px" @click="openModal({type:'estrusForm', rec:e})">编辑</button>
+            <button v-if="can('estrus:write')" class="link" style="color:#dc2626" @click="remove(e)">删除</button>
+            <span v-if="!can('estrus:write')" style="color:#9ca3af">—</span>
           </td>
         </tr>
         <tr v-if="!S.estruses.length"><td colspan="10" class="empty">暂无发情/配种记录</td></tr>
@@ -671,7 +768,8 @@ const CowFormModal = {
             calving_date: m.cow.calving_date?.slice(0, 10) || null,
             expected_calving_date: m.cow.expected_calving_date?.slice(0, 10) || null }
         : { ear_tag: "", name: "", breed: "荷斯坦牛", birth_date: todayStr(), parity: 1,
-            status: "lactating", group: "", calving_date: null,
+            status: "lactating", shed_id: (S.sheds[0] && S.sheds[0].id) || null,
+            group: "", calving_date: null,
             expected_calving_date: null, avg_yield_kg: null, note: "" }
     );
     const err = ref("");
@@ -689,7 +787,7 @@ const CowFormModal = {
         closeModal();
       } catch (e) { err.value = e.message; }
     }
-    return { f, err, save, closeModal };
+    return { f, err, save, closeModal, S };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal">
@@ -718,8 +816,16 @@ const CowFormModal = {
           </select></div>
       </div>
       <div class="field-row">
-        <div class="field"><label>牛舍/群组</label><input class="input" v-model="f.group" placeholder="如 A栋1栏"></div>
+        <div class="field"><label>所属牛舍</label>
+          <select class="input" v-model="f.shed_id">
+            <option :value="null">未分配</option>
+            <option v-for="s in S.sheds" :key="s.id" :value="s.id">{{ s.code }} {{ s.name }}</option>
+          </select></div>
+        <div class="field"><label>栏位/群组</label><input class="input" v-model="f.group" placeholder="如 A栋1栏"></div>
+      </div>
+      <div class="field-row">
         <div class="field"><label>标定日产奶量 kg</label><input type="number" step="0.1" min="0" class="input" v-model.number="f.avg_yield_kg"></div>
+        <div class="field"><label>&nbsp;</label><span style="color:#9ca3af;font-size:12px">牛舍决定数据可见范围；调牛舍即移交责任范围</span></div>
       </div>
       <div class="field-row">
         <div class="field"><label>最近产犊日期</label><input type="date" class="input" v-model="f.calving_date"></div>
@@ -1130,7 +1236,8 @@ const CowDetailModal = {
       const preset = { presetCow: d.value.id };
       openModal({ type, rec: preset });
     }
-    return { d, tab, spark, addRecord, closeModal, SESSION, H_TYPE, SEVERITY, H_RESULT, DETECTION, INSEM_RESULT, addDays };
+    return { d, tab, spark, addRecord, closeModal, SESSION, H_TYPE, SEVERITY, H_RESULT,
+             DETECTION, INSEM_RESULT, addDays, can };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal wide" v-if="d">
@@ -1143,16 +1250,16 @@ const CowDetailModal = {
           <div class="detail-meta">
             <span class="badge green">{{ d.status_label }}</span>
             <span class="badge gray">{{ d.breed }} · {{ d.parity }}胎</span>
-            <span class="badge gray" v-if="d.group">{{ d.group }}</span>
+            <span class="badge gray">{{ d.shed_name || '未分牛舍' }}<template v-if="d.group"> · {{ d.group }}</template></span>
             <span class="badge blue" v-if="d.days_in_milk != null">泌乳 {{ d.days_in_milk }} 天</span>
             <span class="badge red" v-if="d.in_withdrawal">🚫 休药期至 {{ d.withdrawal.withdrawal_end }}</span>
           </div>
         </div>
         <div style="display:flex;gap:8px">
-          <button class="btn btn-sm" @click="addRecord('milkingForm')">＋挤奶</button>
-          <button class="btn btn-sm" @click="addRecord('healthForm')">＋健康</button>
-          <button class="btn btn-sm" @click="addRecord('medForm')">＋用药</button>
-          <button class="btn btn-sm" @click="addRecord('estrusForm')">＋发情</button>
+          <button v-if="can('milking:write')" class="btn btn-sm" @click="addRecord('milkingForm')">＋挤奶</button>
+          <button v-if="can('health:write')" class="btn btn-sm" @click="addRecord('healthForm')">＋健康</button>
+          <button v-if="can('medication:write')" class="btn btn-sm" @click="addRecord('medForm')">＋用药</button>
+          <button v-if="can('estrus:write')" class="btn btn-sm" @click="addRecord('estrusForm')">＋发情</button>
         </div>
       </div>
 
@@ -1238,50 +1345,326 @@ const CowDetailModal = {
   </div></div>`,
 };
 
-/* ---------------- 根组件 ---------------- */
-const App = {
-  components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage,
-    CowFormModal, MilkingFormModal, HealthFormModal, DrugFormModal,
-    MedFormModal, EstrusFormModal, CowDetailModal },
+/* ---------------- 登录页 ---------------- */
+const LoginPage = {
   setup() {
-    onMounted(async () => {
+    const username = ref("");
+    const password = ref("");
+    const err = ref(S.loginMessage || "");
+    const loading = ref(false);
+    async function submit() {
+      err.value = "";
+      loading.value = true;
       try {
-        await Promise.all([
-          loadDashboard(),
-          loadReminders(),
-          loadAnomalies(),
-          loadCows(),
-          loadDrugs(),
-        ]);
-      } catch (e) { toast(e.message, "error"); }
-    });
-    const nav = [
-      { key: "dashboard", ico: "📊", label: "工作台" },
-      { key: "cows", ico: "🐄", label: "奶牛档案" },
-      { key: "milkings", ico: "🥛", label: "挤奶记录" },
-      { key: "health", ico: "🏥", label: "健康与用药" },
-      { key: "repro", ico: "💕", label: "发情与配种" },
-    ];
-    return { S, switchView, nav, topModal };
+        await doLogin(username.value.trim(), password.value);
+        S.view = "dashboard";
+      } catch (e) {
+        err.value = e.message;
+      }
+      loading.value = false;
+    }
+    return { username, password, err, loading, submit };
   },
   template: `
-  <div class="layout">
+  <div class="login-wrap">
+    <form class="login-card" @submit.prevent="submit">
+      <div class="login-brand">🐮 智慧牧场管理系统</div>
+      <div class="login-sub">请使用分配给您的岗位账号登录</div>
+      <label class="field" style="margin-top:18px">登录名
+        <input class="input" v-model="username" autofocus placeholder="如 vet_li" autocomplete="username"></label>
+      <label class="field" style="margin-top:12px">密码
+        <input class="input" type="password" v-model="password" placeholder="请输入密码" autocomplete="current-password"></label>
+      <div v-if="err" class="alert-box danger" style="margin-top:12px">{{ err }}</div>
+      <button class="btn btn-primary login-btn" :disabled="loading" type="submit">
+        {{ loading ? '登录中…' : '登 录' }}
+      </button>
+      <div class="login-hint">
+        演示账号：admin/admin123 · manager/manager123<br>
+        vet_li/vet12345 · milker_chen/milk12345 · viewer_zhou/view12345
+      </div>
+    </form>
+  </div>`,
+};
+
+/* ---------------- 系统管理：用户岗位与牛舍 ---------------- */
+const ROLE_OPTIONS = [
+  { v: "admin", l: "管理员" }, { v: "manager", l: "场长" },
+  { v: "vet", l: "兽医" }, { v: "milker", l: "挤奶员" },
+  { v: "viewer", l: "只读人员" },
+];
+const roleLabel = (r) => ({ admin: "管理员", manager: "场长", vet: "兽医",
+                            milker: "挤奶员", viewer: "只读人员" }[r] || r);
+
+const UserFormModal = {
+  setup() {
+    const m = topModal();
+    const u = m.user;
+    const f = reactive(u ? {
+      display_name: u.display_name,
+      roles: [...u.roles],
+      active: u.active,
+      note: u.note || "",
+      password: "",
+      assignments: u.assignments.map((a) => ({
+        shed_id: a.shed_id, valid_from: a.valid_from, valid_to: a.valid_to, note: a.note || "",
+      })),
+    } : {
+      display_name: "", roles: ["viewer"], active: true, note: "", password: "",
+      assignments: [{ shed_id: S.sheds[0]?.id || null, valid_from: null, valid_to: null, note: "" }],
+    });
+    const err = ref("");
+    function addAssign() {
+      f.assignments.push({ shed_id: null, valid_from: null, valid_to: null, note: "" });
+    }
+    function delAssign(i) { f.assignments.splice(i, 1); }
+    // 管理员/场长为全场范围，不需要分配牛舍
+    const needSheds = computed(() => !f.roles.some((r) => r === "admin" || r === "manager"));
+    async function save() {
+      err.value = "";
+      if (!f.display_name.trim()) { err.value = "请填写姓名"; return; }
+      if (!u && !f.password) { err.value = "请设置初始密码（至少6位）"; return; }
+      if (f.password && f.password.length < 6) { err.value = "密码至少 6 位"; return; }
+      const body = {
+        display_name: f.display_name, roles: f.roles, active: f.active, note: f.note,
+      };
+      if (f.password) body.password = f.password;
+      if (u || true) {
+        body.assignments = needSheds.value
+          ? f.assignments.filter((a) => a.shed_id)
+          : [];
+      }
+      try {
+        if (u) await api(`/api/users/${u.id}`, { method: "PATCH", body });
+        else {
+          body.username = m.username;
+          await api("/api/users", { method: "POST", body });
+        }
+        toast(u ? "用户已更新（其登录状态将立即失效）" : "用户已创建");
+        closeModal();
+        if (m.onSaved) m.onSaved();
+      } catch (e) { err.value = e.message; }
+    }
+    return { m, u, f, err, save, closeModal, ROLE_OPTIONS, needSheds, addAssign, delAssign, S, roleLabel };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal">
+    <div class="modal-head"><h3>{{ u ? '编辑人员：' + u.username : '新增人员' }}</h3>
+      <button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field" v-if="!u"><label>登录名 <span class="req">*</span></label>
+        <input class="input" v-model="m.username" placeholder="如 vet_zhang"></div>
+      <div class="field"><label>姓名 <span class="req">*</span></label>
+        <input class="input" v-model="f.display_name"></div>
+      <div class="field"><label>岗位（可兼岗，权限取并集）</label>
+        <div class="role-checks">
+          <label v-for="r in ROLE_OPTIONS" :key="r.v" class="role-chip">
+            <input type="checkbox" :value="r.v" v-model="f.roles"> {{ r.l }}
+          </label>
+        </div>
+      </div>
+      <div class="field">
+        <label>{{ u ? '重置密码（留空则不修改，改后该用户需重新登录）' : '初始密码（至少6位）' }}</label>
+        <input class="input" type="text" v-model="f.password" :placeholder="u ? '留空保持原密码' : '至少 6 位'">
+      </div>
+      <div class="field"><label>负责牛舍（含临时接管）</label>
+        <div v-if="!needSheds" class="alert-box" style="background:#f0f7ff;color:#2563eb">
+          管理员/场长默认可查看和管理全场全部牛舍，无需分配牛舍。
+        </div>
+        <div v-else>
+          <div v-for="(a,i) in f.assignments" :key="i" class="assign-row">
+            <select class="input" v-model="a.shed_id" style="width:150px">
+              <option :value="null">选择牛舍</option>
+              <option v-for="s in S.sheds" :key="s.id" :value="s.id">{{ s.code }} {{ s.name }}</option>
+            </select>
+            <label class="assign-date">起 <input type="date" class="input" v-model="a.valid_from"></label>
+            <label class="assign-date">止 <input type="date" class="input" v-model="a.valid_to"></label>
+            <input class="input" v-model="a.note" placeholder="备注，如 临时顶替" style="flex:1">
+            <button type="button" class="link" style="color:#dc2626" @click="delAssign(i)">移除</button>
+          </div>
+          <button type="button" class="btn btn-sm" @click="addAssign">＋ 增加牛舍/接管</button>
+          <div style="color:#6b7280;font-size:12px;margin-top:6px">
+            起止日期留空表示长期负责；设置起止日即可安排未来生效、到期自动收回的临时接管。
+          </div>
+        </div>
+      </div>
+      <label class="field" style="display:flex;align-items:center;gap:8px;flex-direction:row">
+        <input type="checkbox" v-model="f.active"> 账号启用中（取消勾选即停用，立即无法登录、会话失效）
+      </label>
+      <div class="field"><label>备注</label><input class="input" v-model="f.note"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">保存</button>
+    </div>
+  </div></div>`,
+};
+
+const UsersPage = {
+  setup() {
+    async function reload() {
+      S.users = await api("/api/users");
+      if (!S.sheds.length) S.sheds = await api("/api/sheds");
+    }
+    onMounted(reload);
+    function create() {
+      openModal({
+        type: "userForm", user: null, username: "",
+        onSaved: reload,
+      });
+    }
+    function edit(u) { openModal({ type: "userForm", user: u, onSaved: reload }); }
+    async function toggle(u) {
+      const word = u.active ? "停用" : "启用";
+      if (!confirm(`确认${word} ${u.display_name}（${u.username}）？` +
+                   (u.active ? "停用后其会话立即失效。" : ""))) return;
+      try {
+        await api(`/api/users/${u.id}`, { method: "PATCH", body: { active: !u.active } });
+        toast(`已${word}`);
+        reload();
+      } catch (e) { toast(e.message, "error"); }
+    }
+    return { S, reload, create, edit, toggle, roleLabel, openModal };
+  },
+  template: `
+  <div class="card">
+    <div class="toolbar">
+      <div style="font-weight:600">👥 人员账号与岗位</div>
+      <span class="spacer"></span>
+      <button class="btn btn-primary" @click="create">＋ 新增人员</button>
+    </div>
+    <div class="table-wrap"><table class="data">
+      <thead><tr><th>登录名</th><th>姓名</th><th>岗位</th><th>数据范围</th>
+        <th>负责牛舍 / 临时接管</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>
+        <tr v-for="u in S.users" :key="u.id" :style="u.active ? '' : 'opacity:.5'">
+          <td><b>{{ u.username }}</b></td>
+          <td>{{ u.display_name }}</td>
+          <td><span v-for="r in u.roles" :key="r" class="badge"
+                    :class="{'red':r==='admin','blue':r==='manager','green':r==='vet','amber':r==='milker','gray':r==='viewer'}"
+                    style="margin-right:4px">{{ roleLabel(r) }}</span></td>
+          <td>{{ u.global_scope ? '全场' : '限负责牛舍' }}</td>
+          <td>
+            <template v-if="u.global_scope">—</template>
+            <template v-else-if="!u.assignments.length"><span style="color:#b45309">暂未分配（看不到任何牛只数据）</span></template>
+            <div v-else v-for="a in u.assignments" :key="a.id" style="font-size:12.5px;line-height:1.7">
+              {{ a.shed_code }}
+              <span class="badge gray" v-if="a.valid_from || a.valid_to">
+                {{ a.valid_from || '今起' }} ~ {{ a.valid_to || '长期' }}
+              </span>
+              <span v-if="a.note" style="color:#6b7280">（{{ a.note }}）</span>
+            </div>
+          </td>
+          <td>
+            <span class="badge" :class="u.active ? 'green' : 'gray'">{{ u.active ? '在职' : '已停用' }}</span>
+          </td>
+          <td style="white-space:nowrap">
+            <button class="link" style="margin-right:10px" @click="edit(u)">编辑/调岗</button>
+            <button class="link" :style="{color: u.active ? '#dc2626' : '#2563eb'}" @click="toggle(u)">
+              {{ u.active ? '停用' : '启用' }}
+            </button>
+          </td>
+        </tr>
+      </tbody>
+    </table></div>
+  </div>`,
+};
+
+/* ---------------- 修改密码弹窗 ---------------- */
+const PasswordModal = {
+  setup() {
+    const f = reactive({ old_password: "", new_password: "", confirm: "" });
+    const err = ref("");
+    async function save() {
+      err.value = "";
+      if (f.new_password.length < 6) { err.value = "新密码至少 6 位"; return; }
+      if (f.new_password !== f.confirm) { err.value = "两次输入的新密码不一致"; return; }
+      try {
+        await api("/api/auth/change-password", { method: "POST",
+          body: { old_password: f.old_password, new_password: f.new_password } });
+        toast("密码已修改，请用新密码重新登录");
+        closeModal();
+        setTimeout(doLogout, 600);
+      } catch (e) { err.value = e.message; }
+    }
+    return { f, err, save, closeModal };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:420px">
+    <div class="modal-head"><h3>修改密码</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field"><label>原密码</label><input type="password" class="input" v-model="f.old_password"></div>
+      <div class="field"><label>新密码（至少6位）</label><input type="password" class="input" v-model="f.new_password"></div>
+      <div class="field"><label>确认新密码</label><input type="password" class="input" v-model="f.confirm"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">确认修改</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 根组件 ---------------- */
+const App = {
+  components: { LoginPage, Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage,
+    UsersPage, CowFormModal, MilkingFormModal, HealthFormModal, DrugFormModal,
+    MedFormModal, EstrusFormModal, CowDetailModal, UserFormModal, PasswordModal },
+  setup() {
+    onMounted(bootstrap);
+    const nav = computed(() => [
+      { key: "dashboard", ico: "📊", label: "工作台", show: can("report:read") },
+      { key: "cows", ico: "🐄", label: "奶牛档案", show: can("cow:read") },
+      { key: "milkings", ico: "🥛", label: "挤奶记录", show: can("milking:read") },
+      { key: "health", ico: "🏥", label: "健康与用药", show: can("health:read") || can("medication:read") },
+      { key: "repro", ico: "💕", label: "发情与配种", show: can("estrus:read") },
+      { key: "admin", ico: "⚙️", label: "人员与权限", show: can("user:manage") },
+    ]);
+    const visibleNav = computed(() => nav.value.filter((n) => n.show));
+    const titleOf = (v) =>
+      ({ dashboard: "工作台", cows: "奶牛档案", milkings: "挤奶记录",
+         health: "健康与用药", repro: "发情与配种", admin: "人员与权限" }[v] || "");
+    return { S, switchView, nav, visibleNav, titleOf, topModal, can, doLogout,
+             roleLabel, openModal };
+  },
+  template: `
+  <div v-if="S.bootstrapping" class="boot">正在载入…</div>
+  <login-page v-else-if="!S.authed"></login-page>
+  <div v-else class="layout">
     <aside class="sidebar">
       <div class="brand"><span class="logo">🐮</span><div>智慧牧场<small>Dairy Farm MS</small></div></div>
       <nav class="nav">
-        <button v-for="n in nav" :key="n.key" class="nav-item"
+        <button v-for="n in visibleNav" :key="n.key" class="nav-item"
                 :class="{active:S.view===n.key}" @click="switchView(n.key)">
           <span class="ico">{{ n.ico }}</span>{{ n.label }}
           <span v-if="n.key==='dashboard' && S.dashboard && S.dashboard.reminder_count"
                 class="nav-badge">{{ S.dashboard.reminder_count }}</span>
         </button>
       </nav>
-      <div class="sidebar-foot">Vue 3 · FastAPI · SQLite<br>内置 12 头样例牛群数据</div>
+      <div class="sidebar-foot">
+        <div style="margin-bottom:6px">
+          {{ S.user.display_name }}
+          <span v-for="r in S.user.roles" :key="r" class="role-tag">{{ roleLabel(r) }}</span>
+        </div>
+        <div v-if="!S.user.global_scope && S.user.sheds.length" style="font-size:11.5px;opacity:.75">
+          负责：{{ S.user.sheds.map(s=>s.code).join('、') }}
+        </div>
+        <div v-else-if="!S.user.global_scope" style="font-size:11.5px;color:#fca5a5">
+          当前无在效负责牛舍
+        </div>
+        <div class="user-actions">
+          <button class="link link-light" @click="openModal({type:'password'})">修改密码</button>
+          <button class="link link-light" @click="doLogout">退出登录</button>
+        </div>
+      </div>
     </aside>
     <main class="main">
       <div class="topbar">
-        <h1>{{ nav.find(n=>n.key===S.view)?.label }}</h1>
-        <div class="date">📅 {{ S.dashboard?.today || '' }} · 牧场管理系统</div>
+        <h1>{{ titleOf(S.view) }}</h1>
+        <div class="date">
+          📅 {{ S.dashboard?.today || '' }} ·
+          <b>{{ S.user.display_name }}</b>（{{ S.user.role_labels.join('、') }}）
+        </div>
       </div>
       <div class="content">
         <dashboard v-if="S.view==='dashboard'"></dashboard>
@@ -1289,6 +1672,7 @@ const App = {
         <milkings-page v-else-if="S.view==='milkings'"></milkings-page>
         <health-page v-else-if="S.view==='health'"></health-page>
         <repro-page v-else-if="S.view==='repro'"></repro-page>
+        <users-page v-else-if="S.view==='admin'"></users-page>
       </div>
     </main>
 
@@ -1301,6 +1685,8 @@ const App = {
       <med-form-modal v-else-if="md.type==='medForm'"></med-form-modal>
       <estrus-form-modal v-else-if="md.type==='estrusForm'"></estrus-form-modal>
       <cow-detail-modal v-else-if="md.type==='cowDetail'"></cow-detail-modal>
+      <user-form-modal v-else-if="md.type==='userForm'"></user-form-modal>
+      <password-modal v-else-if="md.type==='password'"></password-modal>
     </template>
 
     <div class="toast-wrap">

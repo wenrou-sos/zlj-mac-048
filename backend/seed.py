@@ -4,13 +4,31 @@ from datetime import date, timedelta
 
 from sqlalchemy.orm import Session
 
-from . import models
+from . import auth, models
 from .database import Base, SessionLocal, engine
 
 
 def _d(offset: int) -> date:
     return date.today() + timedelta(days=offset)
 
+
+# ---------- 演示账号（首次登录后请改密） ----------
+# 登录名, 姓名, 初始口令, 岗位列表, (牛舍编号, 起始偏移, 截止偏移, 备注)[]
+DEMO_USERS = [
+    ("admin", "系统管理员", "admin123", ["admin"], []),
+    ("manager", "赵场长", "manager123", ["manager"], []),
+    ("vet_li", "李兽医", "vet12345", ["vet"],
+     [("A栋", None, None, "长期负责"), ("C栋", None, None, "长期负责")]),
+    ("vet_wang", "王兽医", "vet12345", ["vet"],
+     [("B栋", None, None, "长期负责")]),
+    ("milker_chen", "陈挤奶", "milk12345", ["milker"],
+     [("A栋", None, None, "本班次负责")]),
+    ("milker_lin", "林挤奶", "milk12345", ["milker", "viewer"],
+     [("B栋", None, None, "兼岗：B栋挤奶员兼B/C栋只读"),
+      ("C栋", None, None, "兼岗只读")]),
+    ("viewer_zhou", "周观察员", "view12345", ["viewer"],
+     [("A栋", 2, 14, "临时接管示例：3天后生效、共两周")]),
+]
 
 DRUGS = [
     # 名称, 类别, 默认牛奶休药期(天), 备注
@@ -79,6 +97,15 @@ def _gen_yield(rng: random.Random, base: float, dim: int, day_offset: int,
 
 
 def seed_database(db: Session) -> None:
+    # ---------- 牛舍 ----------
+    SHEDS = {}
+    for code, name in [("A栋", "A栋泌乳牛舍"), ("B栋", "B栋泌乳牛舍"),
+                       ("C栋", "C栋产房/产后舍"), ("D栋", "D栋干奶/待产舍")]:
+        s = models.Shed(code=code, name=name, active=True)
+        db.add(s)
+        SHEDS[code] = s
+    db.flush()
+
     # ---------- 药品目录 ----------
     drug_map = {}
     for name, usage, wd, note in DRUGS:
@@ -90,6 +117,7 @@ def seed_database(db: Session) -> None:
     # ---------- 奶牛档案 ----------
     cows = {}
     for tag, name, breed, parity, status, group, calv_off, exp_off, avg in COWS:
+        shed_code = group.split("栋", 1)[0] + "栋" if "栋" in group else None
         cow = models.Cow(
             ear_tag=tag,
             name=name,
@@ -97,6 +125,7 @@ def seed_database(db: Session) -> None:
             birth_date=_d(-(parity * 365 + 800 + int(tag[-2:]))),
             parity=parity,
             status=status,
+            shed_id=SHEDS[shed_code].id if shed_code in SHEDS else None,
             group=group,
             calving_date=_d(calv_off) if calv_off is not None else None,
             expected_calving_date=_d(exp_off) if exp_off is not None else None,
@@ -233,6 +262,27 @@ def seed_database(db: Session) -> None:
                             result="negative", result_date=_d(-105),
                             note="复检未孕，之后未见明显发情"),
     ])
+
+    # ---------- 用户、岗位与牛舍分配 ----------
+    for username, display, pwd, roles, assigns in DEMO_USERS:
+        u = models.User(
+            username=username, display_name=display,
+            password_hash=auth.hash_password(pwd),
+            roles=",".join(roles), active=True,
+            note="样例账号，请登录后修改口令",
+        )
+        db.add(u)
+        db.flush()
+        for code, off_from, off_to, note in assigns:
+            shed = SHEDS.get(code)
+            if not shed:
+                continue
+            db.add(models.UserShedAssignment(
+                user_id=u.id, shed_id=shed.id,
+                valid_from=_d(off_from) if off_from is not None else None,
+                valid_to=_d(off_to) if off_to is not None else None,
+                note=note,
+            ))
 
     db.commit()
 

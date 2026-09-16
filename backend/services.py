@@ -71,19 +71,32 @@ def check_withdrawal(db: Session, cow_id: int, on_date: date) -> dict:
     }
 
 
-def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
-    """汇总全部提醒（发情、配种孕检、用药、健康复查、待产、长期空怀）"""
+def build_reminders(
+    db: Session,
+    today: Optional[date] = None,
+    cow_filter: Optional[list] = None,
+) -> List[dict]:
+    """汇总全部提醒（发情、配种孕检、用药、健康复查、待产、长期空怀）
+
+    cow_filter 为 None 时统计全场；否则只统计其中的牛只（牛舍范围控制）。
+    """
     today = today or date.today()
+    cows_all = {c.id: c for c in db.query(models.Cow).all()}
+    if cow_filter is not None:
+        allowed = set(cow_filter)
+        cows_all = {i: c for i, c in cows_all.items() if i in allowed}
+
+    def _cow(cow_id: int):
+        return cows_all.get(cow_id)
+
     out: List[dict] = []
 
     # 1) 发情未配种：发情后 24~48 小时为最佳配种窗口，提醒保留 2 天
-    for e in (
-        db.query(models.EstrusRecord)
-        .filter(~models.EstrusRecord.inseminated)
-        .order_by(models.EstrusRecord.date.desc())
-        .all()
-    ):
-        cow = db.get(models.Cow, e.cow_id)
+    estrus_q = db.query(models.EstrusRecord).filter(~models.EstrusRecord.inseminated)
+    if cow_filter is not None:
+        estrus_q = estrus_q.filter(models.EstrusRecord.cow_id.in_(cow_filter or [-1]))
+    for e in estrus_q.order_by(models.EstrusRecord.date.desc()).all():
+        cow = _cow(e.cow_id)
         if not cow or cow.status == "sold":
             continue
         if 0 <= (today - e.date).days <= 2:
@@ -103,16 +116,14 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
 
     # 2) 配种后孕检 / 返情
     seen_cows: set = set()
-    for e in (
-        db.query(models.EstrusRecord)
-        .filter(models.EstrusRecord.inseminated)
-        .order_by(models.EstrusRecord.insemination_date.desc())
-        .all()
-    ):
+    insem_q = db.query(models.EstrusRecord).filter(models.EstrusRecord.inseminated)
+    if cow_filter is not None:
+        insem_q = insem_q.filter(models.EstrusRecord.cow_id.in_(cow_filter or [-1]))
+    for e in insem_q.order_by(models.EstrusRecord.insemination_date.desc()).all():
         if e.cow_id in seen_cows:
             continue
         seen_cows.add(e.cow_id)
-        cow = db.get(models.Cow, e.cow_id)
+        cow = _cow(e.cow_id)
         if not cow or cow.status == "sold":
             continue
         if e.result == "pregnant":
@@ -160,8 +171,11 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             })
 
     # 3) 用药提醒：下次用药 / 休药期进行中
-    for m in db.query(models.Medication).all():
-        cow = db.get(models.Cow, m.cow_id)
+    med_q = db.query(models.Medication)
+    if cow_filter is not None:
+        med_q = med_q.filter(models.Medication.cow_id.in_(cow_filter or [-1]))
+    for m in med_q.all():
+        cow = _cow(m.cow_id)
         if not cow or cow.status == "sold":
             continue
         if m.next_dose_date and not m.treated:
@@ -203,7 +217,7 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
         ))
         .all()
     ):
-        cow = db.get(models.Cow, h.cow_id)
+        cow = _cow(h.cow_id)
         if not cow or cow.status == "sold":
             continue
         delta = (h.follow_up_date - today).days
@@ -221,7 +235,9 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             })
 
     # 5) 待产 / 预产临近（7 天内）
-    for cow in db.query(models.Cow).filter(models.Cow.expected_calving_date.isnot(None)).all():
+    for cow in cows_all.values():
+        if cow.expected_calving_date is None:
+            continue
         if cow.status == "sold":
             continue
         delta = (cow.expected_calving_date - today).days
@@ -239,7 +255,9 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             })
 
     # 6) 产后首配窗口（产后 45~70 天未配种）
-    for cow in db.query(models.Cow).filter(models.Cow.calving_date.isnot(None)).all():
+    for cow in cows_all.values():
+        if cow.calving_date is None:
+            continue
         if cow.status in ("sold", "dry"):
             continue
         dim = (today - cow.calving_date).days
@@ -281,23 +299,38 @@ def _result_label(code: Optional[str]) -> str:
 
 
 # ---------- 奶量异常发现 ----------
-def detect_yield_anomalies(db: Session, days: int = 7, today: Optional[date] = None) -> List[dict]:
+def detect_yield_anomalies(
+    db: Session,
+    days: int = 7,
+    today: Optional[date] = None,
+    cow_filter: Optional[list] = None,
+) -> List[dict]:
     """
     逐牛、逐班次比较：以异常日前 8~2 天的同班次均值为基线
     - 单班产量下降超过 25%：异常
     - 连续 >=3 天该牛同方向下降：趋势异常
     - SCC > 500,000 cells/mL：乳房炎风险
+
+    cow_filter 为 None 时统计全场；否则只统计其中的牛只（牛舍范围控制）。
     """
     today = today or date.today()
     start = today - timedelta(days=days + 9)
 
-    records = (
+    records_q = (
         db.query(models.MilkingRecord)
         .filter(models.MilkingRecord.date >= start)
+    )
+    if cow_filter is not None:
+        records_q = records_q.filter(models.MilkingRecord.cow_id.in_(cow_filter or [-1]))
+    records = (
+        records_q
         .order_by(models.MilkingRecord.date.asc(), models.MilkingRecord.id.asc())
         .all()
     )
-    cows = {c.id: c for c in db.query(models.Cow).all()}
+    cows_q = db.query(models.Cow)
+    if cow_filter is not None:
+        cows_q = cows_q.filter(models.Cow.id.in_(cow_filter or [-1]))
+    cows = {c.id: c for c in cows_q.all()}
     # cow -> session -> [(date, rec)]（休药期废弃奶仍计入产奶量基线，避免误报产量下降）
     grouped: Dict[int, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
     for r in records:
