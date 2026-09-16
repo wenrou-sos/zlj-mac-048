@@ -4,16 +4,17 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from . import models, schemas, services
-from .database import Base, engine, get_db
+from . import importer, models, schemas, services
+from .database import Base, engine, get_db, run_migrations
 from .seed import init_db
 
 Base.metadata.create_all(bind=engine)
+run_migrations()
 init_db()
 
 app = FastAPI(title="牧场管理系统 API", version="1.0.0")
@@ -44,6 +45,7 @@ def milking_to_dict(r: models.MilkingRecord, db: Session, check_date: bool = Tru
         "note": r.note, "created_at": str(r.created_at) if r.created_at else None,
         "cow_ear_tag": cow.ear_tag if cow else None,
         "cow_name": cow.name if cow else None,
+        "import_batch_id": r.import_batch_id,
         "in_withdrawal": in_w,
         "withdrawal_until": str(until) if until else None,
         "violation": bool(in_w and not r.discarded),
@@ -203,6 +205,7 @@ def list_milkings(
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
     only_violations: bool = False,
+    import_batch_id: Optional[int] = None,
     limit: int = Query(200, le=1000),
     db: Session = Depends(get_db),
 ):
@@ -213,6 +216,8 @@ def list_milkings(
         query = query.filter(models.MilkingRecord.date >= date_from)
     if date_to:
         query = query.filter(models.MilkingRecord.date <= date_to)
+    if import_batch_id:
+        query = query.filter(models.MilkingRecord.import_batch_id == import_batch_id)
     if only_violations:
         # 违规判定必须在 SQL 层过滤：若先 limit 再在内存筛，较早的违规会被漏掉
         query = query.filter(services.withdrawal_violation_clause())
@@ -262,6 +267,7 @@ def annotate_milkings(rows: list, db: Session) -> list:
             "note": r.note, "created_at": str(r.created_at) if r.created_at else None,
             "cow_ear_tag": cow.ear_tag if cow else None,
             "cow_name": cow.name if cow else None,
+            "import_batch_id": r.import_batch_id,
             "in_withdrawal": in_w,
             "withdrawal_until": str(med.withdrawal_end) if med else None,
             "violation": bool(in_w and not r.discarded),
@@ -348,6 +354,110 @@ def delete_milking(rec_id: int, db: Session = Depends(get_db)):
     if not rec:
         raise HTTPException(404, "未找到该记录")
     db.delete(rec)
+    db.commit()
+
+
+# ---------------- 奶量 CSV 导入 ----------------
+def batch_to_dict(b: models.ImportBatch, with_rows: bool = False) -> dict:
+    d = {
+        "id": b.id, "filename": b.filename, "file_hash": b.file_hash[:12],
+        "status": b.status,
+        "total_rows": b.total_rows, "ok_rows": b.ok_rows,
+        "unknown_tag_rows": b.unknown_tag_rows, "duplicate_rows": b.duplicate_rows,
+        "conflict_rows": b.conflict_rows, "invalid_rows": b.invalid_rows,
+        "auto_discard_rows": b.auto_discard_rows, "inserted_rows": b.inserted_rows,
+        "error": b.error,
+        "created_at": str(b.created_at) if b.created_at else None,
+        "committed_at": str(b.committed_at) if b.committed_at else None,
+    }
+    if with_rows:
+        d["rows"] = [{
+            "row_no": r.row_no, "raw": r.raw, "ear_tag": r.ear_tag,
+            "date": str(r.date) if r.date else None,
+            "session": r.session,
+            "session_label": SESSION_LABEL.get(r.session) if r.session else None,
+            "yield_kg": r.yield_kg, "scc": r.scc,
+            "status": r.status,
+            "status_label": importer.ROW_STATUS_LABEL.get(r.status, r.status),
+            "message": r.message,
+            "milking_record_id": r.milking_record_id,
+        } for r in b.rows]
+    return d
+
+
+@app.post("/api/imports/milkings/preview", status_code=201)
+def import_milkings_preview(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """上传设备导出的 CSV，解析并生成预览（不入账）。
+
+    幂等：同一文件（内容哈希相同）重复上传返回已有批次；
+    若该文件已入账则直接返回已入账批次并标记 already_committed。
+    """
+    content = file.file.read()
+    if not content:
+        raise HTTPException(400, "文件为空")
+    try:
+        text = importer.decode(content)
+        importer.parse_text(text)  # 预检整体格式
+    except importer.CsvFormatError as e:
+        raise HTTPException(400, str(e))
+
+    digest = importer.file_hash(content)
+    batch = (db.query(models.ImportBatch)
+             .filter(models.ImportBatch.file_hash == digest)
+             .order_by(models.ImportBatch.id.desc()).first())
+    if batch and batch.status == "committed":
+        result = batch_to_dict(batch, with_rows=True)
+        result["already_committed"] = True
+        return result
+    if not batch:
+        batch = models.ImportBatch(
+            file_hash=digest, filename=file.filename or "milkings.csv", content=text,
+        )
+        db.add(batch)
+        db.flush()
+    # 新建或复用待确认批次：以当前档案/记录/用药数据重新校验
+    importer.rebuild_preview(db, batch, text)
+    db.commit()
+    db.refresh(batch)
+    return batch_to_dict(batch, with_rows=True)
+
+
+@app.post("/api/imports/milkings/{batch_id}/commit")
+def import_milkings_commit(batch_id: int, db: Session = Depends(get_db)):
+    """确认入账：单事务写入全部有效行，失败整体回滚；可安全重试。"""
+    batch = db.get(models.ImportBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "未找到该导入批次")
+    try:
+        return importer.commit_batch(db, batch)
+    except Exception:
+        raise HTTPException(500, "入账失败，已整体回滚，未写入任何记录；可修正后重试")
+
+
+@app.get("/api/imports/milkings")
+def import_milkings_list(db: Session = Depends(get_db)):
+    rows = (db.query(models.ImportBatch)
+            .order_by(models.ImportBatch.id.desc()).limit(100).all())
+    return [batch_to_dict(b) for b in rows]
+
+
+@app.get("/api/imports/milkings/{batch_id}")
+def import_milkings_detail(batch_id: int, db: Session = Depends(get_db)):
+    batch = db.get(models.ImportBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "未找到该导入批次")
+    return batch_to_dict(batch, with_rows=True)
+
+
+@app.delete("/api/imports/milkings/{batch_id}", status_code=204)
+def import_milkings_discard(batch_id: int, db: Session = Depends(get_db)):
+    """放弃一个尚未入账的预览批次（已入账批次保留用于追溯，不可删除）"""
+    batch = db.get(models.ImportBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "未找到该导入批次")
+    if batch.status == "committed":
+        raise HTTPException(400, "已入账批次需保留用于追溯，不能删除")
+    db.delete(batch)
     db.commit()
 
 

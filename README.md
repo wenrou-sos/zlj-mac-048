@@ -12,6 +12,7 @@
 | 工作台 | 牛群结构、今日/昨日产量、近 14 天上市/废弃奶堆叠柱状图、待办提醒、异常清单 |
 | 奶牛档案 | 耳标号、品种、胎次、牛舍、产犊/预产期、标定日产；检索、增删改 |
 | 挤奶记录 | 早/午/晚三班产量与体细胞数（SCC）；废弃奶单独计量，不混入大罐产量 |
+| 奶量导入 | 挤奶设备 CSV 批量导入：预览对照、异常行识别、事务化入账、幂等防重、批次追溯 |
 | 健康情况 | 体检/诊断/免疫、体温、严重程度、复查日、结案状态 |
 | 用药管理 | 药品目录与默认休药期；选药自动套用休药期，可覆盖；下次用药提醒 |
 | 发情配种 | 发情发现方式/强度、冻精、配种员、孕检结果回填 |
@@ -41,6 +42,16 @@
 - 录入挤奶前可调用 `POST /api/milkings/check-withdrawal` 预检（前端选牛即自动校验）
 - 休药期内登记挤奶：**自动标记为废弃奶**并给出警告，从根本上杜绝违规混装
 - 挤奶列表/仪表盘可筛查历史**违规混装**记录（休药期内却未废弃），一键补标废弃
+
+### 📥 奶量 CSV 批量导入
+
+挤奶记录页「📥 导入CSV」支持直接导入挤奶设备导出的文件，免去逐头逐班手工录入：
+
+- **CSV 格式**：需含 `耳标号,日期,班次,产量` 四列（`体细胞数,备注` 可选）；支持 UTF-8(含BOM)/GBK 编码、逗号/分号/制表符分隔、有无表头（无表头按上述固定列序）；班次接受 早/午/晚、morning/noon/evening 等写法，日期支持 `2026-09-16`、`2026/9/16`、`20260916`
+- **先预览后入账**：逐行对照耳标、日期、班次、产量、体细胞数，自动识别**未知耳标、文件内重复行、与已有记录的冲突、格式错误**（异常行入账时自动跳过，不覆盖已有数据）；休药期内的行按现有规则**自动标记废弃**并提示
+- **整批事务入账**：确认后单事务写入，任何失败整体回滚，**不留半批数据**；失败批次可重试
+- **幂等防重**：以文件内容 SHA-256 为幂等键，同一文件重复上传直接返回已入账批次；断线后重复提交返回原结果；数据库另有 `(牛,日期,班次)` 唯一索引兜底，**不会重复记奶**
+- **批次追溯**：批次与原始行永久留存（`导入批次`），每条入账记录带 `import_batch_id`，挤奶列表可按批次筛选、点击 📥 徽标回查批次，随时定位哪些记录来自哪次导入
 
 ## 🚀 快速开始
 
@@ -79,12 +90,13 @@ python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 ```
 dairy-farm/
 ├── backend/
-│   ├── main.py        # FastAPI 路由（CRUD + 仪表盘 + 校验）
+│   ├── main.py        # FastAPI 路由（CRUD + 仪表盘 + 校验 + 导入）
 │   ├── models.py      # SQLAlchemy 模型
 │   ├── schemas.py     # Pydantic 模型
 │   ├── services.py    # 提醒引擎 / 异常发现 / 休药期规则
+│   ├── importer.py    # CSV 解析 / 预览校验 / 事务化入账
 │   ├── seed.py        # 建库与样例数据
-│   ├── database.py    # 引擎与会话
+│   ├── database.py    # 引擎与会话（含轻量迁移）
 │   └── data/dairy.db  # SQLite（运行后生成）
 ├── frontend/
 │   ├── index.html
@@ -103,8 +115,11 @@ dairy-farm/
 | GET | `/api/reminders` | 全部提醒（按紧急度排序） |
 | GET | `/api/anomalies?days=7` | 奶量异常（按牛聚合） |
 | GET/POST/PATCH/DELETE | `/api/cows[...]` | 奶牛档案 |
-| GET/POST/PATCH/DELETE | `/api/milkings[...]` | 挤奶记录 |
+| GET/POST/PATCH/DELETE | `/api/milkings[...]` | 挤奶记录（支持 `import_batch_id` 按批次筛选） |
 | POST | `/api/milkings/check-withdrawal` | 录入前休药期预检 |
+| POST | `/api/imports/milkings/preview` | 上传 CSV 生成预览批次（同文件幂等复用） |
+| POST | `/api/imports/milkings/{id}/commit` | 确认入账（单事务、可安全重试） |
+| GET/DELETE | `/api/imports/milkings[/{id}]` | 导入批次列表/原始行明细；删除待确认批次 |
 | GET/POST/PATCH/DELETE | `/api/health[...]` | 健康记录 |
 | GET/POST | `/api/drugs` | 药品目录 |
 | GET/POST/PATCH/DELETE | `/api/medications[...]` | 用药记录 |

@@ -17,6 +17,17 @@ async function api(path, opts = {}) {
   }
   return data;
 }
+/* 文件上传（multipart，不能用 api() 的 JSON 头） */
+async function apiUpload(path, file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch(API + path, { method: "POST", body: fd });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(typeof data.detail === "string" ? data.detail : "上传失败（" + res.status + "）");
+  }
+  return data;
+}
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const addDays = (s, n) => {
   const d = new Date(s + "T00:00:00");
@@ -66,6 +77,7 @@ const S = reactive({
   health: [],
   meds: [],
   estruses: [],
+  milkingFilterBatch: null,   // 非空时挤奶列表只显示该导入批次的记录
   loading: { milkings: false },
 });
 
@@ -102,7 +114,8 @@ async function loadAnomalies(days = 7) {
 async function switchView(v) {
   S.view = v;
   if (v === "cows" && !S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
-  if (v === "milkings") loadMilkings();
+  // 批次过滤生效时由页面挂载后自行按批次加载，避免被默认查询覆盖
+  if (v === "milkings" && !S.milkingFilterBatch) loadMilkings();
   if (v === "health") {
     if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
     if (!S.health.length) loadHealthAll();
@@ -388,30 +401,41 @@ const MilkingsPage = {
     async function reload() {
       const p = new URLSearchParams();
       // 仅看违规时跨全部历史筛查，避免日期窗口漏掉较早的违规记录
-      if (!onlyV.value) {
+      if (!onlyV.value && !S.milkingFilterBatch) {
         p.set("date_from", dateFrom.value);
         p.set("date_to", dateTo.value);
       }
       if (cowId.value) p.set("cow_id", cowId.value);
+      if (S.milkingFilterBatch) {
+        p.set("import_batch_id", S.milkingFilterBatch);
+        p.set("limit", "1000");
+      }
       if (onlyV.value) {
         p.set("only_violations", "true");
         p.set("limit", "1000");
       }
       await loadMilkings("&" + p.toString());
     }
+    function clearBatchFilter() {
+      S.milkingFilterBatch = null;
+      reload();
+    }
+    // 从导入向导/批次详情跳转进来时，自动套用批次过滤
+    onMounted(() => { if (S.milkingFilterBatch) reload(); });
     const lactatingCows = computed(() => S.cows.filter((c) => c.status === "lactating"));
-    return { S, dateFrom, dateTo, cowId, onlyV, reload, openModal, SESSION, lactatingCows };
+    return { S, dateFrom, dateTo, cowId, onlyV, reload, clearBatchFilter,
+             openModal, SESSION, lactatingCows };
   },
   template: `
   <div class="card">
     <div class="toolbar">
-      <label class="input" :style="{width:'auto',display:'flex',alignItems:'center',gap:'6px',borderStyle:'dashed',opacity: onlyV ? .45 : 1}">
+      <label class="input" :style="{width:'auto',display:'flex',alignItems:'center',gap:'6px',borderStyle:'dashed',opacity: (onlyV || S.milkingFilterBatch) ? .45 : 1}">
         起 <input type="date" class="input" style="border:none;width:130px;padding:2px"
-              :disabled="onlyV" v-model="dateFrom" @change="reload">
+              :disabled="onlyV || !!S.milkingFilterBatch" v-model="dateFrom" @change="reload">
       </label>
-      <label class="input" :style="{width:'auto',display:'flex',alignItems:'center',gap:'6px',borderStyle:'dashed',opacity: onlyV ? .45 : 1}">
+      <label class="input" :style="{width:'auto',display:'flex',alignItems:'center',gap:'6px',borderStyle:'dashed',opacity: (onlyV || S.milkingFilterBatch) ? .45 : 1}">
         止 <input type="date" class="input" style="border:none;width:130px;padding:2px"
-              :disabled="onlyV" v-model="dateTo" @change="reload">
+              :disabled="onlyV || !!S.milkingFilterBatch" v-model="dateTo" @change="reload">
       </label>
       <select class="input" style="width:160px" v-model="cowId" @change="reload">
         <option value="">全部牛只</option>
@@ -421,7 +445,11 @@ const MilkingsPage = {
         <input type="checkbox" v-model="onlyV" @change="reload"> 仅看休药期违规混装
         <span v-if="onlyV" style="color:#6b7280;font-weight:400">（全历史筛查，最多1000条）</span>
       </label>
+      <span v-if="S.milkingFilterBatch" class="badge purple" style="cursor:pointer;font-size:12.5px"
+            @click="clearBatchFilter">📥 导入批次 #{{ S.milkingFilterBatch }} ✕</span>
       <span class="spacer"></span>
+      <button class="btn" @click="openModal({type:'importBatches'})">📋 导入批次</button>
+      <button class="btn btn-primary" style="margin-right:8px" @click="openModal({type:'importWizard'})">📥 导入CSV</button>
       <button class="btn btn-primary" @click="openModal({type:'milkingForm', rec:null})">＋ 登记挤奶</button>
     </div>
     <div class="table-wrap">
@@ -447,7 +475,11 @@ const MilkingsPage = {
               <span v-else-if="r.in_withdrawal" class="badge amber">休药期内</span>
               <span v-else class="badge green">✅ 正常上市</span>
             </td>
-            <td style="max-width:180px;color:#6b7280">{{ r.note || '-' }}</td>
+            <td style="max-width:200px;color:#6b7280">
+              <span v-if="r.import_batch_id" class="badge purple" style="cursor:pointer;margin-right:4px"
+                    :title="'来自 CSV 导入批次 #' + r.import_batch_id"
+                    @click="openModal({type:'importBatches', id: r.import_batch_id})">📥#{{ r.import_batch_id }}</span>{{ r.note || (r.import_batch_id ? '' : '-') }}
+            </td>
             <td style="white-space:nowrap">
               <button v-if="r.violation" class="btn btn-sm btn-danger" style="margin-right:8px"
                 @click="markDiscard(r)">标记废弃</button>
@@ -820,6 +852,298 @@ const MilkingFormModal = {
 async function refreshDash() {
   try { await Promise.all([loadDashboard(), loadAnomalies(), loadReminders()]); } catch (_) {}
 }
+
+/* ---------------- 弹窗：CSV 导入向导（选文件 → 预览 → 确认入账） ---------------- */
+const IMPORT_ROW_STATUS = {
+  ok: { label: "✅ 可入账", cls: "green" },
+  unknown_tag: { label: "❓ 未知耳标", cls: "red" },
+  duplicate: { label: "🔁 文件内重复", cls: "amber" },
+  conflict: { label: "⚠️ 已有记录冲突", cls: "amber" },
+  invalid: { label: "⛔ 格式错误", cls: "red" },
+};
+
+const ImportWizardModal = {
+  setup() {
+    const m = topModal();
+    const step = ref(m.batch ? "preview" : "pick");
+    const batch = ref(m.batch || null);
+    const result = ref(null);
+    const err = ref("");
+    const busy = ref(false);
+    const dragOver = ref(false);
+
+    function downloadTemplate() {
+      const csv = "耳标号,日期,班次,产量,体细胞数,备注\n" +
+        "1601," + todayStr() + ",早班,12.5,180000,示例行（导入前请删除）\n" +
+        "1602," + todayStr() + ",晚班,10.8,,\n";
+      const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "奶量导入模板.csv";
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+    async function pickFile(file) {
+      if (!file || busy.value) return;
+      err.value = ""; busy.value = true;
+      try {
+        batch.value = await apiUpload("/api/imports/milkings/preview", file);
+        step.value = "preview";
+      } catch (e) { err.value = e.message; }
+      busy.value = false;
+    }
+    function onDrop(e) {
+      dragOver.value = false;
+      pickFile(e.dataTransfer.files?.[0]);
+    }
+    async function commit() {
+      if (busy.value) return;
+      err.value = ""; busy.value = true;
+      try {
+        result.value = await api(`/api/imports/milkings/${batch.value.id}/commit`, { method: "POST" });
+        step.value = "done";
+        refreshDash();
+      } catch (e) { err.value = e.message; }
+      busy.value = false;
+    }
+    function viewRecords() {
+      S.milkingFilterBatch = batch.value.id;
+      S.modals.splice(0);   // 关闭整个弹窗栈（向导可能叠在批次列表之上）
+      S.view = "milkings";
+      loadMilkings("&import_batch_id=" + batch.value.id + "&limit=1000");
+    }
+    function reset() { step.value = "pick"; batch.value = null; result.value = null; err.value = ""; }
+    return { step, batch, result, err, busy, dragOver, closeModal,
+             downloadTemplate, pickFile, onDrop, commit, viewRecords, reset,
+             IMPORT_ROW_STATUS, fmtSCC };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal wide">
+    <div class="modal-head"><h3>📥 导入挤奶设备 CSV</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+
+      <!-- 步骤1：选择文件 -->
+      <template v-if="step==='pick'">
+        <div class="dropzone" :class="{over:dragOver}"
+             @dragover.prevent="dragOver=true" @dragleave="dragOver=false" @drop.prevent="onDrop"
+             @click="$refs.fileInput.click()">
+          <div style="font-size:34px">📄</div>
+          <div><b>{{ busy ? '正在解析…' : '点击选择或拖拽 CSV 文件到此处' }}</b></div>
+          <div style="color:#6b7280;font-size:12.5px;margin-top:6px">
+            需包含列：耳标号、日期、班次、产量（体细胞数、备注可选）；支持 UTF-8 / GBK、有无表头
+          </div>
+          <input ref="fileInput" type="file" accept=".csv,text/csv" style="display:none"
+                 @change="pickFile($event.target.files[0]); $event.target.value=''">
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px">
+          <span style="color:#6b7280;font-size:12.5px">同一文件重复上传不会重复记奶，可放心重试</span>
+          <button class="link" @click="downloadTemplate">⬇ 下载 CSV 模板</button>
+        </div>
+      </template>
+
+      <!-- 步骤2：预览确认 -->
+      <template v-else-if="step==='preview' && batch">
+        <div class="alert-box warn" v-if="batch.already_committed">
+          ⚠️ 该文件已于 {{ batch.committed_at }} 入账（批次 #{{ batch.id }}，{{ batch.inserted_rows }} 条），
+          系统已阻止重复入账。可关闭本窗口后到「导入批次」查看明细。
+        </div>
+        <div class="import-summary">
+          <div class="chip"><div class="n">{{ batch.total_rows }}</div><div class="t">数据行</div></div>
+          <div class="chip ok"><div class="n">{{ batch.ok_rows }}</div><div class="t">可入账</div></div>
+          <div class="chip" :class="{bad:batch.unknown_tag_rows}"><div class="n">{{ batch.unknown_tag_rows }}</div><div class="t">未知耳标</div></div>
+          <div class="chip" :class="{bad:batch.duplicate_rows}"><div class="n">{{ batch.duplicate_rows }}</div><div class="t">文件内重复</div></div>
+          <div class="chip" :class="{bad:batch.conflict_rows}"><div class="n">{{ batch.conflict_rows }}</div><div class="t">已有记录冲突</div></div>
+          <div class="chip" :class="{bad:batch.invalid_rows}"><div class="n">{{ batch.invalid_rows }}</div><div class="t">格式错误</div></div>
+          <div class="chip" :class="{warn:batch.auto_discard_rows}"><div class="n">{{ batch.auto_discard_rows }}</div><div class="t">休药期将废弃</div></div>
+        </div>
+        <div style="color:#6b7280;font-size:12.5px;margin:6px 0 10px">
+          文件：{{ batch.filename }} · 批次 #{{ batch.id }} · 异常行将自动跳过，不会覆盖已有记录
+        </div>
+        <div class="table-wrap" style="max-height:320px">
+          <table class="data">
+            <thead><tr>
+              <th>行号</th><th>耳标号</th><th>日期</th><th>班次</th>
+              <th class="num">产量 kg</th><th class="num">体细胞</th><th>判定</th><th>说明</th>
+            </tr></thead>
+            <tbody>
+              <tr v-for="r in batch.rows" :key="r.row_no"
+                  :style="r.status==='ok' ? '' : 'background:#fff8f0'">
+                <td>{{ r.row_no }}</td>
+                <td><b>{{ r.ear_tag || '-' }}</b></td>
+                <td>{{ r.date || '-' }}</td>
+                <td>{{ r.session_label || '-' }}</td>
+                <td class="num">{{ r.yield_kg ?? '-' }}</td>
+                <td class="num">{{ fmtSCC(r.scc) }}</td>
+                <td><span class="badge" :class="IMPORT_ROW_STATUS[r.status].cls">{{ IMPORT_ROW_STATUS[r.status].label }}</span></td>
+                <td style="max-width:260px;color:#6b7280">{{ r.message || (r.status==='ok' ? '待入账' : '') }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
+
+      <!-- 步骤3：入账结果 -->
+      <template v-else-if="step==='done' && result">
+        <div class="alert-box info" v-if="result.reused">
+          ℹ️ 该批次此前已入账（可能因断线重试），本次未重复记奶。
+        </div>
+        <div class="alert-box" :class="result.inserted ? 'info' : 'warn'" v-else>
+          {{ result.inserted ? '✅ 入账完成' : '⚠️ 没有可入账的行' }}
+        </div>
+        <div class="import-summary">
+          <div class="chip ok"><div class="n">{{ result.inserted }}</div><div class="t">已入账</div></div>
+          <div class="chip" :class="{bad:result.skipped}"><div class="n">{{ result.skipped }}</div><div class="t">已跳过</div></div>
+          <div class="chip" :class="{warn:result.auto_discarded}"><div class="n">{{ result.auto_discarded }}</div><div class="t">休药期自动废弃</div></div>
+        </div>
+        <p style="color:#6b7280;font-size:12.5px">
+          批次 #{{ result.batch_id }} · {{ result.committed_at }} · 原始行已留存，随时可在「导入批次」中追溯
+        </p>
+      </template>
+    </div>
+    <div class="modal-foot">
+      <template v-if="step==='pick'">
+        <button class="btn" @click="closeModal">取消</button>
+      </template>
+      <template v-else-if="step==='preview' && batch">
+        <button class="btn" @click="reset" :disabled="busy">← 重新选择文件</button>
+        <button class="btn" @click="closeModal">取消</button>
+        <button v-if="!batch.already_committed" class="btn btn-primary" :disabled="busy || !batch.ok_rows"
+                @click="commit">
+          {{ busy ? '入账中…' : (batch.ok_rows ? '确认入账 ' + batch.ok_rows + ' 条' : '没有可入账的行') }}
+        </button>
+      </template>
+      <template v-else-if="step==='done'">
+        <button class="btn" @click="closeModal">关闭</button>
+        <button class="btn btn-primary" @click="viewRecords">查看本批入账记录</button>
+      </template>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：导入批次历史与原始行追溯 ---------------- */
+const ImportBatchesModal = {
+  setup() {
+    const m = topModal();
+    const list = ref([]);
+    const detail = ref(null);
+    const err = ref("");
+    async function load() {
+      try { list.value = await api("/api/imports/milkings"); }
+      catch (e) { err.value = e.message; }
+    }
+    async function open(id) {
+      err.value = "";
+      try { detail.value = await api(`/api/imports/milkings/${id}`); }
+      catch (e) { err.value = e.message; }
+    }
+    async function removePending(b) {
+      if (!confirm(`确认放弃批次 #${b.id}（${b.filename}）？该批次尚未入账，删除后不可恢复。`)) return;
+      try {
+        await api(`/api/imports/milkings/${b.id}`, { method: "DELETE" });
+        if (detail.value?.id === b.id) detail.value = null;
+        await load();
+        toast("预览批次已删除");
+      } catch (e) { toast(e.message, "error"); }
+    }
+    async function resume(b) {
+      // 待确认批次 → 回到向导继续（以最新数据重新校验后的预览）
+      try {
+        const d = await api(`/api/imports/milkings/${b.id}`);
+        openModal({ type: "importWizard", batch: d });
+      } catch (e) { toast(e.message, "error"); }
+    }
+    function viewRecords(b) {
+      S.milkingFilterBatch = b.id;
+      closeModal();
+      S.view = "milkings";
+      loadMilkings("&import_batch_id=" + b.id + "&limit=1000");
+    }
+    onMounted(async () => {
+      await load();
+      if (m.id) open(m.id);
+    });
+    return { list, detail, err, closeModal, open, removePending, resume, viewRecords,
+             IMPORT_ROW_STATUS, fmtSCC };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal wide">
+    <div class="modal-head"><h3>📋 导入批次</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div v-if="!detail">
+        <div class="table-wrap"><table class="data">
+          <thead><tr>
+            <th>批次</th><th>文件名</th><th>上传时间</th><th>状态</th>
+            <th class="num">数据行</th><th class="num">入账</th><th class="num">跳过</th>
+            <th class="num">自动废弃</th><th>操作</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="b in list" :key="b.id">
+              <td><b>#{{ b.id }}</b></td>
+              <td>{{ b.filename }}</td>
+              <td style="white-space:nowrap">{{ (b.created_at || '').slice(0,16) }}</td>
+              <td>
+                <span v-if="b.status==='committed'" class="badge green">✅ 已入账</span>
+                <span v-else class="badge amber">🕐 待确认</span>
+                <div v-if="b.error" style="color:#dc2626;font-size:11.5px;max-width:180px">{{ b.error }}</div>
+              </td>
+              <td class="num">{{ b.total_rows }}</td>
+              <td class="num">{{ b.status==='committed' ? b.inserted_rows : '—' }}</td>
+              <td class="num">{{ b.status==='committed' ? (b.total_rows - b.inserted_rows) : (b.total_rows - b.ok_rows) }}</td>
+              <td class="num">{{ b.auto_discard_rows || 0 }}</td>
+              <td style="white-space:nowrap">
+                <button class="link" style="margin-right:8px" @click="open(b.id)">原始行</button>
+                <button v-if="b.status==='committed'" class="link" style="margin-right:8px" @click="viewRecords(b)">入账记录</button>
+                <button v-else class="link" style="margin-right:8px" @click="resume(b)">继续入账</button>
+                <button v-if="b.status!=='committed'" class="link" style="color:#dc2626" @click="removePending(b)">删除</button>
+              </td>
+            </tr>
+            <tr v-if="!list.length"><td colspan="9" class="empty">暂无导入批次，点击「📥 导入CSV」开始</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+      <div v-else>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+          <button class="btn btn-sm" @click="detail=null">← 返回批次列表</button>
+          <b>批次 #{{ detail.id }} · {{ detail.filename }}</b>
+          <span v-if="detail.status==='committed'" class="badge green">✅ 已入账 {{ detail.inserted_rows }} 条</span>
+          <span v-else class="badge amber">🕐 待确认</span>
+          <span style="color:#9ca3af;font-size:12px">SHA-256 {{ detail.file_hash }}…</span>
+        </div>
+        <div class="table-wrap" style="max-height:380px"><table class="data">
+          <thead><tr>
+            <th>行号</th><th>原始行</th><th>耳标号</th><th>日期</th><th>班次</th>
+            <th class="num">产量</th><th class="num">体细胞</th><th>判定</th><th>入账记录</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="r in detail.rows" :key="r.row_no">
+              <td>{{ r.row_no }}</td>
+              <td style="max-width:220px;color:#9ca3af;font-size:11.5px;word-break:break-all">{{ r.raw }}</td>
+              <td><b>{{ r.ear_tag || '-' }}</b></td>
+              <td>{{ r.date || '-' }}</td>
+              <td>{{ r.session_label || '-' }}</td>
+              <td class="num">{{ r.yield_kg ?? '-' }}</td>
+              <td class="num">{{ fmtSCC(r.scc) }}</td>
+              <td>
+                <span class="badge" :class="IMPORT_ROW_STATUS[r.status].cls">{{ IMPORT_ROW_STATUS[r.status].label }}</span>
+                <div v-if="r.message" style="color:#6b7280;font-size:11.5px;max-width:200px">{{ r.message }}</div>
+              </td>
+              <td>
+                <span v-if="r.milking_record_id" class="badge purple">#{{ r.milking_record_id }}</span>
+                <span v-else style="color:#9ca3af">—</span>
+              </td>
+            </tr>
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">关闭</button>
+    </div>
+  </div></div>`,
+};
+
 
 /* ---------------- 弹窗：健康表单 ---------------- */
 const HealthFormModal = {
@@ -1242,7 +1566,8 @@ const CowDetailModal = {
 const App = {
   components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage,
     CowFormModal, MilkingFormModal, HealthFormModal, DrugFormModal,
-    MedFormModal, EstrusFormModal, CowDetailModal },
+    MedFormModal, EstrusFormModal, CowDetailModal,
+    ImportWizardModal, ImportBatchesModal },
   setup() {
     onMounted(async () => {
       try {
@@ -1301,6 +1626,8 @@ const App = {
       <med-form-modal v-else-if="md.type==='medForm'"></med-form-modal>
       <estrus-form-modal v-else-if="md.type==='estrusForm'"></estrus-form-modal>
       <cow-detail-modal v-else-if="md.type==='cowDetail'"></cow-detail-modal>
+      <import-wizard-modal v-else-if="md.type==='importWizard'"></import-wizard-modal>
+      <import-batches-modal v-else-if="md.type==='importBatches'"></import-batches-modal>
     </template>
 
     <div class="toast-wrap">

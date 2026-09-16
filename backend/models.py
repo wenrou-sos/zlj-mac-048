@@ -60,9 +60,68 @@ class MilkingRecord(Base):
     scc = Column(Integer, nullable=True, comment="体细胞数 cells/mL")
     discarded = Column(Boolean, default=False, comment="是否因休药期废弃")
     note = Column(Text, nullable=True)
+    import_batch_id = Column(
+        Integer, ForeignKey("import_batches.id", ondelete="SET NULL"),
+        nullable=True, index=True, comment="来源导入批次（手工录入为空）",
+    )
     created_at = Column(DateTime, default=datetime.utcnow)
 
     cow = relationship("Cow", back_populates="milkings")
+    import_batch = relationship("ImportBatch", back_populates="milkings")
+
+
+class ImportBatch(Base):
+    """奶量 CSV 导入批次（file_hash 为幂等键，防止同一文件重复入账）"""
+
+    __tablename__ = "import_batches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    file_hash = Column(String(64), nullable=False, index=True, comment="文件内容 SHA-256")
+    filename = Column(String(128), nullable=False, comment="原始文件名")
+    content = Column(Text, nullable=False, comment="原始 CSV 文本（解码后），供入账时重放解析")
+    status = Column(String(16), nullable=False, default="preview",
+                    comment="preview 待确认 / committed 已入账")
+    total_rows = Column(Integer, nullable=False, default=0, comment="数据行总数")
+    ok_rows = Column(Integer, nullable=False, default=0, comment="可入账行数")
+    unknown_tag_rows = Column(Integer, nullable=False, default=0, comment="未知耳标行数")
+    duplicate_rows = Column(Integer, nullable=False, default=0, comment="文件内重复行数")
+    conflict_rows = Column(Integer, nullable=False, default=0, comment="与已有记录冲突行数")
+    invalid_rows = Column(Integer, nullable=False, default=0, comment="格式错误行数")
+    auto_discard_rows = Column(Integer, nullable=False, default=0, comment="休药期自动废弃行数")
+    inserted_rows = Column(Integer, nullable=False, default=0, comment="实际入账记录数")
+    error = Column(Text, nullable=True, comment="最近一次入账失败原因（未留下半批数据）")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    committed_at = Column(DateTime, nullable=True)
+
+    rows = relationship("ImportRow", back_populates="batch",
+                        cascade="all, delete-orphan", order_by="ImportRow.row_no")
+    milkings = relationship("MilkingRecord", back_populates="import_batch")
+
+
+class ImportRow(Base):
+    """导入批次的单行：保留原始文本与解析/校验结果，便于事后追溯"""
+
+    __tablename__ = "import_rows"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(Integer, ForeignKey("import_batches.id", ondelete="CASCADE"),
+                      nullable=False, index=True)
+    row_no = Column(Integer, nullable=False, comment="CSV 中的行号（含表头从1计）")
+    raw = Column(Text, nullable=False, comment="原始行文本")
+    ear_tag = Column(String(16), nullable=True)
+    date = Column(Date, nullable=True)
+    session = Column(String(8), nullable=True)
+    yield_kg = Column(Float, nullable=True)
+    scc = Column(Integer, nullable=True)
+    status = Column(String(16), nullable=False,
+                    comment="ok 可入账 / unknown_tag 未知耳标 / duplicate 文件内重复 / "
+                            "conflict 与已有记录冲突 / invalid 格式错误")
+    message = Column(Text, nullable=True, comment="状态说明")
+    milking_record_id = Column(Integer, ForeignKey("milking_records.id", ondelete="SET NULL"),
+                               nullable=True, comment="入账后关联的挤奶记录")
+
+    batch = relationship("ImportBatch", back_populates="rows")
+    milking_record = relationship("MilkingRecord")
 
 
 class HealthRecord(Base):
