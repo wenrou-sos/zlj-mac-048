@@ -120,6 +120,7 @@ class DrugCreate(BaseModel):
     name: str = Field(..., max_length=64)
     usage: Optional[str] = None
     default_withdrawal_days: int = Field(0, ge=0, le=365)
+    unit: str = Field("支", max_length=16)
     note: Optional[str] = None
 
 
@@ -129,6 +130,74 @@ class DrugOut(DrugCreate):
 
     class Config:
         from_attributes = True
+
+
+# ---------- 库存：入库 / 领用 / 退回 / 报损 / 盘点 ----------
+class ReceiptCreate(BaseModel):
+    drug_id: int
+    batch_no: str = Field(..., min_length=1, max_length=64)
+    expiry_date: date
+    qty: float = Field(..., gt=0)
+    voucher_date: Optional[date] = None
+    supplier: Optional[str] = None
+    operator: Optional[str] = None
+    note: Optional[str] = None
+
+
+class IssueLine(BaseModel):
+    batch_id: int
+    qty: float = Field(..., gt=0)
+
+
+class IssueCreate(BaseModel):
+    drug_id: int
+    lines: List[IssueLine] = Field(..., min_length=1)
+    voucher_date: Optional[date] = None
+    cow_id: Optional[int] = None
+    purpose: Optional[str] = None
+    operator: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ReturnItem(BaseModel):
+    line_id: int
+    qty_unopened: float = Field(0, ge=0)
+    qty_opened: float = Field(0, ge=0)
+
+
+class ReturnCreate(BaseModel):
+    issue_id: int
+    items: List[ReturnItem] = Field(..., min_length=1)
+    voucher_date: Optional[date] = None
+    operator: Optional[str] = None
+    note: Optional[str] = None
+
+
+class WriteoffItem(BaseModel):
+    batch_id: int
+    qty: float = Field(..., gt=0)
+    location: str = Field("ok", pattern="^(ok|quarantine)$")
+
+
+class WriteoffCreate(BaseModel):
+    items: List[WriteoffItem] = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1, max_length=128)
+    voucher_date: Optional[date] = None
+    operator: Optional[str] = None
+    note: Optional[str] = None
+
+
+class StocktakeItem(BaseModel):
+    batch_id: int
+    actual_ok: Optional[float] = Field(None, ge=0)
+    actual_quarantine: Optional[float] = Field(None, ge=0)
+
+
+class StocktakeCreate(BaseModel):
+    items: List[StocktakeItem] = Field(..., min_length=1)
+    voucher_date: Optional[date] = None
+    operator: Optional[str] = None
+    note: Optional[str] = None
 
 
 # ---------- 用药 ----------
@@ -144,6 +213,8 @@ class MedicationCreate(BaseModel):
     next_dose_date: Optional[date] = None
     operator: Optional[str] = None
     note: Optional[str] = None
+    # 实际用药消耗：指定领用批次（多批次凑齐）；不传则只登记用药不扣库存（历史补录）
+    issue_lines: Optional[List[IssueLine]] = None
 
 
 class MedicationUpdate(BaseModel):

@@ -2,8 +2,10 @@
 import random
 from datetime import date, timedelta
 
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
+from . import inventory as inv
 from . import models
 from .database import Base, SessionLocal, engine
 
@@ -12,20 +14,20 @@ def _d(offset: int) -> date:
     return date.today() + timedelta(days=offset)
 
 
+# 名称, 类别, 默认牛奶休药期(天), 单位, 备注
 DRUGS = [
-    # 名称, 类别, 默认牛奶休药期(天), 备注
-    ("青霉素G钾", "抗生素", 4, "用于呼吸道、全身细菌感染"),
-    ("注射用头孢噻呋钠", "抗生素", 3, "三代头孢，产后保健/细菌感染"),
-    ("盐酸林可霉素", "抗生素", 5, "厌氧菌及支原体感染"),
-    ("土霉素注射液", "抗生素", 7, "广谱抗菌"),
-    ("恩诺沙星注射液", "氟喹诺酮抗菌药", 5, "消化道/呼吸道感染，孕畜慎用"),
-    ("复方阿莫西林乳房灌注剂", "乳腺局部用药", 4, "临床型乳房炎，乳头灌注"),
-    ("氟尼辛葡甲胺", "非甾体消炎镇痛药", 2, "发热、炎症辅助治疗"),
-    ("缩宫素注射液", "生殖激素", 2, "产后子宫复旧、排脓"),
-    ("氯前列醇钠", "前列腺素类", 0, "同期发情/诱导分娩"),
-    ("伊维菌素注射液", "驱虫药", 14, "体内外寄生虫，休药期长"),
-    ("葡萄糖酸钙注射液", "营养补液", 0, "产后瘫痪/低血钙"),
-    ("维生素ADE注射液", "营养补充", 0, "产后保健"),
+    ("青霉素G钾", "抗生素", 4, "支", "用于呼吸道、全身细菌感染"),
+    ("注射用头孢噻呋钠", "抗生素", 3, "瓶", "三代头孢，产后保健/细菌感染"),
+    ("盐酸林可霉素", "抗生素", 5, "支", "厌氧菌及支原体感染"),
+    ("土霉素注射液", "抗生素", 7, "支", "广谱抗菌"),
+    ("恩诺沙星注射液", "氟喹诺酮抗菌药", 5, "支", "消化道/呼吸道感染，孕畜慎用"),
+    ("复方阿莫西林乳房灌注剂", "乳腺局部用药", 4, "支", "临床型乳房炎，乳头灌注"),
+    ("氟尼辛葡甲胺", "非甾体消炎镇痛药", 2, "支", "发热、炎症辅助治疗"),
+    ("缩宫素注射液", "生殖激素", 2, "支", "产后子宫复旧、排脓"),
+    ("氯前列醇钠", "前列腺素类", 0, "支", "同期发情/诱导分娩"),
+    ("伊维菌素注射液", "驱虫药", 14, "支", "体内外寄生虫，休药期长"),
+    ("葡萄糖酸钙注射液", "营养补液", 0, "瓶", "产后瘫痪/低血钙"),
+    ("维生素ADE注射液", "营养补充", 0, "支", "产后保健"),
 ]
 
 # ear_tag, 名字, 品种, 胎次, 状态, 群组, 产犊偏移, 预产偏移, 标定日产
@@ -81,8 +83,9 @@ def _gen_yield(rng: random.Random, base: float, dim: int, day_offset: int,
 def seed_database(db: Session) -> None:
     # ---------- 药品目录 ----------
     drug_map = {}
-    for name, usage, wd, note in DRUGS:
-        d = models.DrugCatalog(name=name, usage=usage, default_withdrawal_days=wd, note=note)
+    for name, usage, wd, unit, note in DRUGS:
+        d = models.DrugCatalog(name=name, usage=usage, default_withdrawal_days=wd,
+                               unit=unit, note=note)
         db.add(d)
         drug_map[name] = d
     db.flush()
@@ -161,8 +164,47 @@ def seed_database(db: Session) -> None:
                             note="体况评分3.0，建议关注采食量"),
     ])
 
-    # ---------- 用药记录 ----------
-    db.add_all([
+    # ---------- 用药记录（历史用药均先有入库、再有领用，库存流水对得上） ----------
+    def receipt(drug_name: str, batch_no: str, expiry_off: int, qty: float,
+                inbound_off: int = -120, supplier: str = "华牧兽药批发") -> None:
+        inv.create_receipt(
+            db, drug_id=drug_map[drug_name].id, batch_no=batch_no,
+            expiry_date=_d(expiry_off), qty=qty, voucher_date=_d(inbound_off),
+            supplier=supplier, operator="仓管-赵倩",
+        )
+
+    def historical_issue(med, batch_no: str, qty: float, inbound_off: int) -> None:
+        """给历史用药补关联领用单：同事务先入库再出库，再回填 voucher_id"""
+        v = inv.create_issue(
+            db, drug_id=med.drug_id,
+            lines=[{"batch_id": _batch_id(med.drug_id, batch_no), "qty": qty}],
+            voucher_date=med.date, cow_id=med.cow_id, purpose=med.reason,
+            operator=med.operator, note="历史用药补录领用",
+        )
+        med.voucher_id = v.id
+
+    def _batch_id(drug_id: int, batch_no: str) -> int:
+        return (
+            db.query(models.DrugBatch)
+            .filter_by(drug_id=drug_id, batch_no=batch_no)
+            .first().id
+        )
+
+    # 1) 先按批次入库（含过期/近效期/待毁等演示场景）
+    receipt("注射用头孢噻呋钠", "CTF20260301", 40, 20, -100)      # 正常批次
+    receipt("注射用头孢噻呋钠", "CTF20250815", -30, 6, -180)     # 已过期→冻结禁发
+    receipt("复方阿莫西林乳房灌注剂", "AMX20251101", 55, 30, -90)
+    receipt("氟尼辛葡甲胺", "FLN20251020", 35, 12, -90)          # 近效期(35天)
+    receipt("氟尼辛葡甲胺", "FLN20260601", 260, 20, -60)         # 正常批次
+    receipt("缩宫素注射液", "OXY20250920", 5, 10, -80)           # 近效期5天
+    receipt("缩宫素注射液", "OXY20260501", 230, 30, -40)
+    receipt("葡萄糖酸钙注射液", "CA20270101", 480, 24, -60)
+    receipt("伊维菌素注射液", "IVM20270301", 540, 40, -120)
+    receipt("青霉素G钾", "PEN20261201", 440, 50, -50)
+    receipt("土霉素注射液", "OTC20260415", 210, 30, -50)
+    receipt("恩诺沙星注射液", "ENR20261010", 390, 25, -50)
+
+    meds_seed = [
         models.Medication(
             cow_id=cows["1609"].id, drug_id=drug_map["注射用头孢噻呋钠"].id,
             drug_name="注射用头孢噻呋钠", date=_d(-2), dose="1g/次，每日1次，连用3日",
@@ -195,7 +237,17 @@ def seed_database(db: Session) -> None:
             drug_name="伊维菌素注射液", date=_d(-60), dose="20mL", route="皮下注射",
             reason="季度驱虫", withdrawal_days=14, withdrawal_end=_d(-60 + 14),
             treated=True, operator="王兽医"),
-    ])
+    ]
+    db.add_all(meds_seed)
+    db.flush()
+
+    # 2) 历史用药逐笔关联领用批次（数量与剂量疗程对应，可核对）
+    historical_issue(meds_seed[0], "CTF20260301", 3, -100)   # 连用3日 3瓶
+    historical_issue(meds_seed[1], "AMX20251101", 6, -90)    # 每日2次×3日 6支
+    historical_issue(meds_seed[2], "FLN20251020", 1, -90)    # 近效期批次 FEFO 先出
+    historical_issue(meds_seed[3], "OXY20250920", 1, -80)    # 近效期批次 FEFO 先出
+    historical_issue(meds_seed[4], "CA20270101", 1, -60)
+    historical_issue(meds_seed[5], "IVM20270301", 1, -120)
 
     # ---------- 发情/配种记录 ----------
     db.add_all([
@@ -237,6 +289,20 @@ def seed_database(db: Session) -> None:
     db.commit()
 
 
+def _lightweight_migrations() -> None:
+    """老库平滑升级：create_all 不会给已存在的表加列，这里按列名幂等补齐"""
+    inspector = inspect(engine)
+    tables = {t: {c["name"] for c in inspector.get_columns(t)}
+              for t in inspector.get_table_names()}
+    if "drug_catalog" in tables and "unit" not in tables["drug_catalog"]:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE drug_catalog ADD COLUMN unit VARCHAR(16) "
+                              "NOT NULL DEFAULT '支'"))
+    if "medications" in tables and "voucher_id" not in tables["medications"]:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE medications ADD COLUMN voucher_id INTEGER"))
+
+
 def init_db(force: bool = False) -> None:
     import os
     from .database import DB_PATH
@@ -244,6 +310,7 @@ def init_db(force: bool = False) -> None:
     if force and DB_PATH.exists():
         os.remove(DB_PATH)
     Base.metadata.create_all(bind=engine)
+    _lightweight_migrations()
     if force or db_is_empty():
         db = SessionLocal()
         try:

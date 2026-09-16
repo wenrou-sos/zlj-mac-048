@@ -50,6 +50,23 @@ const REMINDER_META = {
   health_followup: { ico: "🏥", label: "健康复查" },
   calving: { ico: "🐣", label: "待产" },
   first_insemination: { ico: "📅", label: "产后首配" },
+  drug_expired: { ico: "🧊", label: "药品过期" },
+  drug_near_expiry: { ico: "⏳", label: "药品近效期" },
+};
+
+const BATCH_STATUS = {
+  available: { label: "正常", cls: "green" },
+  near_expiry: { label: "近效期", cls: "amber" },
+  expired: { label: "已过期", cls: "red" },
+  out: { label: "无库存", cls: "gray" },
+};
+const VOUCHER_META = {
+  receipt: { label: "入库", cls: "blue", ico: "⤵️" },
+  issue: { label: "领用", cls: "green", ico: "⤴️" },
+  return: { label: "退回", cls: "amber", ico: "↩️" },
+  writeoff: { label: "报损", cls: "red", ico: "🗑️" },
+  check: { label: "盘点", cls: "gray", ico: "🧮" },
+  revoke: { label: "撤销领用", cls: "red", ico: "🚫" },
 };
 
 /* ---------------- 全局状态 ---------------- */
@@ -66,6 +83,10 @@ const S = reactive({
   health: [],
   meds: [],
   estruses: [],
+  batches: [],
+  vouchers: [],
+  ledger: [],
+  reconcile: null,
   loading: { milkings: false },
 });
 
@@ -108,10 +129,16 @@ async function switchView(v) {
     if (!S.health.length) loadHealthAll();
     if (!S.meds.length) loadMedsAll();
     if (!S.drugs.length) loadDrugs();
+    if (!S.batches.length) loadBatches().catch((e) => toast(e.message, "error"));
   }
   if (v === "repro") {
     if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
     if (!S.estruses.length) loadEstrusesAll();
+  }
+  if (v === "inventory") {
+    if (!S.drugs.length) loadDrugs();
+    if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
+    loadAllStock().catch((e) => toast(e.message, "error"));
   }
   if (v === "milkings" && !S.cows.length) {
     loadCows().catch((e) => toast(e.message, "error"));
@@ -128,6 +155,16 @@ async function loadMilkings(q = "") {
 async function loadHealthAll() { S.health = await api("/api/health"); }
 async function loadMedsAll() { S.meds = await api("/api/medications"); }
 async function loadEstrusesAll() { S.estruses = await api("/api/estruses"); }
+async function loadBatches() { S.batches = await api("/api/inventory/batches"); }
+async function loadVouchers() { S.vouchers = await api("/api/inventory/vouchers?limit=500"); }
+async function loadLedger() { S.ledger = await api("/api/inventory/ledger?limit=500"); }
+async function loadReconcile() {
+  try { S.reconcile = await api("/api/inventory/reconcile"); } catch (_) {}
+}
+async function loadAllStock() {
+  await Promise.all([loadBatches(), loadVouchers(), loadLedger()]);
+  loadReconcile();
+}
 
 /* ---------------- 柱状图 ---------------- */
 const BarChart = {
@@ -229,7 +266,10 @@ const Dashboard = {
       <div class="card stat alert">
         <div class="label">紧急待办</div>
         <div class="value">{{ S.dashboard.reminder_danger }}<span class="unit"> / {{ S.dashboard.reminder_count }} 条提醒</span></div>
-        <div class="delta">休药期牛只 {{ S.dashboard.cows_in_withdrawal }} 头</div>
+        <div class="delta">休药期牛只 {{ S.dashboard.cows_in_withdrawal }} 头 ·
+          <span :class="S.dashboard.stock && S.dashboard.stock.expired_count ? 'color:#dc2626;font-weight:600' : ''">
+            药品过期 {{ S.dashboard.stock?.expired_count || 0 }} 批
+          </span> · 近效期 {{ S.dashboard.stock?.near_expiry_count || 0 }} 批</div>
         <div class="big-ico">🔔</div>
       </div>
       <div class="card stat warn">
@@ -264,7 +304,7 @@ const Dashboard = {
               <div class="r-meta">
                 {{ REMINDER_META[r.type]?.label }} · 截止 {{ r.due_date }}
                 <span v-if="r.days_overdue > 0" class="overdue">· 已逾期 {{ r.days_overdue }} 天</span>
-                <button class="link" style="margin-left:8px"
+                <button v-if="r.cow_id" class="link" style="margin-left:8px"
                   @click="openModal({type:'cowDetail', id:r.cow_id})">查看牛只</button>
               </div>
             </div>
@@ -526,7 +566,7 @@ const HealthPage = {
       </div>
       <div class="table-wrap"><table class="data">
         <thead><tr><th>用药日期</th><th>耳标号</th><th>药品</th><th>剂量</th><th>途径</th><th>原因</th>
-          <th>休药期</th><th>鲜奶可售日</th><th>下次用药</th><th>兽医</th><th>操作</th></tr></thead>
+          <th>休药期</th><th>鲜奶可售日</th><th>下次用药</th><th>领用批次/单号</th><th>兽医</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="m in S.meds" :key="m.id" :style="m.active_withdrawal ? 'background:#fffbeb' : ''">
             <td>{{ m.date }}</td>
@@ -542,32 +582,56 @@ const HealthPage = {
               </template>
               <span v-else>-</span>
             </td>
+            <td style="font-size:12px">
+              <template v-if="m.issue_batches && m.issue_batches.length">
+                <div v-for="b in m.issue_batches" :key="b.batch_no" style="white-space:nowrap">
+                  {{ b.batch_no }} <span class="badge gray">×{{ b.qty }}</span>
+                </div>
+                <div style="color:#9ca3af">{{ m.voucher_no }}</div>
+              </template>
+              <span v-else class="badge gray">历史补录·未扣库存</span>
+            </td>
             <td>{{ m.operator || '-' }}</td>
             <td style="white-space:nowrap">
               <button v-if="m.next_dose_date && !m.treated" class="btn btn-sm" style="margin-right:8px"
                 @click="doneDose(m)">已执行</button>
-              <button class="link" style="color:#dc2626" @click="removeMed(m)">删除</button>
+              <button v-if="m.voucher_id" class="link" style="color:#dc2626"
+                @click="revokeMed(m)">撤销领用</button>
+              <button v-else class="link" style="color:#dc2626" @click="removeMed(m)">删除</button>
             </td>
           </tr>
-          <tr v-if="!S.meds.length"><td colspan="11" class="empty">暂无用药记录</td></tr>
+          <tr v-if="!S.meds.length"><td colspan="12" class="empty">暂无用药记录</td></tr>
         </tbody>
       </table></div>
     </div>
 
     <div v-if="tab==='drugs'">
       <div class="toolbar">
-        <span style="color:#6b7280;font-size:12.5px">登记用药时选择药品将自动套用默认牛奶休药期；休药期含用药当天，结束日次日方可上市。</span>
+        <span style="color:#6b7280;font-size:12.5px">登记用药时选择药品将自动套用默认牛奶休药期；库存按批号/效期在“药品库存”模块管理。</span>
         <span class="spacer"></span>
+        <button class="btn" @click="switchView('inventory')">📦 管理批次库存</button>
         <button class="btn btn-primary" @click="openModal({type:'drugForm'})">＋ 新增药品</button>
       </div>
       <div class="table-wrap"><table class="data">
-        <thead><tr><th>药品名称</th><th>类别</th><th class="num">默认休药期(天)</th><th>鲜奶可售日(用药后)</th><th>备注</th></tr></thead>
+        <thead><tr><th>药品名称</th><th>类别</th><th>单位</th><th class="num">默认休药期(天)</th>
+          <th>鲜奶可售日(用药后)</th><th class="num">在库 合格/待毁</th><th>效期预警</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="d in S.drugs" :key="d.id">
             <td><b>{{ d.name }}</b></td><td>{{ d.usage || '-' }}</td>
+            <td>{{ d.unit }}</td>
             <td class="num"><span class="badge" :class="d.default_withdrawal_days >= 7 ? 'red' : (d.default_withdrawal_days > 0 ? 'amber' : 'green')">{{ d.default_withdrawal_days }}</span></td>
             <td>{{ d.default_withdrawal_days === 0 ? '当天可售' : '第 ' + (d.default_withdrawal_days + 1) + ' 天' }}</td>
-            <td style="color:#6b7280">{{ d.note || '-' }}</td>
+            <td class="num">
+              <b>{{ drugStock(d.id).ok }}</b> /
+              <span :style="drugStock(d.id).quar ? 'color:#dc2626;font-weight:600' : ''">{{ drugStock(d.id).quar }}</span>
+              {{ d.unit }}
+            </td>
+            <td>
+              <span v-if="drugStock(d.id).expired" class="badge red">{{ drugStock(d.id).expired }} 批过期</span>
+              <span v-if="drugStock(d.id).near" class="badge amber" style="margin-left:4px">{{ drugStock(d.id).near }} 批近效期</span>
+              <span v-if="!drugStock(d.id).expired && !drugStock(d.id).near" style="color:#9ca3af">-</span>
+            </td>
+            <td><button class="link" @click="openModal({type:'receiptForm', presetDrug:d.id})">入库</button></td>
           </tr>
         </tbody>
       </table></div>
@@ -576,6 +640,15 @@ const HealthPage = {
   methods: {
     addDays,
     cowTag(id) { const c = S.cows.find((x) => x.id === id); return c ? c.ear_tag : id; },
+    drugStock(drugId) {
+      const bs = S.batches.filter((b) => b.drug_id === drugId);
+      return {
+        ok: Math.round(bs.reduce((s, b) => s + b.qty_ok, 0) * 1000) / 1000,
+        quar: Math.round(bs.reduce((s, b) => s + b.qty_quarantine, 0) * 1000) / 1000,
+        near: bs.filter((b) => b.status === "near_expiry" && b.qty_ok > 0).length,
+        expired: bs.filter((b) => b.status === "expired" && (b.qty_ok > 0 || b.qty_quarantine > 0)).length,
+      };
+    },
     async doneDose(m) {
       try {
         await api(`/api/medications/${m.id}`, { method: "PATCH", body: { treated: true } });
@@ -590,10 +663,23 @@ const HealthPage = {
       toast("已删除");
     },
     async removeMed(m) {
-      if (!confirm("确认删除该用药记录？休药期校验将立即失效。")) return;
-      await api(`/api/medications/${m.id}`, { method: "DELETE" });
-      S.meds = S.meds.filter((x) => x.id !== m.id);
-      toast("已删除");
+      if (!confirm("确认删除该用药记录？该记录未关联库存，休药期校验将立即失效。")) return;
+      try {
+        await api(`/api/medications/${m.id}`, { method: "DELETE" });
+        S.meds = S.meds.filter((x) => x.id !== m.id);
+        toast("已删除");
+      } catch (e) { toast(e.message, "error"); }
+    },
+    async revokeMed(m) {
+      if (!confirm(`确认撤销该用药的领用单 ${m.voucher_no}？\n` +
+        "库存将按原批次原路退回合格库存，该用药记录同步作废。\n" +
+        "（若药品已开封用剩需退回，请改在“药品库存-单据”里对该单做退回，已开封部分入待毁。）")) return;
+      try {
+        await api(`/api/inventory/issues/${m.voucher_id}/revoke`, { method: "POST", body: {} });
+        toast("已撤销领用并作废用药记录，库存原路退回");
+        await Promise.all([loadMedsAll(), loadAllStock()]);
+        refreshDash();
+      } catch (e) { toast(e.message, "error"); }
     },
   },
 };
@@ -659,6 +745,238 @@ const ReproPage = {
       toast("已删除");
     },
   },
+};
+
+/* ---------------- 药品库存（批号/效期） ---------------- */
+const InventoryPage = {
+  setup() {
+    const tab = ref("batches");
+    const f = reactive({ drugId: "", status: "", hideEmpty: false, kw: "" });
+    const vf = reactive({ type: "" });
+    const lf = reactive({ drugId: "" });
+    const fmt = (v) => (v == null ? "-" : String(Math.round(v * 1000) / 1000));
+    const drugName = (id) => S.drugs.find((d) => d.id === id)?.name || `#${id}`;
+    const drugUnit = (id) => S.drugs.find((d) => d.id === id)?.unit || "";
+    const cowTag = (id) => S.cows.find((c) => c.id === id)?.ear_tag || "-";
+
+    const filteredBatches = computed(() => {
+      let rows = S.batches;
+      if (f.drugId) rows = rows.filter((b) => b.drug_id === Number(f.drugId));
+      if (f.status) rows = rows.filter((b) => b.status === f.status);
+      if (f.hideEmpty) rows = rows.filter((b) => b.qty_ok > 0 || b.qty_quarantine > 0);
+      if (f.kw.trim()) rows = rows.filter((b) => b.batch_no.includes(f.kw.trim()));
+      return rows;
+    });
+    const filteredVouchers = computed(() =>
+      vf.type ? S.vouchers.filter((v) => v.voucher_type === vf.type) : S.vouchers
+    );
+    const filteredLedger = computed(() =>
+      lf.drugId ? S.ledger.filter((r) => r.drug_id === Number(lf.drugId)) : S.ledger
+    );
+    const stats = computed(() => {
+      const bs = S.batches;
+      const today = todayStr();
+      return {
+        kinds: new Set(bs.map((b) => b.drug_id)).size,
+        batches: bs.length,
+        near: bs.filter((b) => b.status === "near_expiry").length,
+        expired: bs.filter((b) => b.status === "expired" && (b.qty_ok > 0 || b.qty_quarantine > 0)).length,
+        quar: bs.filter((b) => b.qty_quarantine > 0).length,
+        today,
+      };
+    });
+    function vQty(v) { return fmt(v.lines.reduce((s, l) => s + l.qty, 0)); }
+    function vBatches(v) {
+      return v.lines.map((l) => `${l.batch_no}×${fmt(l.qty)}`).join("，");
+    }
+    function canRevoke(v) {
+      return v.voucher_type === "issue" && v.status === "posted" &&
+        v.lines.every((l) => l.qty_returned_ok === 0 && l.qty_returned_quar === 0);
+    }
+    async function revoke(v) {
+      if (!confirm(`确认整单撤销领用 ${v.voucher_no}？\n数量将原路退回各批次；` +
+        (v.cow_tag ? `关联的用药记录将同步作废。` : `该单不关联用药。`))) return;
+      try {
+        await api(`/api/inventory/issues/${v.id}/revoke`, { method: "POST", body: {} });
+        toast("领用已撤销，库存原路退回");
+        await loadAllStock();
+        loadMedsAll();
+        refreshDash();
+      } catch (e) { toast(e.message, "error"); }
+    }
+    return {
+      S, tab, f, vf, lf, fmt, drugName, drugUnit, cowTag, stats,
+      filteredBatches, filteredVouchers, filteredLedger,
+      BATCH_STATUS, VOUCHER_META, vQty, vBatches, canRevoke, revoke, openModal,
+    };
+  },
+  template: `
+  <div>
+    <div v-if="S.reconcile && !S.reconcile.ok" class="alert-box danger" style="margin-bottom:12px">
+      🚨 库存对账发现 {{ S.reconcile.problems.length }} 个问题：
+      {{ S.reconcile.problems[0].message }}<span v-if="S.reconcile.problems.length>1"> 等</span>
+    </div>
+    <div v-else-if="S.reconcile" class="alert-box info" style="margin-bottom:12px">
+      ✅ 库存对账通过：流水余额与批次库存、用药消耗全部一致（{{ S.reconcile.batch_count }} 批次 / {{ S.reconcile.ledger_count }} 条流水）
+    </div>
+
+    <div class="grid grid-4" style="margin-bottom:14px">
+      <div class="card stat"><div class="label">在库批次</div>
+        <div class="value">{{ stats.batches }}<span class="unit"> 批 / {{ stats.kinds }} 种</span></div></div>
+      <div class="card stat warn"><div class="label">30天内近效期</div>
+        <div class="value">{{ stats.near }}<span class="unit"> 批</span></div>
+        <div class="delta">FEFO 自动优先发出</div></div>
+      <div class="card stat alert"><div class="label">过期冻结</div>
+        <div class="value">{{ stats.expired }}<span class="unit"> 批</span></div>
+        <div class="delta">禁止发出，请报损</div></div>
+      <div class="card stat"><div class="label">待毁隔离</div>
+        <div class="value">{{ stats.quar }}<span class="unit"> 批</span></div>
+        <div class="delta">已开封退回，仅可报损</div></div>
+    </div>
+
+    <div class="card">
+      <div class="tabs">
+        <button class="tab" :class="{active:tab==='batches'}" @click="tab='batches'">📦 批次库存</button>
+        <button class="tab" :class="{active:tab==='vouchers'}" @click="tab='vouchers'">🧾 出入库单据</button>
+        <button class="tab" :class="{active:tab==='ledger'}" @click="tab='ledger'">📜 库存流水</button>
+      </div>
+
+      <!-- 批次库存 -->
+      <div v-if="tab==='batches'">
+        <div class="toolbar">
+          <select class="input" style="width:200px" v-model="f.drugId">
+            <option value="">全部药品</option>
+            <option v-for="d in S.drugs" :key="d.id" :value="d.id">{{ d.name }}</option>
+          </select>
+          <select class="input" style="width:120px" v-model="f.status">
+            <option value="">全部状态</option>
+            <option value="available">正常</option>
+            <option value="near_expiry">近效期</option>
+            <option value="expired">已过期</option>
+            <option value="out">无库存</option>
+          </select>
+          <div class="search"><span class="ico">🔍</span>
+            <input class="input" placeholder="批号" v-model="f.kw"></div>
+          <label style="display:flex;align-items:center;gap:6px;color:#6b7280;cursor:pointer">
+            <input type="checkbox" v-model="f.hideEmpty"> 隐藏零库存</label>
+          <span class="spacer"></span>
+          <button class="btn" @click="openModal({type:'stocktakeForm'})">🧮 盘点</button>
+          <button class="btn" @click="openModal({type:'writeoffForm'})">🗑️ 报损</button>
+          <button class="btn" @click="openModal({type:'issueForm'})">⤴️ 领用</button>
+          <button class="btn btn-primary" @click="openModal({type:'receiptForm'})">⤵️ 入库</button>
+        </div>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>药品</th><th>批号</th><th>效期至</th><th>状态</th>
+            <th class="num">合格库存</th><th class="num">待毁</th><th>入库日</th><th>供应商</th><th>操作</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="b in filteredBatches" :key="b.id"
+                :style="b.status==='expired' ? 'background:#fff5f5' : (b.status==='near_expiry' ? 'background:#fffbeb' : '')">
+              <td>{{ b.drug_name }}</td>
+              <td><b>{{ b.batch_no }}</b></td>
+              <td>{{ b.expiry_date }}</td>
+              <td>
+                <span class="badge" :class="BATCH_STATUS[b.status].cls">{{ BATCH_STATUS[b.status].label }}</span>
+                <span v-if="b.status==='near_expiry'" class="badge amber" style="margin-left:4px">剩{{ b.days_to_expiry }}天</span>
+                <span v-if="b.status==='expired'" class="badge red" style="margin-left:4px">过期{{ -b.days_to_expiry }}天</span>
+              </td>
+              <td class="num" :style="b.qty_ok<=0 ? 'color:#9ca3af' : ''">
+                <b>{{ fmt(b.qty_ok) }}</b> {{ b.unit }}</td>
+              <td class="num">
+                <span v-if="b.qty_quarantine>0" class="badge red">{{ fmt(b.qty_quarantine) }}</span>
+                <span v-else>-</span>
+              </td>
+              <td>{{ b.inbound_date }}</td>
+              <td style="color:#6b7280">{{ b.supplier || '-' }}</td>
+              <td style="white-space:nowrap">
+                <button class="link" style="margin-right:8px"
+                  :disabled="b.qty_ok<=0 && b.qty_quarantine<=0"
+                  @click="openModal({type:'writeoffForm', presetBatch:b})">报损</button>
+                <button class="link"
+                  @click="openModal({type:'stocktakeForm', presetBatch:b})">盘点</button>
+              </td>
+            </tr>
+            <tr v-if="!filteredBatches.length"><td colspan="9" class="empty">暂无批次</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+
+      <!-- 单据 -->
+      <div v-if="tab==='vouchers'">
+        <div class="toolbar">
+          <select class="input" style="width:140px" v-model="vf.type">
+            <option value="">全部单据</option>
+            <option value="receipt">入库</option><option value="issue">领用</option>
+            <option value="return">退回</option><option value="writeoff">报损</option>
+            <option value="check">盘点</option><option value="revoke">撤销领用</option>
+          </select>
+          <span class="spacer"></span>
+        </div>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>单号</th><th>类型</th><th>日期</th><th>药品</th><th>牛只</th>
+            <th>批次/数量</th><th>操作人</th><th>状态/原因</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="v in filteredVouchers" :key="v.id">
+              <td><b>{{ v.voucher_no }}</b></td>
+              <td><span class="badge" :class="VOUCHER_META[v.voucher_type].cls">
+                {{ VOUCHER_META[v.voucher_type].ico }} {{ v.type_label }}</span></td>
+              <td>{{ v.voucher_date }}</td>
+              <td>{{ v.drug_name || '（多药品盘点）' }}</td>
+              <td>{{ v.cow_tag || '-' }}<span v-if="v.cow_name"> {{ v.cow_name }}</span></td>
+              <td style="max-width:280px">{{ vBatches(v) }}</td>
+              <td>{{ v.operator || '-' }}</td>
+              <td>
+                <span v-if="v.status==='reversed'" class="badge gray">已撤销</span>
+                <span v-if="v.purpose" style="color:#6b7280;font-size:12px">{{ v.purpose }}</span>
+              </td>
+              <td style="white-space:nowrap">
+                <button v-if="v.voucher_type==='issue' && v.status==='posted'" class="link"
+                  style="margin-right:8px" @click="openModal({type:'returnForm', issue:v})">退回</button>
+                <button v-if="canRevoke(v)" class="link" style="color:#dc2626;margin-right:8px"
+                  @click="revoke(v)">撤销</button>
+                <span v-if="!canRevoke(v) && !(v.voucher_type==='issue'&&v.status==='posted')"
+                  style="color:#d1d5db">-</span>
+              </td>
+            </tr>
+            <tr v-if="!filteredVouchers.length"><td colspan="9" class="empty">暂无单据</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+
+      <!-- 流水 -->
+      <div v-if="tab==='ledger'">
+        <div class="toolbar">
+          <select class="input" style="width:220px" v-model="lf.drugId">
+            <option value="">全部药品</option>
+            <option v-for="d in S.drugs" :key="d.id" :value="d.id">{{ d.name }}</option>
+          </select>
+          <span style="color:#6b7280;font-size:12.5px">流水只追加不修改；红冲走“撤销领用”另开反向单据。</span>
+        </div>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>#</th><th>日期</th><th>单据</th><th>类型</th><th>药品/批号</th>
+            <th class="num">合格变动</th><th class="num">待毁变动</th>
+            <th class="num">合格余额</th><th class="num">待毁余额</th><th>牛只/说明</th></tr></thead>
+          <tbody>
+            <tr v-for="r in filteredLedger" :key="r.id">
+              <td>{{ r.id }}</td><td>{{ r.voucher_date }}</td>
+              <td>{{ r.voucher_no }}</td>
+              <td><span class="badge" :class="VOUCHER_META[r.voucher_type].cls">{{ r.type_label }}</span></td>
+              <td>{{ r.drug_name }}<br><span style="color:#6b7280;font-size:12px">{{ r.batch_no }}（{{ r.expiry_date }}）</span></td>
+              <td class="num" :style="r.qty_change_ok>0?'color:#16a34a;font-weight:600':(r.qty_change_ok<0?'color:#dc2626;font-weight:600':'')">
+                {{ r.qty_change_ok > 0 ? '+' + fmt(r.qty_change_ok) : (r.qty_change_ok < 0 ? fmt(r.qty_change_ok) : '-') }}</td>
+              <td class="num" :style="r.qty_change_quarantine>0?'color:#b45309;font-weight:600':(r.qty_change_quarantine<0?'color:#dc2626;font-weight:600':'')">
+                {{ r.qty_change_quarantine ? (r.qty_change_quarantine > 0 ? '+' : '') + fmt(r.qty_change_quarantine) : '-' }}</td>
+              <td class="num">{{ fmt(r.balance_ok) }}</td>
+              <td class="num">{{ fmt(r.balance_quarantine) }}</td>
+              <td style="color:#6b7280;font-size:12px;max-width:240px">
+                {{ r.cow_tag ? r.cow_tag + ' · ' : '' }}{{ r.note }}</td>
+            </tr>
+            <tr v-if="!filteredLedger.length"><td colspan="10" class="empty">暂无流水</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+  </div>`,
 };
 
 /* ---------------- 弹窗：奶牛表单 ---------------- */
@@ -933,7 +1251,436 @@ const DrugFormModal = {
   </div></div>`,
 };
 
-/* ---------------- 弹窗：用药表单（自动休药期） ---------------- */
+/* ---------------- 弹窗：入库 ---------------- */
+const ReceiptFormModal = {
+  setup() {
+    const m = topModal();
+    const f = reactive({
+      drug_id: m.presetDrug || null, batch_no: "", expiry_date: addDays(todayStr(), 365),
+      qty: null, voucher_date: todayStr(), supplier: "", operator: "", note: "",
+    });
+    const err = ref("");
+    async function save() {
+      err.value = "";
+      try {
+        await api("/api/inventory/receipts", { method: "POST", body: f });
+        toast("入库成功，已生成批次与流水");
+        await loadAllStock();
+        refreshDash();
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    return { f, err, save, closeModal, S };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:520px">
+    <div class="modal-head"><h3>⤵️ 药品入库（按批号/效期）</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field"><label>药品 <span class="req">*</span></label>
+        <select class="input" v-model="f.drug_id">
+          <option :value="null" disabled>请选择</option>
+          <option v-for="d in S.drugs" :key="d.id" :value="d.id">
+            {{ d.name }}（单位 {{ d.unit }}）</option>
+        </select></div>
+      <div class="field-row">
+        <div class="field"><label>生产批号 <span class="req">*</span></label>
+          <input class="input" v-model="f.batch_no" placeholder="如 CTF20260301"></div>
+        <div class="field"><label>有效期至 <span class="req">*</span></label>
+          <input type="date" class="input" v-model="f.expiry_date"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>入库数量 <span class="req">*</span></label>
+          <input type="number" min="0.001" step="0.001" class="input" v-model.number="f.qty"></div>
+        <div class="field"><label>入库日期</label>
+          <input type="date" class="input" v-model="f.voucher_date"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>供应商</label><input class="input" v-model="f.supplier"></div>
+        <div class="field"><label>经办人</label><input class="input" v-model="f.operator"></div>
+      </div>
+      <div class="field"><label>备注</label><input class="input" v-model="f.note"></div>
+      <div class="hint">同一批号重复入库会累加到原批次；批号已存在但效期不一致会被拒绝。过期批号不能入库。</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">确认入库</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：领用（FEFO 多批次凑齐） ---------------- */
+const IssueFormModal = {
+  setup() {
+    const m = topModal();
+    const f = reactive({
+      drug_id: m.presetDrug || null, voucher_date: todayStr(), cow_id: null,
+      purpose: "", operator: "", note: "", want: null,
+      lines: [], // {batch_id, batch_no, expiry_date, available, qty}
+    });
+    const err = ref("");
+    const batches = ref([]);
+    const totalPicked = computed(() =>
+      Math.round(f.lines.reduce((s, l) => s + (Number(l.qty) || 0), 0) * 1000) / 1000);
+    const shortage = computed(() =>
+      f.want ? Math.max(0, Math.round((f.want - totalPicked.value) * 1000) / 1000) : 0);
+
+    async function loadBatches() {
+      if (!f.drug_id) { batches.value = []; return; }
+      batches.value = await api(`/api/inventory/available?drug_id=${f.drug_id}&on_date=${f.voucher_date}`);
+      // 保留已有选择中仍有效的批次行，补齐未选批次（数量为 0）
+      const valid = new Map(batches.value.map((b) => [b.id, b]));
+      f.lines = f.lines.filter((l) => valid.has(l.batch_id));
+      for (const b of batches.value) {
+        if (!f.lines.some((l) => l.batch_id === b.id)) {
+          f.lines.push({ batch_id: b.id, batch_no: b.batch_no, expiry_date: b.expiry_date,
+                         available: b.qty_ok, qty: null });
+        } else {
+          const l = f.lines.find((x) => x.batch_id === b.id);
+          l.available = b.qty_ok; l.expiry_date = b.expiry_date;
+        }
+      }
+    }
+    async function autoFill() {
+      if (!f.drug_id || !f.want || f.want <= 0) { err.value = "请选择药品并填写领用数量"; return; }
+      err.value = "";
+      try {
+        const sug = await api(`/api/inventory/suggest?drug_id=${f.drug_id}&qty=${f.want}&on_date=${f.voucher_date}`);
+        await loadBatches();
+        for (const l of f.lines) {
+          const a = sug.allocations.find((x) => x.batch_id === l.batch_id);
+          l.qty = a ? a.qty : null;
+        }
+        if (!sug.fulfilled) err.value = `可发库存不足，还差 ${sug.shortage}，请先入库或减少数量`;
+      } catch (e) { err.value = e.message; }
+    }
+    async function save() {
+      err.value = "";
+      const lines = f.lines.filter((l) => Number(l.qty) > 0)
+        .map((l) => ({ batch_id: l.batch_id, qty: Number(l.qty) }));
+      if (!lines.length) { err.value = "请先自动凑量或手动填写各批次数量"; return; }
+      try {
+        const v = await api("/api/inventory/issues", {
+          method: "POST",
+          body: { drug_id: f.drug_id, voucher_date: f.voucher_date, cow_id: f.cow_id || null,
+                  purpose: f.purpose, operator: f.operator, note: f.note, lines },
+        });
+        toast(`领用成功：${v.lines.map((l) => l.batch_no + "×" + l.qty).join("，")}`);
+        await loadAllStock();
+        refreshDash();
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    watch(() => [f.drug_id, f.voucher_date], loadBatches);
+    if (f.drug_id) loadBatches();
+    return { S, f, err, batches, totalPicked, shortage, autoFill, save, closeModal };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal">
+    <div class="modal-head"><h3>⤴️ 药品领用</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field-row">
+        <div class="field"><label>药品 <span class="req">*</span></label>
+          <select class="input" v-model="f.drug_id">
+            <option :value="null" disabled>请选择</option>
+            <option v-for="d in S.drugs" :key="d.id" :value="d.id">
+              {{ d.name }}（{{ d.unit }}）</option>
+          </select></div>
+        <div class="field"><label>领用日期</label>
+          <input type="date" class="input" v-model="f.voucher_date"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>领用牛只（选填）</label>
+          <select class="input" v-model="f.cow_id">
+            <option :value="null">不指定（库存领用）</option>
+            <option v-for="c in S.cows.filter(x=>x.status!=='sold')" :key="c.id" :value="c.id">
+              {{ c.ear_tag }} {{ c.name || '' }}</option>
+          </select></div>
+        <div class="field"><label>用途/原因</label><input class="input" v-model="f.purpose"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>需要总量 <span class="req">*</span></label>
+          <input type="number" min="0.001" step="0.001" class="input" v-model.number="f.want"
+                 placeholder="填写后点 FEFO 自动凑量"></div>
+        <div class="field" style="display:flex;align-items:flex-end">
+          <button class="btn" type="button" @click="autoFill">⚡ FEFO 近效期先出·自动凑量</button>
+        </div>
+      </div>
+
+      <div class="card-title" style="margin-top:8px">批次分配（可手动调整，一次领用支持多批次凑齐）</div>
+      <table class="data" style="font-size:13px">
+        <thead><tr><th>批号</th><th>效期至</th><th class="num">可发</th><th class="num" style="width:120px">本次领用量</th></tr></thead>
+        <tbody>
+          <tr v-for="l in f.lines" :key="l.batch_id"
+              :style="l.expiry_date < f.voucher_date ? 'background:#fff5f5' : ''">
+            <td><b>{{ l.batch_no }}</b></td>
+            <td>{{ l.expiry_date }}
+              <span v-if="l.expiry_date < f.voucher_date" class="badge red">已过期</span></td>
+            <td class="num">{{ l.available }}</td>
+            <td class="num"><input type="number" min="0" step="0.001" :max="l.available"
+              class="input" style="padding:4px 8px;text-align:right" v-model.number="l.qty"></td>
+          </tr>
+          <tr v-if="!f.lines.length"><td colspan="4" class="empty">该药品当前没有可发批次（可能全部过期或无库存）</td></tr>
+        </tbody>
+      </table>
+      <div class="hint" style="margin-top:6px">
+        已分配 <b :class="shortage ? 'color:#dc2626' : 'color:#16a34a'">{{ totalPicked }}</b> / 需 {{ f.want || 0 }}
+        <span v-if="shortage" style="color:#dc2626">· 还差 {{ shortage }}，无法出库</span>
+        <span v-else-if="f.want" style="color:#16a34a">· 已凑齐</span>
+        ；过期批次不在可发列表，库存不足整单拒绝，不会部分发出。
+      </div>
+      <div class="field-row" style="margin-top:8px">
+        <div class="field"><label>经办人</label><input class="input" v-model="f.operator"></div>
+        <div class="field"><label>备注</label><input class="input" v-model="f.note"></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">确认领用出库</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：退回（未开封/已开封去向分开） ---------------- */
+const ReturnFormModal = {
+  setup() {
+    const m = topModal();
+    const info = ref(null);
+    const items = ref([]);
+    const f = reactive({ voucher_date: todayStr(), operator: "", note: "" });
+    const err = ref("");
+    onMounted(async () => {
+      info.value = await api(`/api/inventory/issues/${m.issue.id}/returnable`);
+      items.value = info.value.lines.map((l) => ({
+        line_id: l.line_id, batch_no: l.batch_no, expiry_date: l.expiry_date,
+        qty: l.qty, returned: l.qty_returned_ok + l.qty_returned_quar,
+        returnable: l.returnable, qty_unopened: null, qty_opened: null,
+      }));
+    });
+    const totalReturn = (which) =>
+      items.value.reduce((s, i) => s + (Number(i[which]) || 0), 0);
+    async function save() {
+      err.value = "";
+      const payload = items.value
+        .filter((i) => Number(i.qty_unopened) > 0 || Number(i.qty_opened) > 0)
+        .map((i) => ({ line_id: i.line_id,
+                       qty_unopened: Number(i.qty_unopened) || 0,
+                       qty_opened: Number(i.qty_opened) || 0 }));
+      if (!payload.length) { err.value = "请填写退回数量"; return; }
+      try {
+        await api("/api/inventory/returns", {
+          method: "POST", body: { issue_id: m.issue.id, items: payload, ...f },
+        });
+        toast("退回完成：未开封回库，已开封入待毁隔离");
+        await loadAllStock();
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    return { info, items, f, err, save, closeModal, totalReturn };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal">
+    <div class="modal-head"><h3>↩️ 领用退回</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="alert-box warn">
+        未开封药品 → 退回原批次<strong>合格库存</strong>可再发出；
+        已开封药品 → 进入<strong style="color:#dc2626">待毁隔离区</strong>，不能再发出，只能报损销毁。
+      </div>
+      <div v-if="info" style="color:#6b7280;font-size:13px;margin-bottom:8px">
+        原领用单 <b>{{ info.voucher_no }}</b> · {{ info.drug_name }} · 牛只 {{ info.cow_tag || '-' }}
+      </div>
+      <table class="data" style="font-size:13px">
+        <thead><tr><th>批号</th><th class="num">原领</th><th class="num">已退</th>
+          <th class="num" style="width:130px">未开封(回库)</th>
+          <th class="num" style="width:130px">已开封(待毁)</th></tr></thead>
+        <tbody>
+          <tr v-for="i in items" :key="i.line_id">
+            <td><b>{{ i.batch_no }}</b><div style="color:#9ca3af;font-size:11px">{{ i.expiry_date }}</div></td>
+            <td class="num">{{ i.qty }}</td><td class="num">{{ i.returned }}</td>
+            <td class="num"><input type="number" min="0" :max="i.returnable" step="0.001"
+              class="input" style="padding:4px 8px;text-align:right" v-model.number="i.qty_unopened"></td>
+            <td class="num"><input type="number" min="0" :max="i.returnable" step="0.001"
+              class="input" style="padding:4px 8px;text-align:right" v-model.number="i.qty_opened"></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="hint">合计：未开封回库 {{ totalReturn('qty_unopened') }}，已开封待毁 {{ totalReturn('qty_opened') }}；累计退回不能超过原领量。</div>
+      <div class="field-row" style="margin-top:8px">
+        <div class="field"><label>退回日期</label><input type="date" class="input" v-model="f.voucher_date"></div>
+        <div class="field"><label>经办人</label><input class="input" v-model="f.operator"></div>
+      </div>
+      <div class="field"><label>备注</label><input class="input" v-model="f.note"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">确认退回</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：报损 ---------------- */
+const WriteoffFormModal = {
+  setup() {
+    const m = topModal();
+    const f = reactive({
+      voucher_date: todayStr(), reason: "", operator: "", note: "",
+      rows: [], // {batch_id, batch_no, qty_ok, qty_quarantine, qty, location}
+    });
+    const err = ref("");
+    function syncRows() {
+      const existing = new Map(f.rows.map((r) => [r.batch_id, r]));
+      const rows = S.batches.filter((b) => b.qty_ok > 0 || b.qty_quarantine > 0).map((b) => {
+        const ex = existing.get(b.id);
+        return ex ? { ...ex, qty_ok: b.qty_ok, qty_quarantine: b.qty_quarantine,
+                      batch_no: b.batch_no, drug_name: b.drug_name }
+                  : { batch_id: b.id, batch_no: b.batch_no, drug_name: b.drug_name,
+                      qty_ok: b.qty_ok, qty_quarantine: b.qty_quarantine,
+                      qty: null, location: b.qty_ok > 0 ? "ok" : "quarantine" };
+      });
+      f.rows = rows;
+      if (m.presetBatch) {
+        const r = f.rows.find((x) => x.batch_id === m.presetBatch.id);
+        if (r) r.location = m.presetBatch.qty_quarantine > 0 && m.presetBatch.qty_ok <= 0
+          ? "quarantine" : "ok";
+      }
+    }
+    syncRows();
+    async function save() {
+      err.value = "";
+      const items = f.rows.filter((r) => Number(r.qty) > 0)
+        .map((r) => ({ batch_id: r.batch_id, qty: Number(r.qty), location: r.location }));
+      if (!items.length) { err.value = "请填写报损数量"; return; }
+      if (!f.reason.trim()) { err.value = "必须填写报损原因"; return; }
+      try {
+        await api("/api/inventory/writeoffs", { method: "POST", body: { ...f, items } });
+        toast("报损完成，已写流水");
+        await loadAllStock();
+        refreshDash();
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    return { S, f, err, save, closeModal };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal">
+    <div class="modal-head"><h3>🗑️ 药品报损</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field-row">
+        <div class="field" style="flex:2"><label>报损原因 <span class="req">*</span></label>
+          <input class="input" v-model="f.reason" placeholder="如 过期销毁 / 破损 / 已开封销毁" list="wo-reason">
+          <datalist id="wo-reason"><option value="过期销毁"><option value="包装破损">
+            <option value="已开封剩余销毁"><option value="变质异常"></datalist></div>
+        <div class="field"><label>日期</label><input type="date" class="input" v-model="f.voucher_date"></div>
+      </div>
+      <table class="data" style="font-size:13px">
+        <thead><tr><th>药品/批号</th><th class="num">合格</th><th class="num">待毁</th>
+          <th>来源</th><th class="num" style="width:110px">报损数量</th></tr></thead>
+        <tbody>
+          <tr v-for="r in f.rows" :key="r.batch_id">
+            <td>{{ r.drug_name }}<br><b>{{ r.batch_no }}</b></td>
+            <td class="num">{{ r.qty_ok }}</td>
+            <td class="num"><span :class="r.qty_quarantine>0?'badge red':''">{{ r.qty_quarantine }}</span></td>
+            <td><select class="input" style="padding:3px 6px" v-model="r.location">
+              <option value="ok">合格库存</option>
+              <option value="quarantine">待毁隔离</option>
+            </select></td>
+            <td class="num"><input type="number" min="0" step="0.001"
+              class="input" style="padding:4px 8px;text-align:right" v-model.number="r.qty"></td>
+          </tr>
+          <tr v-if="!f.rows.length"><td colspan="5" class="empty">暂无可报损库存</td></tr>
+        </tbody>
+      </table>
+      <div class="field" style="margin-top:8px"><label>经办人</label><input class="input" v-model="f.operator"></div>
+      <div class="field"><label>备注</label><input class="input" v-model="f.note"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-danger" @click="save">确认报损</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：盘点 ---------------- */
+const StocktakeFormModal = {
+  setup() {
+    const m = topModal();
+    const f = reactive({ voucher_date: todayStr(), operator: "", note: "", rows: [] });
+    const err = ref("");
+    function syncRows() {
+      const existing = new Map(f.rows.map((r) => [r.batch_id, r]));
+      f.rows = S.batches.map((b) => {
+        const ex = existing.get(b.id);
+        return {
+          batch_id: b.id, batch_no: b.batch_no, drug_name: b.drug_name,
+          qty_ok: b.qty_ok, qty_quarantine: b.qty_quarantine,
+          actual_ok: ex ? ex.actual_ok : b.qty_ok,
+          actual_quarantine: ex ? ex.actual_quarantine : b.qty_quarantine,
+        };
+      });
+    }
+    syncRows();
+    const shown = computed(() =>
+      m.presetBatch ? f.rows.filter((r) => r.batch_id === m.presetBatch.id) : f.rows);
+    const diffOf = (r) =>
+      Math.round(((Number(r.actual_ok) - r.qty_ok)) * 1000) / 1000;
+    async function save() {
+      err.value = "";
+      const items = shown.value.map((r) => ({
+        batch_id: r.batch_id,
+        actual_ok: r.actual_ok === "" || r.actual_ok == null ? r.qty_ok : Number(r.actual_ok),
+        actual_quarantine: r.actual_quarantine == null ? r.qty_quarantine : Number(r.actual_quarantine),
+      }));
+      if (!items.length) { err.value = "没有可盘点批次"; return; }
+      try {
+        await api("/api/inventory/stocktakes", { method: "POST", body: { ...f, items } });
+        toast("盘点完成，账实差异已调整并入流水");
+        await loadAllStock();
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    return { f, err, shown, diffOf, save, closeModal };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal">
+    <div class="modal-head"><h3>🧮 库存盘点</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field-row">
+        <div class="field"><label>盘点日期</label><input type="date" class="input" v-model="f.voucher_date"></div>
+        <div class="field"><label>盘点人</label><input class="input" v-model="f.operator"></div>
+      </div>
+      <table class="data" style="font-size:13px">
+        <thead><tr><th>药品/批号</th><th class="num">账面合格</th>
+          <th class="num" style="width:120px">实盘合格</th><th class="num">账面待毁</th>
+          <th class="num" style="width:110px">实盘待毁</th><th>差异</th></tr></thead>
+        <tbody>
+          <tr v-for="r in shown" :key="r.batch_id">
+            <td>{{ r.drug_name }}<br><b>{{ r.batch_no }}</b></td>
+            <td class="num">{{ r.qty_ok }}</td>
+            <td class="num"><input type="number" min="0" step="0.001"
+              class="input" style="padding:4px 8px;text-align:right" v-model.number="r.actual_ok"></td>
+            <td class="num">{{ r.qty_quarantine }}</td>
+            <td class="num"><input type="number" min="0" step="0.001"
+              class="input" style="padding:4px 8px;text-align:right" v-model.number="r.actual_quarantine"></td>
+            <td><span v-if="diffOf(r)!==0" class="badge"
+                :class="diffOf(r)>0?'green':'red'">{{ diffOf(r)>0?'盘盈 +':'盘亏 ' }}{{ diffOf(r) }}</span>
+              <span v-else class="badge gray">相符</span></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="field" style="margin-top:8px"><label>备注</label><input class="input" v-model="f.note"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">提交盘点单</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：用药表单（自动休药期 + 批次出库） ---------------- */
 const MedFormModal = {
   setup() {
     const m = topModal();
@@ -941,31 +1688,82 @@ const MedFormModal = {
       cow_id: m.rec?.presetCow || null, drug_id: null, drug_name: "",
       date: todayStr(), dose: "", route: "颈部肌注", reason: "",
       withdrawal_days: null, next_dose_date: null, operator: "", note: "",
+      consume: true, want: null,
+      lines: [], // {batch_id, batch_no, expiry_date, available, qty}
     });
     const err = ref("");
     const wdEnd = computed(() =>
       f.date && f.withdrawal_days != null ? addDays(f.date, f.withdrawal_days) : null);
     const saleDate = computed(() =>
       wdEnd.value ? addDays(wdEnd.value, 1) : null);
+    const totalPicked = computed(() =>
+      Math.round(f.lines.reduce((s, l) => s + (Number(l.qty) || 0), 0) * 1000) / 1000);
+    const shortage = computed(() =>
+      f.want ? Math.max(0, Math.round((f.want - totalPicked.value) * 1000) / 1000) : 0);
+    const drugUnit = computed(() => S.drugs.find((d) => d.id === f.drug_id)?.unit || "");
+
+    async function loadBatches() {
+      if (!f.drug_id || !f.consume) { f.lines = []; return; }
+      const rows = await api(`/api/inventory/available?drug_id=${f.drug_id}&on_date=${f.date}`);
+      const valid = new Map(rows.map((b) => [b.id, b]));
+      f.lines = f.lines.filter((l) => valid.has(l.batch_id));
+      for (const b of rows) {
+        if (!f.lines.some((l) => l.batch_id === b.id)) {
+          f.lines.push({ batch_id: b.id, batch_no: b.batch_no, expiry_date: b.expiry_date,
+                         available: b.qty_ok, qty: null });
+        } else {
+          Object.assign(f.lines.find((x) => x.batch_id === b.id),
+                        { available: b.qty_ok, expiry_date: b.expiry_date });
+        }
+      }
+    }
+    async function autoFill() {
+      err.value = "";
+      if (!f.drug_id || !f.want || f.want <= 0) { err.value = "请选择目录药品并填写本次消耗总量"; return; }
+      try {
+        const sug = await api(`/api/inventory/suggest?drug_id=${f.drug_id}&qty=${f.want}&on_date=${f.date}`);
+        await loadBatches();
+        for (const l of f.lines) {
+          const a = sug.allocations.find((x) => x.batch_id === l.batch_id);
+          l.qty = a ? a.qty : null;
+        }
+        if (!sug.fulfilled) err.value = `可发库存不足，还差 ${sug.shortage}${drugUnit.value}，请先入库`;
+      } catch (e) { err.value = e.message; }
+    }
     function pickDrug() {
       const d = S.drugs.find((x) => x.id === f.drug_id);
       if (d) { f.drug_name = d.name; f.withdrawal_days = d.default_withdrawal_days; }
+      loadBatches();
     }
+    watch(() => [f.date, f.consume], loadBatches);
     async function save() {
       err.value = "";
+      const body = { ...f };
+      delete body.lines; delete body.want; delete body.consume;
+      if (f.consume && f.drug_id) {
+        const lines = f.lines.filter((l) => Number(l.qty) > 0)
+          .map((l) => ({ batch_id: l.batch_id, qty: Number(l.qty) }));
+        if (!lines.length) { err.value = "请点 FEFO 自动凑量或手动填写各批次出库数量（或取消勾选作历史补录）"; return; }
+        if (shortage.value > 0) { err.value = `出库数量未凑齐，还差 ${shortage.value}${drugUnit.value}`; return; }
+        body.issue_lines = lines;
+      }
       try {
-        await api("/api/medications", { method: "POST", body: f });
-        toast("用药记录已保存，休药期校验已生效");
+        await api("/api/medications", { method: "POST", body });
+        toast(f.consume && body.issue_lines
+          ? "用药已保存并按批次出库，休药期校验已生效"
+          : "用药已保存（历史补录，未扣库存）");
         await loadMedsAll();
+        if (body.issue_lines) await loadAllStock();
         closeModal();
         refreshDash();
       } catch (e) { err.value = e.message; }
     }
-    return { S, f, err, save, closeModal, pickDrug, wdEnd, saleDate };
+    return { S, f, err, save, closeModal, pickDrug, loadBatches, autoFill,
+             wdEnd, saleDate, totalPicked, shortage, drugUnit };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal">
-    <div class="modal-head"><h3>登记用药</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-head"><h3>登记用药（关联领用批次）</h3><button class="modal-close" @click="closeModal">×</button></div>
     <div class="modal-body">
       <div class="alert-box danger" v-if="err">{{ err }}</div>
       <div class="field-row">
@@ -978,9 +1776,9 @@ const MedFormModal = {
       </div>
       <div class="field"><label>药品（选择后自动套用默认休药期）</label>
         <select class="input" v-model="f.drug_id" @change="pickDrug">
-          <option :value="null">— 自定义输入药品名 —</option>
+          <option :value="null">— 自定义输入药品名（历史补录不扣库存）—</option>
           <option v-for="d in S.drugs" :key="d.id" :value="d.id">
-            {{ d.name }}（休药期 {{ d.default_withdrawal_days }} 天）
+            {{ d.name }}（休药期 {{ d.default_withdrawal_days }} 天 / 单位 {{ d.unit }}）
           </option>
         </select></div>
       <div class="field-row">
@@ -995,7 +1793,45 @@ const MedFormModal = {
         </template>
         <template v-else>✅ 休药期 0 天，用药当天鲜奶可上市。</template>
       </div>
-      <div class="field-row">
+
+      <!-- 库存出库 -->
+      <div v-if="f.drug_id" class="stock-box">
+        <label class="stock-toggle">
+          <input type="checkbox" v-model="f.consume" @change="loadBatches">
+          本次用药从库存出库（生成领用单并扣减批次库存）
+        </label>
+        <template v-if="f.consume">
+          <div class="field-row">
+            <div class="field"><label>本次消耗总量 <span class="req">*</span></label>
+              <input type="number" min="0.001" step="0.001" class="input" v-model.number="f.want"
+                     :placeholder="'共需多少 ' + drugUnit"></div>
+            <div class="field" style="display:flex;align-items:flex-end">
+              <button class="btn" type="button" @click="autoFill">⚡ FEFO 自动凑量（可跨批次）</button>
+            </div>
+          </div>
+          <table class="data" style="font-size:13px">
+            <thead><tr><th>批号</th><th>效期至</th><th class="num">可发</th><th class="num" style="width:120px">出库量</th></tr></thead>
+            <tbody>
+              <tr v-for="l in f.lines" :key="l.batch_id">
+                <td><b>{{ l.batch_no }}</b></td>
+                <td>{{ l.expiry_date }}</td>
+                <td class="num">{{ l.available }}</td>
+                <td class="num"><input type="number" min="0" step="0.001"
+                  class="input" style="padding:4px 8px;text-align:right" v-model.number="l.qty"></td>
+              </tr>
+              <tr v-if="!f.lines.length"><td colspan="4" class="empty">该药品当前没有可发批次（全部过期或无库存），请先入库；或取消勾选作历史补录</td></tr>
+            </tbody>
+          </table>
+          <div class="hint" style="margin-top:4px">
+            已出库 <b :class="shortage ? 'color:#dc2626' : 'color:#16a34a'">{{ totalPicked }}</b> / 需 {{ f.want || 0 }} {{ drugUnit }}
+            <span v-if="shortage" style="color:#dc2626">· 还差 {{ shortage }}，无法保存</span>
+            <span v-else-if="f.want" style="color:#16a34a">· 已凑齐</span>
+          </div>
+        </template>
+        <div v-else class="hint">未勾选出库：仅登记用药/休药期，不扣减任何批次库存（适用于历史补录）。</div>
+      </div>
+
+      <div class="field-row" style="margin-top:8px">
         <div class="field"><label>剂量</label><input class="input" v-model="f.dose" placeholder="如 1g/次，每日1次，连用3日"></div>
         <div class="field"><label>给药途径</label>
           <select class="input" v-model="f.route">
@@ -1210,16 +2046,22 @@ const CowDetailModal = {
       </div>
 
       <div v-if="tab==='meds'" class="table-wrap"><table class="data">
-        <thead><tr><th>日期</th><th>药品</th><th>剂量/途径</th><th>休药期</th><th>可售日</th><th>状态</th></tr></thead>
+        <thead><tr><th>日期</th><th>药品</th><th>剂量/途径</th><th>休药期</th><th>可售日</th><th>领用批次</th><th>状态</th></tr></thead>
         <tbody>
           <tr v-for="m in d.medications" :key="m.id">
             <td>{{ m.date }}</td><td>{{ m.drug_name }}</td>
             <td>{{ m.dose || '-' }} {{ m.route ? '· '+m.route : '' }}</td>
             <td>{{ m.withdrawal_days }} 天</td>
             <td><b>{{ addDays(m.withdrawal_end, 1) }}</b></td>
+            <td style="font-size:12px">
+              <template v-if="m.issue_batches && m.issue_batches.length">
+                <div v-for="b in m.issue_batches" :key="b.batch_no">{{ b.batch_no }} ×{{ b.qty }}</div>
+              </template>
+              <span v-else class="badge gray">未扣库存</span>
+            </td>
             <td><span v-if="m.active_withdrawal" class="badge red">休药中</span><span v-else class="badge green">已解除</span></td>
           </tr>
-          <tr v-if="!d.medications.length"><td colspan="6" class="empty">无用药记录</td></tr>
+          <tr v-if="!d.medications.length"><td colspan="7" class="empty">无用药记录</td></tr>
         </tbody></table>
       </div>
 
@@ -1240,9 +2082,10 @@ const CowDetailModal = {
 
 /* ---------------- 根组件 ---------------- */
 const App = {
-  components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage,
+  components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage, InventoryPage,
     CowFormModal, MilkingFormModal, HealthFormModal, DrugFormModal,
-    MedFormModal, EstrusFormModal, CowDetailModal },
+    MedFormModal, EstrusFormModal, CowDetailModal,
+    ReceiptFormModal, IssueFormModal, ReturnFormModal, WriteoffFormModal, StocktakeFormModal },
   setup() {
     onMounted(async () => {
       try {
@@ -1260,6 +2103,7 @@ const App = {
       { key: "cows", ico: "🐄", label: "奶牛档案" },
       { key: "milkings", ico: "🥛", label: "挤奶记录" },
       { key: "health", ico: "🏥", label: "健康与用药" },
+      { key: "inventory", ico: "📦", label: "药品库存" },
       { key: "repro", ico: "💕", label: "发情与配种" },
     ];
     return { S, switchView, nav, topModal };
@@ -1288,6 +2132,7 @@ const App = {
         <cows-page v-else-if="S.view==='cows'"></cows-page>
         <milkings-page v-else-if="S.view==='milkings'"></milkings-page>
         <health-page v-else-if="S.view==='health'"></health-page>
+        <inventory-page v-else-if="S.view==='inventory'"></inventory-page>
         <repro-page v-else-if="S.view==='repro'"></repro-page>
       </div>
     </main>
@@ -1301,6 +2146,11 @@ const App = {
       <med-form-modal v-else-if="md.type==='medForm'"></med-form-modal>
       <estrus-form-modal v-else-if="md.type==='estrusForm'"></estrus-form-modal>
       <cow-detail-modal v-else-if="md.type==='cowDetail'"></cow-detail-modal>
+      <receipt-form-modal v-else-if="md.type==='receiptForm'"></receipt-form-modal>
+      <issue-form-modal v-else-if="md.type==='issueForm'"></issue-form-modal>
+      <return-form-modal v-else-if="md.type==='returnForm'"></return-form-modal>
+      <writeoff-form-modal v-else-if="md.type==='writeoffForm'"></writeoff-form-modal>
+      <stocktake-form-modal v-else-if="md.type==='stocktakeForm'"></stocktake-form-modal>
     </template>
 
     <div class="toast-wrap">

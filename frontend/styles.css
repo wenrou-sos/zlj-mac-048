@@ -302,6 +302,16 @@ table.data .num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .tab.active { color: var(--green-700); border-bottom-color: var(--green-600); }
 
+/* ---------- 药品库存 ---------- */
+.stock-box {
+  margin-top: 12px; padding: 12px; border: 1px dashed var(--gray-300, #d1d5db);
+  border-radius: 8px; background: #fafaf9;
+}
+.stock-toggle { display: flex; align-items: center; gap: 8px; font-weight: 600;
+  font-size: 13.5px; color: #374151; cursor: pointer; margin-bottom: 8px; }
+.stock-box .data input { width: 100%; }
+.link:disabled { color: #d1d5db; cursor: not-allowed; }
+
 /* ---------- 迷你折线(SVG) ---------- */
 .spark { width: 100%; height: 150px; }
 

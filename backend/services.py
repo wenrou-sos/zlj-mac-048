@@ -267,6 +267,35 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             "days_overdue": max(0, dim - 60),
         })
 
+    # 7) 药品批次效期：过期库存必须冻结，30 天内到期提醒先用
+    for b in db.query(models.DrugBatch).filter(models.DrugBatch.active.is_(True)).all():
+        if b.qty_ok <= 0:
+            continue
+        days = (b.expiry_date - today).days
+        drug = db.get(models.DrugCatalog, b.drug_id)
+        drug_name = drug.name if drug else f"药品#{b.drug_id}"
+        unit = drug.unit if drug else ""
+        if days < 0:
+            out.append({
+                "type": "drug_expired",
+                "level": "danger",
+                "title": f"药品已过期冻结：{drug_name}（批号 {b.batch_no}）",
+                "detail": f"效期至 {b.expiry_date}，剩余 {b.qty_ok:g}{unit} "
+                          f"已禁止发出，请报损处理",
+                "due_date": str(b.expiry_date),
+                "days_overdue": -days,
+            })
+        elif days <= 30:
+            out.append({
+                "type": "drug_near_expiry",
+                "level": "warning" if days > 7 else "danger",
+                "title": f"药品近效期：{drug_name}（批号 {b.batch_no}）",
+                "detail": f"效期至 {b.expiry_date}（剩 {days} 天），"
+                          f"库存 {b.qty_ok:g}{unit}，FEFO 将优先发出该批",
+                "due_date": str(b.expiry_date),
+                "days_overdue": 0,
+            })
+
     level_rank = {"danger": 0, "warning": 1, "info": 2}
     out.sort(key=lambda r: (level_rank.get(r["level"], 9), r.get("days_overdue", 0) * -1))
     return out
