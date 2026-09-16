@@ -1,4 +1,5 @@
 """初始化并写入样例牛群数据（所有日期相对今天生成，保证提醒场景可直接演示）"""
+import datetime
 import random
 from datetime import date, timedelta
 
@@ -46,18 +47,6 @@ COWS = [
 
 SESSION_WEIGHT = {"morning": 0.38, "noon": 0.28, "evening": 0.34}
 SESSIONS = ["morning", "noon", "evening"]
-
-# (牛耳标, 用药日偏移, 休药天数) —— 与下方用药记录保持一致，用于挤奶记录自动标记废弃
-WITHDRAWAL_WINDOWS = [
-    ("1609", -2, 3),   # 头孢噻呋钠
-    ("1610", -12, 4),  # 复方阿莫西林乳房灌注
-    ("1610", -12, 2),  # 氟尼辛葡甲胺（被上一条窗口覆盖）
-    ("1607", -4, 2),   # 缩宫素
-]
-
-
-def in_withdrawal_window(tag: str, day_offset: int) -> bool:
-    return any(t == tag and d <= day_offset <= d + wd for t, d, wd in WITHDRAWAL_WINDOWS)
 
 
 def _gen_yield(rng: random.Random, base: float, dim: int, day_offset: int,
@@ -122,13 +111,9 @@ def seed_database(db: Session) -> None:
                     scc = rng.randint(580, 920) * 1000  # 体细胞骤升
                 elif rng.random() < 0.15:
                     scc = rng.randint(80, 260) * 1000
-                # 休药期牛奶一律废弃，唯独保留 1609 昨天早班一条“违规混装”演示样例
+                # 休药期废弃在用药疗程落库后按实际给药窗口统一回算（见 _mark_withdrawal_milk）
                 discarded = False
                 note = None
-                in_window = in_withdrawal_window(tag, off)
-                if in_window:
-                    discarded = not (tag == "1609" and off == -1 and sess == "morning")
-                    note = "休药期废弃" if discarded else "休药期内未标注废弃（违规样例）"
                 # 1607 新产牛前3天初乳不上市
                 if tag == "1607" and dim <= 2:
                     discarded = True
@@ -160,26 +145,10 @@ def seed_database(db: Session) -> None:
                             diagnosis="常规体检", temperature=38.9, result="recovered",
                             note="体况评分3.0，建议关注采食量"),
     ])
+    db.flush()
 
-    # ---------- 用药记录 ----------
+    # ---------- 用药记录（旧零散记录：继续保留、继续参与休药校验） ----------
     db.add_all([
-        models.Medication(
-            cow_id=cows["1609"].id, drug_id=drug_map["注射用头孢噻呋钠"].id,
-            drug_name="注射用头孢噻呋钠", date=_d(-2), dose="1g/次，每日1次，连用3日",
-            route="颈部肌注", reason="发热呼吸道感染", withdrawal_days=3,
-            withdrawal_end=_d(-2 + 3), next_dose_date=_d(1), treated=False,
-            operator="李兽医"),
-        models.Medication(
-            cow_id=cows["1610"].id, drug_id=drug_map["复方阿莫西林乳房灌注剂"].id,
-            drug_name="复方阿莫西林乳房灌注剂", date=_d(-12), dose="每乳区1支，每日2次，连用3日",
-            route="乳头灌注", reason="临床型乳房炎", withdrawal_days=4,
-            withdrawal_end=_d(-12 + 4), next_dose_date=None, treated=True,
-            operator="王兽医"),
-        models.Medication(
-            cow_id=cows["1610"].id, drug_id=drug_map["氟尼辛葡甲胺"].id,
-            drug_name="氟尼辛葡甲胺", date=_d(-12), dose="15mL/次", route="静注",
-            reason="乳房炎消炎退热", withdrawal_days=2, withdrawal_end=_d(-12 + 2),
-            treated=True, operator="王兽医"),
         models.Medication(
             cow_id=cows["1607"].id, drug_id=drug_map["缩宫素注射液"].id,
             drug_name="缩宫素注射液", date=_d(-4), dose="50IU", route="肌注",
@@ -196,6 +165,184 @@ def seed_database(db: Session) -> None:
             reason="季度驱虫", withdrawal_days=14, withdrawal_end=_d(-60 + 14),
             treated=True, operator="王兽医"),
     ])
+
+    # ---------- 用药疗程（围绕病历，多药/多次/多班，逐次记录实际给药） ----------
+    hr_1609 = next(h for h in db.query(models.HealthRecord).filter_by(cow_id=cows["1609"].id))
+    hr_1610 = next(h for h in db.query(models.HealthRecord).filter_by(cow_id=cows["1610"].id))
+    hr_1611 = models.HealthRecord(
+        cow_id=cows["1611"].id, date=_d(-2), record_type="diagnosis",
+        diagnosis="前胃弛缓/食欲下降（治疗观察）", temperature=39.1,
+        severity="mild", follow_up_date=_d(2), result="ongoing",
+        note="近5天产奶量持续下滑，采食减少，瘤胃蠕动弱，建立疗程并交班观察")
+    db.add(hr_1611)
+    db.flush()
+
+    def line(course, drug_name, planned_dose, route, tpd, wd, times,
+             status="active", seq=1, change_reason=None):
+        ln = models.CourseDrug(
+            course_id=course.id, drug_id=drug_map[drug_name].id, drug_name=drug_name,
+            planned_dose=planned_dose, route=route, times_per_day=tpd,
+            interval_days=1, withdrawal_days=wd, seq=seq, status=status,
+            change_reason=change_reason)
+        db.add(ln)
+        db.flush()
+        return ln
+
+    def planned_dose(course_obj, ln, no, day_off, t, dose_text=None):
+        obj = models.CourseDose(
+            course_id=course_obj.id, course_drug_id=ln.id, cow_id=course_obj.cow_id,
+            dose_no=no, planned_date=_d(day_off), planned_time=t,
+            planned_dose=dose_text or ln.planned_dose, status="planned")
+        db.add(obj)
+        return obj
+
+    def give(obj, day_off, t=None, dose_text=None, wd=None, operator="李兽医", note=None):
+        line_id = obj.course_drug_id
+        d = _d(day_off)
+        obj.status = "administered"
+        obj.administered_date = d
+        obj.administered_time = t or obj.planned_time
+        obj.administered_dose = dose_text or obj.planned_dose
+        obj.withdrawal_days = ln_wd[line_id] if wd is None else wd
+        obj.withdrawal_end = d + timedelta(days=obj.withdrawal_days)
+        obj.operator = operator
+        obj.recorded_by = operator
+        obj.recorded_at = datetime.datetime.utcnow()
+        obj.note = note
+        return obj
+
+    def miss(obj, reason):
+        obj.status = "missed"
+        obj.reason = reason
+        obj.recorded_at = datetime.datetime.utcnow()
+        return obj
+
+    # 1609 甜豆：发热呼吸道感染，头孢每日1次×3。首针已打→第2针漏用（交班可见）
+    # → 今天第3针待执行（休药期因此只来自首针，演示“未执行计划不算已用药”）
+    c1609 = models.TreatmentCourse(
+        cow_id=cows["1609"].id, health_record_id=hr_1609.id,
+        title="发热（上呼吸道感染）抗菌疗程", start_date=_d(-2),
+        planned_end_date=_d(0), veterinarian="李兽医",
+        note="交班：今天必须完成第3针并复查体温；若仍发热请王兽医会诊。")
+    db.add(c1609)
+    db.flush()
+    ln1609 = line(c1609, "注射用头孢噻呋钠", "1g/次", "颈部肌注", 1, 3, ["morning"])
+    ln_wd = {ln1609.id: 3}
+    d1 = planned_dose(c1609, ln1609, 1, -2, "morning")
+    d2 = planned_dose(c1609, ln1609, 2, -1, "morning")
+    d3 = planned_dose(c1609, ln1609, 3, 0, "morning")
+    give(d1, -2, operator="李兽医")
+    miss(d2, "清晨牛舍周转遗漏，夜班发现时已错过，交班评估是否补做")
+    db.add_all([
+        models.CourseEvent(course_id=c1609.id, event_type="created",
+                           summary="建立疗程「发热（上呼吸道感染）抗菌疗程」，安排 1 种药",
+                           operator="李兽医"),
+        models.CourseEvent(course_id=c1609.id, event_type="administered",
+                           summary="第 1 次 注射用头孢噻呋钠 已给药：" + str(_d(-2)) + " 早班",
+                           detail="剂量 1g/次；休药 3 天，至 " + str(_d(-2 + 3)),
+                           operator="李兽医"),
+        models.CourseEvent(course_id=c1609.id, event_type="missed",
+                           summary="第 2 次 注射用头孢噻呋钠（" + str(_d(-1))
+                                   + " 早班）漏用：清晨牛舍周转遗漏，夜班发现时已错过，交班评估是否补做"),
+        models.CourseEvent(course_id=c1609.id, event_type="note",
+                           summary="更新交班备注", detail=c1609.note),
+    ])
+
+    # 1610 玉珠：临床型乳房炎，两种药并行——阿莫西林每日2班×3日（6次，已完成），
+    # 氟尼辛当日单次辅助消炎（已完成）；疗程已结束，但休药限制仍有效
+    c1610 = models.TreatmentCourse(
+        cow_id=cows["1610"].id, health_record_id=hr_1610.id,
+        title="临床型乳房炎（左后乳区）联合治疗", start_date=_d(-12),
+        planned_end_date=_d(-10), end_date=_d(-10), status="ended",
+        end_reason="用药3日后体温正常、乳区红肿消退，医嘱疗程结束进入休药观察",
+        veterinarian="王兽医",
+        note="休药至" + str(_d(-12 + 4)) + "，次日鲜奶方可上市；继续监测SCC。")
+    db.add(c1610)
+    db.flush()
+    ln_amx = line(c1610, "复方阿莫西林乳房灌注剂", "每乳区1支", "乳头灌注", 2, 4,
+                  ["morning", "evening"])
+    ln_fln = line(c1610, "氟尼辛葡甲胺", "15mL/次", "静注", 1, 2, ["noon"])
+    ln_wd.update({ln_amx.id: 4, ln_fln.id: 2})
+    amx_days = [-12, -11, -10]
+    no = 1
+    for off in amx_days:
+        for t in ("morning", "evening"):
+            give(planned_dose(c1610, ln_amx, no, off, t), off, t, operator="王兽医")
+            no += 1
+    give(planned_dose(c1610, ln_fln, 1, -12, "noon"), -12, "noon", operator="王兽医")
+    db.add(models.CourseEvent(
+        course_id=c1610.id, event_type="ended",
+        summary="结束疗程：" + c1610.end_reason,
+        detail="既有休药限制继续有效"))
+
+    # 1611 奶咖：食欲下降，维ADE原计划2日→第2日换药为葡萄糖酸钙（注明原因）；
+    # 钙静滴每日1次×3：首针已打、今天待执行、明天待执行（交班剩余安排）
+    c1611 = models.TreatmentCourse(
+        cow_id=cows["1611"].id, health_record_id=hr_1611.id,
+        title="前胃弛缓/食欲下降支持治疗", start_date=_d(-2),
+        planned_end_date=_d(1), veterinarian="李兽医",
+        note="交班：今明两天各1次葡萄糖酸钙静滴；观察采食与产奶量回升情况。")
+    db.add(c1611)
+    db.flush()
+    ln_vit = line(c1611, "维生素ADE注射液", "10mL/次", "颈部肌注", 1, 0, ["morning"],
+                  status="switched", seq=1,
+                  change_reason="换为 葡萄糖酸钙注射液：肌注后精神改善不明显，改静注补钙促采食")
+    ln_ca = line(c1611, "葡萄糖酸钙注射液", "500mL 缓慢静滴", "静注", 1, 0, ["morning"],
+                 seq=2)
+    ln_wd.update({ln_vit.id: 0, ln_ca.id: 0})
+    v1 = planned_dose(c1611, ln_vit, 1, -2, "morning")
+    v2 = planned_dose(c1611, ln_vit, 2, -1, "morning")
+    give(v1, -2, operator="李兽医", note="首次肌注")
+    v2.status = "cancelled"
+    v2.reason = "换药为 葡萄糖酸钙注射液：肌注后精神改善不明显，改静注补钙促采食"
+    v2.recorded_at = datetime.datetime.utcnow()
+    ca1 = planned_dose(c1611, ln_ca, 1, -1, "morning")
+    ca2 = planned_dose(c1611, ln_ca, 2, 0, "morning")
+    ca3 = planned_dose(c1611, ln_ca, 3, 1, "morning")
+    give(ca1, -1, operator="夜班赵师傅")
+    db.add_all([
+        models.CourseEvent(course_id=c1611.id, event_type="created",
+                           summary="建立疗程「前胃弛缓/食欲下降支持治疗」，安排 1 种药",
+                           operator="李兽医"),
+        models.CourseEvent(course_id=c1611.id, event_type="administered",
+                           summary="第 1 次 维生素ADE注射液 已给药：" + str(_d(-2)) + " 早班",
+                           operator="李兽医"),
+        models.CourseEvent(course_id=c1611.id, event_type="switched",
+                           summary="维生素ADE注射液 换药为 葡萄糖酸钙注射液",
+                           detail="肌注后精神改善不明显，改静注补钙促采食"),
+        models.CourseEvent(course_id=c1611.id, event_type="cancelled",
+                           summary="第 2 次 维生素ADE注射液（" + str(_d(-1))
+                                   + " 早班）取消：换药为 葡萄糖酸钙注射液"),
+        models.CourseEvent(course_id=c1611.id, event_type="administered",
+                           summary="第 1 次 葡萄糖酸钙注射液 已给药：" + str(_d(-1)) + " 早班",
+                           detail="剂量 500mL 缓慢静滴；休药 0 天", operator="夜班赵师傅"),
+    ])
+
+    db.flush()
+
+    # ---------- 按“已实际给药”的休药窗口回算挤奶废弃标记 ----------
+    # 唯一例外：1609 昨天早班故意保留一条休药期内未废弃记录，用于演示违规混装拦截
+    from .course_services import all_withdrawal_windows
+    all_cows = list(cows.values())
+    cow_ids = [c.id for c in all_cows]
+    cows_by_id = {c.id: c for c in all_cows}
+    min_d, max_d = _d(-20), _d(0)
+    windows = all_withdrawal_windows(db, cow_ids, min_d, max_d)
+    milk_rows = db.query(models.MilkingRecord).filter(
+        models.MilkingRecord.date >= min_d).all()
+    for r in milk_rows:
+        if r.discarded:
+            continue  # 初乳期废弃等既定标记不动
+        wins = windows.get(r.cow_id, [])
+        in_w = any(w["start"] <= r.date <= w["end"] for w in wins)
+        if not in_w:
+            continue
+        tag = cows_by_id[r.cow_id].ear_tag
+        deliberate = tag == "1609" and r.date == _d(-1) and r.session == "morning"
+        r.discarded = not deliberate
+        r.note = "休药期内未标注废弃（违规样例）" if deliberate else "休药期废弃"
+
+    db.commit()
 
     # ---------- 发情/配种记录 ----------
     db.add_all([

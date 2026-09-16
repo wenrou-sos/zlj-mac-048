@@ -179,6 +179,78 @@ class MedicationOut(BaseModel):
         from_attributes = True
 
 
+# ---------- 用药疗程 ----------
+class CourseDrugItem(BaseModel):
+    """创建疗程时的一条用药安排"""
+    drug_id: Optional[int] = None
+    drug_name: Optional[str] = Field(None, max_length=64)
+    planned_dose: Optional[str] = None
+    route: Optional[str] = None
+    times_per_day: int = Field(1, ge=1, le=3)
+    interval_days: int = Field(1, ge=1, le=30)
+    planned_times: Optional[List[str]] = Field(
+        None, description="每日班次，如 ['morning','evening']，长度需与 times_per_day 一致")
+    withdrawal_days: Optional[int] = Field(None, ge=0, le=365)
+    total_doses: Optional[int] = Field(None, ge=1, le=60,
+                                       description="总次数；不填则按 days 推算")
+    days: Optional[int] = Field(None, ge=1, le=60, description="连用天数")
+
+
+class CourseCreate(BaseModel):
+    cow_id: int
+    health_record_id: Optional[int] = None
+    title: str = Field(..., max_length=128)
+    start_date: date
+    planned_end_date: Optional[date] = None
+    veterinarian: Optional[str] = None
+    note: Optional[str] = None
+    drugs: List[CourseDrugItem]
+
+
+class CourseNote(BaseModel):
+    note: str = Field(..., max_length=2000)
+
+
+class CourseEnd(BaseModel):
+    end_date: Optional[date] = None
+    end_reason: str = Field(..., min_length=1, max_length=128)
+
+
+class AddDrugPayload(CourseDrugItem):
+    """疗程中途加药/换药（新用药行）"""
+    start_date: Optional[date] = None
+    reason: Optional[str] = Field(None, max_length=255, description="换药/加药原因；换药时必填")
+    replace_line_id: Optional[int] = Field(None, description="被替换（换药停用）的用药行 id")
+
+
+class AdministerPayload(BaseModel):
+    """逐次给药：记录实际时间与剂量；休药期随实际给药日更新"""
+    administered_date: Optional[date] = None
+    administered_time: Optional[str] = Field(None, pattern="^(morning|noon|evening)$")
+    administered_dose: Optional[str] = None
+    withdrawal_days: Optional[int] = Field(None, ge=0, le=365)
+    operator: Optional[str] = None
+    note: Optional[str] = None
+
+
+class DoseSkipPayload(BaseModel):
+    """漏用 / 取消：必须注明原因"""
+    reason: str = Field(..., min_length=1, max_length=255)
+    note: Optional[str] = None
+
+
+class DoseDelayPayload(BaseModel):
+    """延期：保留原计划，记录新日期与原因"""
+    delayed_to: date
+    reason: str = Field(..., min_length=1, max_length=255)
+    note: Optional[str] = None
+
+
+class LineChangePayload(BaseModel):
+    """停药：必须注明原因"""
+    reason: str = Field(..., min_length=1, max_length=255)
+
+
 # ---------- 发情/配种 ----------
 class EstrusCreate(BaseModel):
     cow_id: int

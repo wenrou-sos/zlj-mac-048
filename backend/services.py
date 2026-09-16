@@ -15,22 +15,9 @@ STATUS_LABEL = {
 
 
 def withdrawal_violation_clause(on_column=None, cow_column=None):
-    """
-    生成“该挤奶记录当日处于休药期内且未标记废弃”的 SQL EXISTS 条件，
-    可直接用于 WHERE 过滤，避免先 limit 截断再在内存里漏判。
-    """
-    on_column = on_column or models.MilkingRecord.date
-    cow_column = cow_column or models.MilkingRecord.cow_id
-    med = models.Medication
-    return and_(
-        models.MilkingRecord.discarded.is_(False),
-        exists().where(
-            med.cow_id == cow_column,
-            med.withdrawal_days > 0,
-            med.date <= on_column,
-            med.withdrawal_end >= on_column,
-        ),
-    )
+    """休药期内未废弃的违规混装条件（统一口径，委托疗程模块：旧零散用药 + 疗程实际给药）"""
+    from . import course_services
+    return course_services.withdrawal_violation_clause(on_column, cow_column)
 
 
 def cow_label(cow: models.Cow) -> str:
@@ -40,35 +27,16 @@ def cow_label(cow: models.Cow) -> str:
 
 def latest_medication_window(
     db: Session, cow_id: int, on_date: date
-) -> Optional[models.Medication]:
-    """返回指定日期仍处于休药期内的用药记录（取截止日最晚的一条）"""
-    med = (
-        db.query(models.Medication)
-        .filter(
-            models.Medication.cow_id == cow_id,
-            models.Medication.withdrawal_days > 0,
-            models.Medication.date <= on_date,
-            models.Medication.withdrawal_end >= on_date,
-        )
-        .order_by(models.Medication.withdrawal_end.desc())
-        .first()
-    )
-    return med
+) -> Optional[dict]:
+    """返回指定日期仍生效的休药窗口（截止日最晚者；含旧零散用药与疗程实际给药）"""
+    from . import course_services
+    return course_services.active_withdrawal_window(db, cow_id, on_date)
 
 
 def check_withdrawal(db: Session, cow_id: int, on_date: date) -> dict:
-    """休药期校验：返回某牛某日是否处于休药期及明细"""
-    med = latest_medication_window(db, cow_id, on_date)
-    if not med:
-        return {"in_withdrawal": False, "medication": None}
-    return {
-        "in_withdrawal": True,
-        "medication": med,
-        "withdrawal_end": med.withdrawal_end,
-        "drug_name": med.drug_name,
-        "message": f"该牛自 {med.date} 使用 {med.drug_name}，"
-                   f"牛奶休药期至 {med.withdrawal_end}（含当天），当日鲜奶应废弃",
-    }
+    """休药期校验：统一走疗程模块（旧零散用药记录与疗程实际给药合并判断）"""
+    from . import course_services
+    return course_services.check_withdrawal(db, cow_id, on_date)
 
 
 def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
@@ -159,38 +127,8 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
                 "days_overdue": days - 60,
             })
 
-    # 3) 用药提醒：下次用药 / 休药期进行中
-    for m in db.query(models.Medication).all():
-        cow = db.get(models.Cow, m.cow_id)
-        if not cow or cow.status == "sold":
-            continue
-        if m.next_dose_date and not m.treated:
-            delta = (m.next_dose_date - today).days
-            if -3 <= delta <= 3:
-                out.append({
-                    "type": "medication_dose",
-                    "level": "danger" if delta <= 0 else "warning",
-                    "cow_id": cow.id,
-                    "cow_tag": cow.ear_tag,
-                    "title": f"{cow_label(cow)} 待续用药",
-                    "detail": f"{m.drug_name}（{m.dose or ''}）下次用药日 "
-                              f"{m.next_dose_date}，{m.reason or ''}",
-                    "due_date": str(m.next_dose_date),
-                    "days_overdue": max(0, -delta),
-                })
-        if m.withdrawal_days > 0 and m.date <= today <= m.withdrawal_end:
-            left = (m.withdrawal_end - today).days
-            out.append({
-                "type": "withdrawal",
-                "level": "danger" if left == 0 else "warning",
-                "cow_id": cow.id,
-                "cow_tag": cow.ear_tag,
-                "title": f"{cow_label(cow)} 休药期内·鲜奶须废弃",
-                "detail": f"{m.drug_name} 休药期至 {m.withdrawal_end}"
-                          f"（剩余 {left + 1} 个挤奶日），该牛牛奶不可混入大罐",
-                "due_date": str(m.withdrawal_end + timedelta(days=1)),
-                "days_overdue": 0,
-            })
+    # 3) 用药提醒
+    _build_medication_reminders(db, today, out)
 
     # 4) 健康复查（result 为 NULL 的“未结案”记录也必须纳入，
     #    注意 SQL 三值逻辑：NULL != 'recovered' 结果为 NULL 会被 WHERE 过滤掉）
@@ -278,6 +216,113 @@ def _det_label(code: str) -> str:
 
 def _result_label(code: Optional[str]) -> str:
     return {"recovered": "已康复", "ongoing": "治疗中", "observed": "观察中"}.get(code, "未结案")
+
+
+# ---------- 用药疗程提醒 ----------
+def _build_medication_reminders(db: Session, today: date, out: List[dict]) -> None:
+    """逐次待给药/逾期、漏用待评估、休药期（按牛聚合，含旧零散用药）"""
+    from . import course_services as cs
+
+    # 3a) 疗程：逐次待给药（含延期）与漏用待评估
+    courses = db.query(models.TreatmentCourse).all()
+    for c in courses:
+        cow = db.get(models.Cow, c.cow_id)
+        if not cow or cow.status == "sold":
+            continue
+        active_line_ids = {ln.id for ln in c.drug_lines if ln.status == "active"}
+        line_names = {ln.id: ln.drug_name for ln in c.drug_lines}
+        due_doses, missed = [], []
+        for d in c.doses:
+            if d.status == models.DOSE_MISSED:
+                missed.append(d)
+            elif d.status in (models.DOSE_PLANNED, models.DOSE_DELAYED) \
+                    and d.course_drug_id in active_line_ids:
+                due = d.delayed_to if d.status == models.DOSE_DELAYED else d.planned_date
+                if due <= today + timedelta(days=1):
+                    due_doses.append((due, d))
+        due_doses.sort(key=lambda x: x[0])
+        for due, d in due_doses[:3]:
+            delta = (due - today).days
+            sess = cs.SESSION_LABEL.get(d.planned_time, "")
+            shifted = d.status == models.DOSE_DELAYED
+            out.append({
+                "type": "medication_dose",
+                "level": "danger" if delta <= 0 else "warning",
+                "cow_id": cow.id,
+                "cow_tag": cow.ear_tag,
+                "title": f"{cow_label(cow)} 疗程待给药·{line_names.get(d.course_drug_id, '')}",
+                "detail": f"「{c.title}」第 {d.dose_no} 次（{sess}）"
+                          f"计划 {d.planned_date}"
+                          + (f"，已延期至 {d.delayed_to}" if shifted else "")
+                          + (f"，原因：{d.reason}" if shifted and d.reason else "")
+                          + (f"，剂量 {d.planned_dose}" if d.planned_dose else ""),
+                "due_date": str(due),
+                "days_overdue": max(0, -delta),
+                "course_id": c.id,
+            })
+        # 漏用：当天未执行的计划在次日仍未处理（漏用/补做）时提示评估，保留 5 天
+        for d in missed:
+            age = (today - d.planned_date).days
+            if 0 <= age <= 5:
+                out.append({
+                    "type": "medication_missed",
+                    "level": "warning",
+                    "cow_id": cow.id,
+                    "cow_tag": cow.ear_tag,
+                    "title": f"{cow_label(cow)} 有漏用·{line_names.get(d.course_drug_id, '')}",
+                    "detail": f"「{c.title}」第 {d.dose_no} 次（计划 {d.planned_date}）"
+                              f"已记漏用：{d.reason or '原因未详'}，交班时确认是否补做/调整方案",
+                    "due_date": str(d.planned_date),
+                    "days_overdue": age,
+                    "course_id": c.id,
+                })
+
+    # 3b) 休药期：按牛聚合成一条（窗口来自实际给药，未执行计划不算）
+    windows = cs.all_withdrawal_windows(
+        db,
+        [cow.id for cow in db.query(models.Cow).all() if cow.status != "sold"],
+        today, today,
+    )
+    for cow in db.query(models.Cow).all():
+        if cow.status == "sold":
+            continue
+        wins = windows.get(cow.id)
+        if not wins:
+            continue
+        win = wins[0]
+        left = (win["end"] - today).days
+        names = "、".join(sorted({w["drug_name"] for w in wins}))
+        out.append({
+            "type": "withdrawal",
+            "level": "danger" if left == 0 else "warning",
+            "cow_id": cow.id,
+            "cow_tag": cow.ear_tag,
+            "title": f"{cow_label(cow)} 休药期内·鲜奶须废弃",
+            "detail": f"{names} 休药期至 {win['end']}"
+                      f"（剩余 {left + 1} 个挤奶日），该牛牛奶不可混入大罐",
+            "due_date": str(win["end"] + timedelta(days=1)),
+            "days_overdue": 0,
+        })
+
+    # 3c) 旧零散用药记录上的“下次用药”标记（历史数据仍可提醒；新流程请建疗程）
+    for m in db.query(models.Medication).all():
+        cow = db.get(models.Cow, m.cow_id)
+        if not cow or cow.status == "sold":
+            continue
+        if m.next_dose_date and not m.treated:
+            delta = (m.next_dose_date - today).days
+            if -3 <= delta <= 3:
+                out.append({
+                    "type": "medication_dose",
+                    "level": "danger" if delta <= 0 else "warning",
+                    "cow_id": cow.id,
+                    "cow_tag": cow.ear_tag,
+                    "title": f"{cow_label(cow)} 待续用药（零散记录）",
+                    "detail": f"{m.drug_name}（{m.dose or ''}）下次用药日 "
+                              f"{m.next_dose_date}，{m.reason or ''}",
+                    "due_date": str(m.next_dose_date),
+                    "days_overdue": max(0, -delta),
+                })
 
 
 # ---------- 奶量异常发现 ----------

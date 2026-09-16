@@ -302,6 +302,39 @@ table.data .num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .tab.active { color: var(--green-700); border-bottom-color: var(--green-600); }
 
+/* ---------- 用药疗程 ---------- */
+.course-drug-box {
+  border: 1px solid var(--gray-200);
+  border-radius: 10px;
+  padding: 14px 16px 4px;
+  margin-bottom: 14px;
+  background: var(--green-50);
+}
+.course-line-box {
+  border: 1px solid var(--gray-200);
+  border-radius: 10px;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+.course-line-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  background: var(--gray-100);
+}
+.event-list { display: flex; flex-direction: column; gap: 0; max-height: 55vh; overflow-y: auto; }
+.event-item {
+  display: flex;
+  gap: 12px;
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--gray-100);
+}
+.event-ico { font-size: 18px; width: 26px; text-align: center; flex-shrink: 0; }
+.event-meta { font-size: 11.5px; color: var(--gray-500); margin-top: 2px; }
+.modal-mask.submask { z-index: 70; padding-top: 60px; background: rgba(15,35,20,.35); }
+
 /* ---------- 迷你折线(SVG) ---------- */
 .spark { width: 100%; height: 150px; }
 

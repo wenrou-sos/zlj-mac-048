@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from . import models, schemas, services
+from . import course_services
 from .database import Base, engine, get_db
 from .seed import init_db
 
@@ -151,6 +152,11 @@ def cow_detail(cow_id: int, db: Session) -> dict:
         db.query(models.EstrusRecord).filter_by(cow_id=cow_id)
         .order_by(models.EstrusRecord.date.desc()).limit(20).all()
     )
+    courses = (
+        db.query(models.TreatmentCourse).filter_by(cow_id=cow_id)
+        .order_by(models.TreatmentCourse.start_date.desc(),
+                  models.TreatmentCourse.id.desc()).all()
+    )
     wd = services.check_withdrawal(db, cow_id, today)
     # 近7天每日产奶量（含废弃标记）
     trend = []
@@ -192,6 +198,7 @@ def cow_detail(cow_id: int, db: Session) -> dict:
             "semen": e.semen, "technician": e.technician, "result": e.result,
             "result_date": str(e.result_date) if e.result_date else None, "note": e.note,
         } for e in estruses],
+        "courses": [course_services.course_to_dict(c, today) for c in courses],
         "yield_trend": trend,
     }
 
@@ -223,38 +230,24 @@ def list_milkings(
 
 
 def annotate_milkings(rows: list, db: Session) -> list:
-    """批量补充牛只与休药期标注，避免逐行 N+1 查询"""
+    """批量补充牛只与休药期标注（旧零散用药 + 疗程实际给药），避免逐行 N+1 查询"""
+    from . import course_services as cs
     if not rows:
         return []
     cow_ids = {r.cow_id for r in rows}
     cows = {c.id: c for c in db.query(models.Cow).filter(models.Cow.id.in_(cow_ids)).all()}
 
     min_d, max_d = min(r.date for r in rows), max(r.date for r in rows)
-    meds = (
-        db.query(models.Medication)
-        .filter(
-            models.Medication.cow_id.in_(cow_ids),
-            models.Medication.withdrawal_days > 0,
-            models.Medication.date <= max_d,
-            models.Medication.withdrawal_end >= min_d,
-        )
-        .order_by(models.Medication.withdrawal_end.desc())
-        .all()
-    )
-    # (cow_id) -> 与本批记录日期范围相交的用药区间
-    by_cow: dict = {}
-    for m in meds:
-        by_cow.setdefault(m.cow_id, []).append(m)
+    windows = cs.all_withdrawal_windows(db, list(cow_ids), min_d, max_d)
 
     out = []
     for r in rows:
         cow = cows.get(r.cow_id)
-        med = next(
-            (m for m in by_cow.get(r.cow_id, [])
-             if m.date <= r.date <= m.withdrawal_end),
+        win = next(
+            (w for w in windows.get(r.cow_id, []) if w["start"] <= r.date <= w["end"]),
             None,
         )
-        in_w = med is not None
+        in_w = win is not None
         out.append({
             "id": r.id, "cow_id": r.cow_id, "date": str(r.date), "session": r.session,
             "session_label": SESSION_LABEL.get(r.session, r.session),
@@ -263,7 +256,7 @@ def annotate_milkings(rows: list, db: Session) -> list:
             "cow_ear_tag": cow.ear_tag if cow else None,
             "cow_name": cow.name if cow else None,
             "in_withdrawal": in_w,
-            "withdrawal_until": str(med.withdrawal_end) if med else None,
+            "withdrawal_until": str(win["end"]) if win else None,
             "violation": bool(in_w and not r.discarded),
         })
     return out
@@ -281,13 +274,11 @@ def milking_check(payload: dict, db: Session = Depends(get_db)):
     chk = services.check_withdrawal(db, cid, on)
     if not chk["in_withdrawal"]:
         return {"in_withdrawal": False, "message": "该牛当日不在休药期内，可正常挤奶"}
-    med = chk["medication"]
     return {
         "in_withdrawal": True,
         "withdrawal_end": str(chk["withdrawal_end"]),
         "drug_name": chk["drug_name"],
         "message": chk["message"],
-        "medication_id": med.id,
     }
 
 
@@ -596,15 +587,7 @@ def dashboard(db: Session = Depends(get_db)):
         .filter(services.withdrawal_violation_clause())
         .count()
     )
-    cows_in_withdrawal = (
-        db.query(models.Medication.cow_id)
-        .filter(
-            models.Medication.withdrawal_days > 0,
-            models.Medication.date <= today,
-            models.Medication.withdrawal_end >= today,
-        )
-        .distinct().count()
-    )
+    cows_in_withdrawal = len(course_services.cows_in_withdrawal(db, today))
 
     return {
         "today": str(today),
@@ -620,6 +603,144 @@ def dashboard(db: Session = Depends(get_db)):
         "violation_count": violation_count,
         "cows_in_withdrawal": cows_in_withdrawal,
     }
+
+
+# ---------------- 用药疗程 ----------------
+def _get_course_or_404(course_id: int, db: Session) -> models.TreatmentCourse:
+    c = db.get(models.TreatmentCourse, course_id)
+    if not c:
+        raise HTTPException(404, "未找到该疗程")
+    return c
+
+
+@app.get("/api/courses")
+def list_courses(cow_id: Optional[int] = None, status: Optional[str] = None,
+                 db: Session = Depends(get_db)):
+    query = db.query(models.TreatmentCourse)
+    if cow_id:
+        query = query.filter_by(cow_id=cow_id)
+    if status:
+        if status not in ("active", "ended"):
+            raise HTTPException(400, "非法状态")
+        query = query.filter(models.TreatmentCourse.status == status)
+    rows = query.order_by(
+        models.TreatmentCourse.status.asc(),
+        models.TreatmentCourse.start_date.desc(),
+        models.TreatmentCourse.id.desc(),
+    ).limit(300).all()
+    cows = {c.id: c for c in db.query(models.Cow).all()}
+    today = date.today()
+    out = []
+    for c in rows:
+        d = course_services.course_to_dict(c, today)
+        cow = cows.get(c.cow_id)
+        d["cow_ear_tag"] = cow.ear_tag if cow else None
+        d["cow_name"] = cow.name if cow else None
+        out.append(d)
+    return out
+
+
+@app.post("/api/courses", status_code=201)
+def create_course(payload: schemas.CourseCreate, db: Session = Depends(get_db)):
+    c = course_services.create_course(db, payload)
+    return course_services.course_to_dict(c, date.today())
+
+
+@app.get("/api/courses/{course_id}")
+def get_course(course_id: int, db: Session = Depends(get_db)):
+    c = _get_course_or_404(course_id, db)
+    cow = db.get(models.Cow, c.cow_id)
+    d = course_services.course_to_dict(c, date.today())
+    d["cow_ear_tag"] = cow.ear_tag if cow else None
+    d["cow_name"] = cow.name if cow else None
+    return d
+
+
+@app.patch("/api/courses/{course_id}/note")
+def patch_course_note(course_id: int, payload: schemas.CourseNote,
+                      db: Session = Depends(get_db)):
+    c = _get_course_or_404(course_id, db)
+    c = course_services.update_note(db, c, payload.note)
+    return course_services.course_to_dict(c, date.today())
+
+
+@app.post("/api/courses/{course_id}/end")
+def end_course(course_id: int, payload: schemas.CourseEnd, db: Session = Depends(get_db)):
+    c = _get_course_or_404(course_id, db)
+    c = course_services.end_course(db, c, payload)
+    return course_services.course_to_dict(c, date.today())
+
+
+@app.post("/api/courses/{course_id}/reopen")
+def reopen_course(course_id: int, db: Session = Depends(get_db)):
+    c = _get_course_or_404(course_id, db)
+    c = course_services.reopen_course(db, c)
+    return course_services.course_to_dict(c, date.today())
+
+
+@app.post("/api/courses/{course_id}/drugs", status_code=201)
+def add_course_drug(course_id: int, payload: schemas.AddDrugPayload,
+                    db: Session = Depends(get_db)):
+    c = _get_course_or_404(course_id, db)
+    c = course_services.add_drug_line(db, c, payload)
+    return course_services.course_to_dict(c, date.today())
+
+
+@app.post("/api/courses/drugs/{line_id}/stop")
+def stop_course_drug(line_id: int, payload: schemas.LineChangePayload,
+                     db: Session = Depends(get_db)):
+    line = db.get(models.CourseDrug, line_id)
+    if not line:
+        raise HTTPException(404, "未找到该用药行")
+    c = _get_course_or_404(line.course_id, db)
+    c = course_services.stop_line(db, c, line, payload.reason)
+    return course_services.course_to_dict(c, date.today())
+
+
+def _dose_response(d: models.CourseDose, db: Session):
+    c = _get_course_or_404(d.course_id, db)
+    return course_services.course_to_dict(c, date.today())
+
+
+@app.post("/api/courses/doses/{dose_id}/administer")
+def administer_dose(dose_id: int, payload: schemas.AdministerPayload,
+                    db: Session = Depends(get_db)):
+    d = course_services.administer_dose(db, dose_id, payload)
+    return _dose_response(d, db)
+
+
+@app.post("/api/courses/doses/{dose_id}/miss")
+def miss_dose(dose_id: int, payload: schemas.DoseSkipPayload,
+              db: Session = Depends(get_db)):
+    d = course_services.mark_dose(db, dose_id, models.DOSE_MISSED, payload)
+    return _dose_response(d, db)
+
+
+@app.post("/api/courses/doses/{dose_id}/cancel")
+def cancel_dose(dose_id: int, payload: schemas.DoseSkipPayload,
+                db: Session = Depends(get_db)):
+    d = course_services.mark_dose(db, dose_id, models.DOSE_CANCELLED, payload)
+    return _dose_response(d, db)
+
+
+@app.post("/api/courses/doses/{dose_id}/delay")
+def delay_dose(dose_id: int, payload: schemas.DoseDelayPayload,
+               db: Session = Depends(get_db)):
+    d = course_services.delay_dose(db, dose_id, payload)
+    return _dose_response(d, db)
+
+
+@app.post("/api/courses/doses/{dose_id}/reset")
+def reset_dose(dose_id: int, db: Session = Depends(get_db)):
+    d = course_services.reset_dose(db, dose_id)
+    return _dose_response(d, db)
+
+
+@app.delete("/api/courses/{course_id}", status_code=204)
+def delete_course(course_id: int, db: Session = Depends(get_db)):
+    c = _get_course_or_404(course_id, db)
+    db.delete(c)
+    db.commit()
 
 
 # ---------------- 静态前端 ----------------
