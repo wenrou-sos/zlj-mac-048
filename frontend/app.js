@@ -1243,11 +1243,17 @@ const ReproEventFormModal = {
     async function save() {
       err.value = "";
       try {
+        if (f.event_type === "pregnancy_check" && f.check_result === "pregnant"
+            && f.date_precision === "day" && !f.edd_auto && !f.expected_calving_date) {
+          err.value = "手工预产期模式必须填写预产期日期；或勾选“按配种日自动推算”。";
+          return;
+        }
         const body = { ...f };
         // 日期精度：只有 day 才传 event_date
         if (body.date_precision === "month") body.event_date = null;
-        // 预产期勾选“自动推算”时不提交具体值，交后端按配种日+280 联动；
-        // 这样只改备注不会把自动预产期锁死，之后更正配种日仍会联动
+        // 预产期归属由显式 edd_mode 决定：auto 按配种日+280 联动，manual 锁定。
+        // 只改备注不会改变归属，避免“巧合相等”误解锁手工预产期
+        body.edd_mode = body.edd_auto ? "auto" : "manual";
         if (body.edd_auto) body.expected_calving_date = null;
         delete body.edd_auto;
         if (body.date_precision !== "day") body.expected_calving_date = null;

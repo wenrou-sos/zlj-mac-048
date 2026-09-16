@@ -151,22 +151,32 @@ def compute_state(events: List[models.ReproEvent], today: date) -> dict:
                 current_insem = pregnant_insem = positive_check = None
             # recheck：维持当前阶段（已配待检或妊娠疑似），等待下次孕检
         elif t == "pregnancy_end":
-            # 只结束“发生在此终止之前”的妊娠；晚于终止日补录的当前妊娠不受影响
-            if positive_check and ev.event_date >= positive_check.event_date:
+            # 终止事件本身即声明“曾妊娠并结束”：即使缺少阳性孕检记录（漏检），
+            # 只要终止日不早于当前妊娠/待检起点，也必须结束本周期
+            anchor = (
+                positive_check.event_date if phase == "pregnant" and positive_check
+                else current_insem.event_date if current_insem
+                else None
+            )
+            if anchor is None or ev.event_date >= anchor:
                 phase = "open"
                 last_end = ev
                 current_insem = pregnant_insem = positive_check = None
-                last_estrus = None
+                last_negative = last_estrus = None
         elif t == "calving":
-            # 只关闭“此次产犊之前”的周期；产犊日之后补录的配种/孕检属于新周期
-            if positive_check and ev.event_date >= positive_check.event_date:
+            # 产犊是妊娠成立的最强证据：没有阳性孕检（漏录孕检）也要正常闭合周期。
+            # 锚点取当前妊娠确认日，或待结案配种日；早于锚点的产犊属于更早的历史归档
+            anchor = (
+                positive_check.event_date if phase == "pregnant" and positive_check
+                else current_insem.event_date if current_insem
+                else None
+            )
+            if anchor is None or ev.event_date >= anchor:
                 phase = "open"
                 last_calving = ev
                 last_end = None
                 current_insem = pregnant_insem = positive_check = None
-                last_estrus = None
-            elif not positive_check:
-                last_calving = ev
+                last_negative = last_estrus = None
 
     expected = None
     days_pregnant = None
@@ -426,30 +436,30 @@ def _field_summary(ev: models.ReproEvent) -> str:
 
 
 # ---------------------------------------------------------------- 预产期 / 提醒差异
-def _resolve_positive_check(ev: models.ReproEvent) -> Tuple[Optional[date], bool, List[str]]:
-    """
-    解析阳性孕检的预产期归属（手工校正 or 自动推算）。
-    关键：不能因前端“随表单带回未改动的预产期”就误锁为手工值——
-    只有提交值与配种日推算值不一致时才算手工校正。
-    返回 (预产期, 是否手工, 提示)
-    """
-    if ev.event_type != "pregnancy_check" or ev.check_result != "pregnant":
-        return None, False, []
+def _auto_edd_for(ev: models.ReproEvent) -> Optional[date]:
     insem = ev.linked_event if ev.linked_event_id else None
-    auto_edd = None
     if insem and insem.event_type == "insemination" and insem.event_date:
-        auto_edd = insem.event_date + timedelta(days=GESTATION_DAYS)
-    submitted = ev.expected_calving_date
-    if not submitted:
-        if auto_edd:
-            return auto_edd, False, [
-                f"未手工指定预产期，已按配种日 +{GESTATION_DAYS} 天推算为 "
-                f"{auto_edd}，可在编辑中校正"]
-        return None, False, []
-    if auto_edd and submitted == auto_edd:
-        # 与自动推算一致（常见于编辑时只改备注、表单带回原值）→ 不锁手工
-        return submitted, False, []
-    return submitted, True, []
+        return insem.event_date + timedelta(days=GESTATION_DAYS)
+    return None
+
+
+def _resolve_edd(ev: models.ReproEvent, mode: str) -> Tuple[Optional[date], bool, List[str]]:
+    """
+    按显式 edd_mode 决定阳性孕检预产期归属，绝不靠“提交值==推算值”推断：
+    - mode='manual'：必须提供预产期并锁定，更正配种日不联动；
+    - mode='auto'  ：按关联配种日+280 重算（无论提交值是否恰好等于推算值）。
+    """
+    auto = _auto_edd_for(ev)
+    if mode == "manual":
+        if not ev.expected_calving_date:
+            raise HTTPException(400, "手工预产期模式必须填写预产期日期")
+        return ev.expected_calving_date, True, []
+    # auto
+    hints = []
+    if auto:
+        hints.append(f"预产期按配种日 +{GESTATION_DAYS} 天自动推算为 {auto}，"
+                     f"更正配种日期会同步联动；如需固定请改为手工预产期")
+    return auto, False, hints
 
 
 def _cow_repro_reminders(db: Session, cow_id: int, today: date) -> List[dict]:
@@ -533,8 +543,11 @@ def create_event(db: Session, payload: schemas.ReproEventCreate, today: date) ->
     if ev.linked_event and ev.linked_event.cow_id != cow.id:
         raise HTTPException(400, "关联事件必须属于同一头牛")
     if ev.event_type == "pregnancy_check" and ev.check_result == "pregnant":
-        ev.expected_calving_date, ev.edd_manual, edd_hints = _resolve_positive_check(ev)
+        ev.expected_calving_date, ev.edd_manual, edd_hints = _resolve_edd(
+            ev, payload.edd_mode)
         warnings += edd_hints
+    elif ev.event_type == "pregnancy_check":
+        ev.edd_manual = False
 
     impacts: List[str] = []
     # 胎次推进（仅在明确勾选中发生，可逆：作废时回退）
@@ -585,6 +598,7 @@ def update_event(db: Session, ev_id: int, payload: schemas.ReproEventUpdate,
     rem_before = _cow_repro_reminders(db, cow.id, today)
     old_summary = f"{_date_text(ev)}：{_field_summary(ev)}"
     old_parity_flag = ev.updates_parity
+    old_check_result = ev.check_result
     warnings: List[str] = []
 
     if "date_precision" in data or "event_date" in data or \
@@ -603,7 +617,7 @@ def update_event(db: Session, ev_id: int, payload: schemas.ReproEventUpdate,
               "calf_status", "updates_parity", "linked_event_id", "note"):
         if k in data:
             setattr(ev, k, data[k])
-    # 预产期单独经解析函数处理（见下），避免“表单带回未改动的值”被误判为手工锁定
+    # 预产期归属由显式 edd_mode 决定（不靠提交值与推算值是否相等推断）
     if "expected_calving_date" in data:
         ev.expected_calving_date = data["expected_calving_date"]
     _validate_type_fields(ev.event_type, {
@@ -612,10 +626,22 @@ def update_event(db: Session, ev_id: int, payload: schemas.ReproEventUpdate,
         raise HTTPException(400, "关联事件必须属于同一头牛")
     if ev.event_type == "pregnancy_check":
         if ev.check_result == "pregnant":
-            ev.expected_calving_date, ev.edd_manual, edd_hints = _resolve_positive_check(ev)
+            if data.get("edd_mode"):
+                mode = data["edd_mode"]
+            elif old_check_result != "pregnant":
+                # 本次由阴性/疑似改成阳性且未显式给模式：默认按配种日自动推算
+                mode = "auto"
+            else:
+                # 只改备注等无关字段：保持原归属不变
+                mode = "manual" if ev.edd_manual else "auto"
+            ev.expected_calving_date, ev.edd_manual, edd_hints = _resolve_edd(ev, mode)
+            # 只改备注等无关字段时不重复弹“自动推算”提示；仅在本次显式选择 auto
+            # 或由阴性/疑似转为阳性时提示
+            if not data.get("edd_mode") and old_check_result == "pregnant":
+                edd_hints = []
             warnings += edd_hints
         else:
-            # 改为阴性/疑似后，该孕检上携带的预产期只作历史字段，不参与状态计算
+            # 改为阴性/疑似后，该孕检上的预产期只作历史字段，不参与状态计算
             ev.edd_manual = False
 
     # 更正配种日期：级联重算所有“自动推算”的阳性孕检预产期（手工校正的不动）

@@ -236,6 +236,8 @@ class ReproEventCreate(BaseModel):
     technician: Optional[str] = Field(None, max_length=32)
     check_result: Optional[str] = Field(None, pattern=_CHECK_RESULTS)
     expected_calving_date: Optional[date] = None
+    edd_mode: str = Field("auto", pattern="^(auto|manual)$",
+                          description="预产期来源：auto 按配种日+280自动联动，manual 手工锁定")
     end_reason: Optional[str] = Field(None, pattern=_END_REASONS)
     calf_count: Optional[int] = Field(None, ge=0, le=5)
     calf_sex: Optional[str] = Field(None, pattern=_CALF_SEX)
@@ -257,6 +259,7 @@ class ReproEventUpdate(BaseModel):
     technician: Optional[str] = Field(None, max_length=32)
     check_result: Optional[str] = Field(None, pattern=_CHECK_RESULTS)
     expected_calving_date: Optional[date] = None
+    edd_mode: Optional[str] = Field(None, pattern="^(auto|manual)$")
     end_reason: Optional[str] = Field(None, pattern=_END_REASONS)
     calf_count: Optional[int] = Field(None, ge=0, le=5)
     calf_sex: Optional[str] = Field(None, pattern=_CALF_SEX)
