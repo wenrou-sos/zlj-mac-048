@@ -15,6 +15,7 @@
 | 健康情况 | 体检/诊断/免疫、体温、严重程度、复查日、结案状态 |
 | 用药管理 | 药品目录与默认休药期；选药自动套用休药期，可覆盖；下次用药提醒 |
 | 发情配种 | 发情发现方式/强度、冻精、配种员、孕检结果回填 |
+| 牛舍转群 | 牛舍容量与用途、按生效时间批量转群、冲突预检、临时隔离/延期/取消、居住历史与补录 |
 
 ### 🔔 智能提醒（`/api/reminders`）
 
@@ -41,6 +42,23 @@
 - 录入挤奶前可调用 `POST /api/milkings/check-withdrawal` 预检（前端选牛即自动校验）
 - 休药期内登记挤奶：**自动标记为废弃奶**并给出警告，从根本上杜绝违规混装
 - 挤奶列表/仪表盘可筛查历史**违规混装**记录（休药期内却未废弃），一键补标废弃
+
+### 🔀 牛舍容量与批量转群（`/api/transfers`、`/api/pens`）
+
+- **牛舍档案**：维护栏位名称、用途（泌乳/干奶/产房/隔离/其他）、容量、启停；任意日期的在栏数/剩余位实时可查
+- **居住日历 `stays`**：半开区间 `[迁入日, 迁出日)`，迁入迁出全程留痕；同一头牛时间区间不允许重叠，
+  **应用层校验 + SQLite 触发器双重兜底**
+- **批量安排**：选择一批牛、目标栏与**生效日期**，保存前自动预检（容量推演、牛只重复安排、用途不符、停用栏），
+  可先存为「待确认」；确认时在**单个事务**内裁剪居住历史、更新牛只去向（`cows.group`）与占栏量
+- **先确认者赢**：两个安排争用最后栏位时都能创建（预检标红冲突），但只有先确认的会成功，
+  后确认者被容量校验与数据库触发器拒绝，不会都成功
+- **临时隔离**：指定隔离栏与计划返回日期/返回栏，自动生成「原栏 → 隔离 → 返回」三段居住区间；
+  支持**提前回迁**
+- **延期 / 取消**：待确认安排可自由改期；已确认但未生效的安排延期会重算容量，取消会回收已预占区间
+- **历史补录** `POST /api/stays/backfill`：补录迁入/迁出日期；与已有居住区间重叠（同一头牛同时住两栏）
+  一律拒绝；同栏相邻记录自动归并
+- **旧数据对照归并**：原 `cows.group` 文本自动按关键字推断用途建栏建账，也可用
+  `POST /api/pens/reconcile` 手动触发
 
 ## 🚀 快速开始
 
@@ -79,11 +97,12 @@ python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 ```
 dairy-farm/
 ├── backend/
-│   ├── main.py        # FastAPI 路由（CRUD + 仪表盘 + 校验）
-│   ├── models.py      # SQLAlchemy 模型
+│   ├── main.py        # FastAPI 路由（CRUD + 仪表盘 + 校验 + 牛舍转群）
+│   ├── models.py      # SQLAlchemy 模型（含居住重叠/容量 SQLite 触发器）
 │   ├── schemas.py     # Pydantic 模型
 │   ├── services.py    # 提醒引擎 / 异常发现 / 休药期规则
-│   ├── seed.py        # 建库与样例数据
+│   ├── housing.py     # 牛舍容量 / 转群预检确认 / 隔离延期取消 / 历史补录
+│   ├── seed.py        # 建库、样例数据与旧文本牛舍归并迁移
 │   ├── database.py    # 引擎与会话
 │   └── data/dairy.db  # SQLite（运行后生成）
 ├── frontend/
@@ -109,5 +128,10 @@ dairy-farm/
 | GET/POST | `/api/drugs` | 药品目录 |
 | GET/POST/PATCH/DELETE | `/api/medications[...]` | 用药记录 |
 | GET/POST/PATCH/DELETE | `/api/estruses[...]` | 发情/配种记录 |
+| GET/POST/PATCH | `/api/pens[...]` | 牛舍容量与用途；`POST /api/pens/reconcile` 归并旧文本 |
+| GET | `/api/pens?on_date=YYYY-MM-DD` | 指定日期各栏占用（含已确认未来安排） |
+| GET/POST | `/api/transfers` | 转群安排（`POST /api/transfers/preview` 不落库预检） |
+| POST | `/api/transfers/{id}/confirm|postpone|cancel|release` | 确认/延期/取消/隔离回迁 |
+| GET/POST | `/api/stays`、`/api/stays/backfill` | 居住历史与历史补录（重叠拒绝） |
 
 > 说明：系统为单机演示应用，未做登录鉴权；生产部署请置于内网并自行增加认证与 HTTPS。

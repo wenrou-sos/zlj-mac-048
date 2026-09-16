@@ -267,8 +267,42 @@ def build_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
             "days_overdue": max(0, dim - 60),
         })
 
+    # 7) 待确认转群安排（生效日临近/已逾期）
+    out.extend(build_transfer_reminders(db, today))
+
     level_rank = {"danger": 0, "warning": 1, "info": 2}
     out.sort(key=lambda r: (level_rank.get(r["level"], 9), r.get("days_overdue", 0) * -1))
+    return out
+
+
+def build_transfer_reminders(db: Session, today: Optional[date] = None) -> List[dict]:
+    """待确认转群安排：已到/超过生效日提醒执行确认；隔离在档头数单独提示"""
+    from . import models as m
+    today = today or date.today()
+    out: List[dict] = []
+    plans = (
+        db.query(m.TransferPlan)
+        .filter(m.TransferPlan.status == "draft")
+        .order_by(m.TransferPlan.effective_date.asc())
+        .all()
+    )
+    for p in plans:
+        delta = (today - p.effective_date).days
+        if delta < -7:
+            continue
+        first_cow = p.items[0].cow if p.items else None
+        out.append({
+            "type": "transfer_due",
+            "level": "danger" if delta >= 0 else "warning",
+            "cow_id": first_cow.id if first_cow else None,
+            "cow_tag": first_cow.ear_tag if first_cow else None,
+            "title": f"转群安排「{p.title}」待确认（{len(p.items)} 头）",
+            "detail": (f"生效日 {p.effective_date}，已逾期 {delta} 天，请确认执行或延期/取消"
+                       if delta >= 0 else
+                       f"将于 {p.effective_date} 生效（{ -delta } 天后），可提前确认或检查冲突"),
+            "due_date": str(p.effective_date),
+            "days_overdue": max(0, delta),
+        })
     return out
 
 

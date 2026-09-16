@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from . import models, schemas, services
+from . import models, schemas, services, housing
 from .database import Base, engine, get_db
 from .seed import init_db
 
@@ -92,11 +92,37 @@ def create_cow(payload: schemas.CowCreate, db: Session = Depends(get_db)):
     if payload.expected_calving_date and payload.calving_date and \
             payload.expected_calving_date <= payload.calving_date:
         raise HTTPException(400, "预产期应晚于产犊日期")
-    cow = models.Cow(**payload.model_dump())
+    data = payload.model_dump()
+    pen = _resolve_group_to_pen(db, data.get("group"), payload.status) if data.get("group") else None
+    cow = models.Cow(**data)
     db.add(cow)
+    db.flush()
+    if pen and cow.status != "sold":
+        db.add(models.Stay(cow_id=cow.id, pen_id=pen.id, start_date=date.today(),
+                           end_date=None, source="manual", note="建档入栏"))
     db.commit()
     db.refresh(cow)
     return cow
+
+
+def _resolve_group_to_pen(db: Session, name: Optional[str], status: str) -> Optional[models.Pen]:
+    """把牛舍文本解析成 Pen：同名直接用，否则按用途关键字新建。"""
+    if not name:
+        return None
+    pen = db.query(models.Pen).filter_by(name=name).first()
+    if pen:
+        return pen
+    purpose = "other"
+    for kw, code in housing.PURPOSE_BY_GROUP_KEYWORD.items():
+        if kw in name:
+            purpose = code
+            break
+    pen = models.Pen(name=name, purpose=purpose,
+                     capacity=0 if status == "sold" else 10,
+                     active=status != "sold", note="录入牛只时自动归并")
+    db.add(pen)
+    db.flush()
+    return pen
 
 
 @app.get("/api/cows/{cow_id}")
@@ -115,6 +141,22 @@ def update_cow(cow_id: int, payload: schemas.CowUpdate, db: Session = Depends(ge
     data = payload.model_dump(exclude_unset=True)
     if "status" in data and data["status"] not in VALID_STATUS:
         raise HTTPException(400, "非法状态")
+    # 旧表单直接改“牛舍”文本：归并到栏位并办理当日转栏（立即生效的手工调整）
+    if "group" in data and (data["group"] or None) != (cow.group or None):
+        new_text = data["group"]
+        if new_text:
+            pen = _resolve_group_to_pen(db, new_text, data.get("status", cow.status))
+            today = date.today()
+            cur = housing.open_stay(db, cow_id)
+            if not cur or cur.pen_id != pen.id:
+                if cur:
+                    cur.end_date = today
+                db.add(models.Stay(cow_id=cow_id, pen_id=pen.id, start_date=today,
+                                   end_date=None, source="manual", note="档案中手工调整牛舍"))
+        else:
+            cur = housing.open_stay(db, cow_id)
+            if cur:
+                cur.end_date = today
     for k, v in data.items():
         setattr(cow, k, v)
     db.commit()
@@ -151,6 +193,11 @@ def cow_detail(cow_id: int, db: Session) -> dict:
         db.query(models.EstrusRecord).filter_by(cow_id=cow_id)
         .order_by(models.EstrusRecord.date.desc()).limit(20).all()
     )
+    stays = (
+        db.query(models.Stay).filter_by(cow_id=cow_id)
+        .order_by(models.Stay.start_date.desc()).limit(50).all()
+    )
+    current_pen = housing.pen_at(db, cow_id, today)
     wd = services.check_withdrawal(db, cow_id, today)
     # 近7天每日产奶量（含废弃标记）
     trend = []
@@ -167,6 +214,11 @@ def cow_detail(cow_id: int, db: Session) -> dict:
         "birth_date": str(cow.birth_date), "parity": cow.parity, "status": cow.status,
         "status_label": services.STATUS_LABEL.get(cow.status, cow.status),
         "group": cow.group,
+        "current_pen": {"id": current_pen.id, "name": current_pen.name,
+                        "purpose": current_pen.purpose,
+                        "purpose_label": housing.PURPOSE_LABEL.get(
+                            current_pen.purpose, current_pen.purpose)} if current_pen else None,
+        "stays": [housing.stay_to_dict(s, db) for s in stays],
         "calving_date": str(cow.calving_date) if cow.calving_date else None,
         "expected_calving_date": str(cow.expected_calving_date) if cow.expected_calving_date else None,
         "days_in_milk": (today - cow.calving_date).days if cow.calving_date else None,
@@ -606,6 +658,30 @@ def dashboard(db: Session = Depends(get_db)):
         .distinct().count()
     )
 
+    # 牛舍占用与转群安排概览
+    pens = db.query(models.Pen).filter(models.Pen.active.is_(True)).all()
+    occ = housing.occupancy_on(db, today)
+    pen_rows = []
+    over_pens = 0
+    isolation_now = 0
+    for p in pens:
+        n = occ.get(p.id, {"occupied": 0})["occupied"]
+        pen_rows.append({"id": p.id, "name": p.name, "capacity": p.capacity,
+                         "occupied": n, "free": max(0, p.capacity - n),
+                         "purpose": p.purpose})
+        if n > p.capacity:
+            over_pens += 1
+        if p.purpose == "isolation":
+            isolation_now += n
+    draft_plans = db.query(models.TransferPlan).filter(
+        models.TransferPlan.status == "draft",
+        models.TransferPlan.effective_date >= today,
+    ).count()
+    due_plans = db.query(models.TransferPlan).filter(
+        models.TransferPlan.status == "draft",
+        models.TransferPlan.effective_date <= today,
+    ).count()
+
     return {
         "today": str(today),
         "cows_total": len(cows),
@@ -619,7 +695,192 @@ def dashboard(db: Session = Depends(get_db)):
         "anomaly_count": len(anomalies),
         "violation_count": violation_count,
         "cows_in_withdrawal": cows_in_withdrawal,
+        "pens": sorted(pen_rows, key=lambda r: (r["occupied"] >= r["capacity"], r["name"])),
+        "pens_over_capacity": over_pens,
+        "isolation_now": isolation_now,
+        "draft_transfers": draft_plans,
+        "draft_transfers_due": due_plans,
     }
+
+
+# ---------------- 牛舍 ----------------
+@app.get("/api/pens")
+def list_pens(on_date: Optional[date] = None, db: Session = Depends(get_db)):
+    """牛舍清单与实时占用（可按日期查看，含已确认的未来安排）"""
+    on_date = on_date or date.today()
+    pens = db.query(models.Pen).order_by(models.Pen.active.desc(), models.Pen.name.asc()).all()
+    return [housing.pen_dict(p, db, on_date) for p in pens]
+
+
+@app.post("/api/pens/reconcile")
+def reconcile_pens(db: Session = Depends(get_db)):
+    """把旧的 cows.group 自由文本对照归并为栏位与居住建账（可重复执行，幂等）"""
+    return housing.reconcile_group_text(db)
+
+
+@app.post("/api/pens", status_code=201)
+def create_pen(payload: schemas.PenCreate, db: Session = Depends(get_db)):
+    if db.query(models.Pen).filter_by(name=payload.name).first():
+        raise HTTPException(409, "同名牛舍已存在")
+    p = models.Pen(**payload.model_dump())
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return housing.pen_dict(p, db)
+
+
+@app.patch("/api/pens/{pen_id}")
+def update_pen(pen_id: int, payload: schemas.PenUpdate, db: Session = Depends(get_db)):
+    pen = db.get(models.Pen, pen_id)
+    if not pen:
+        raise HTTPException(404, "未找到该牛舍")
+    data = payload.model_dump(exclude_unset=True)
+    if "name" in data and data["name"] != pen.name:
+        if db.query(models.Pen).filter_by(name=data["name"]).first():
+            raise HTTPException(409, "同名牛舍已存在")
+    if "capacity" in data:
+        today = date.today()
+        occ = housing.occupancy_on(db, today).get(pen.id, {"occupied": 0})["occupied"]
+        if data["capacity"] < occ:
+            raise HTTPException(400, f"当前在栏 {occ} 头，容量不能低于现住数量")
+    for k, v in data.items():
+        setattr(pen, k, v)
+    db.commit()
+    db.refresh(pen)
+    return housing.pen_dict(pen, db)
+
+
+# ---------------- 批量转群 ----------------
+def _items_payload(items) -> list:
+    return [{
+        "cow_id": i.cow_id, "to_pen_id": i.to_pen_id,
+        "from_pen_id": i.from_pen_id, "return_pen_id": i.return_pen_id,
+        "return_date": i.return_date,
+    } for i in items]
+
+
+@app.post("/api/transfers/preview")
+def preview_transfer(payload: schemas.PlanCreate, db: Session = Depends(get_db)):
+    """提前查看冲突：不落库，返回每头牛的问题与各目标栏位容量推演"""
+    return housing.analyze_moves(
+        db, effective=payload.effective_date, kind=payload.kind,
+        items=_items_payload(payload.items))
+
+
+@app.get("/api/transfers")
+def list_transfers(status_filter: Optional[str] = Query(None, alias="status"),
+                   db: Session = Depends(get_db)):
+    q = db.query(models.TransferPlan)
+    if status_filter in ("draft", "confirmed", "cancelled"):
+        q = q.filter(models.TransferPlan.status == status_filter)
+    plans = q.order_by(
+        models.TransferPlan.status.asc(),
+        models.TransferPlan.effective_date.desc(),
+        models.TransferPlan.id.desc(),
+    ).all()
+    return [housing.plan_to_dict(p, db) for p in plans]
+
+
+@app.post("/api/transfers", status_code=201)
+def create_transfer(payload: schemas.PlanCreate, db: Session = Depends(get_db)):
+    try:
+        plan, analysis = housing.create_plan(
+            db, title=payload.title, effective_date=payload.effective_date,
+            kind=payload.kind, items=_items_payload(payload.items),
+            operator=payload.operator, note=payload.note,
+            auto_confirm=payload.confirm)
+    except housing.HousingError as e:
+        raise HTTPException(409, str(e))
+    result = housing.plan_to_dict(plan, db)
+    result["warnings"] = analysis["warnings"]
+    result["pen_conflicts"] = analysis["pen_conflicts"]
+    return result
+
+
+@app.get("/api/transfers/{plan_id}")
+def get_transfer(plan_id: int, db: Session = Depends(get_db)):
+    plan = db.get(models.TransferPlan, plan_id)
+    if not plan:
+        raise HTTPException(404, "未找到该转群安排")
+    return housing.plan_to_dict(plan, db)
+
+
+@app.patch("/api/transfers/{plan_id}")
+def update_transfer_meta(plan_id: int, payload: schemas.PlanPatch,
+                         db: Session = Depends(get_db)):
+    plan = db.get(models.TransferPlan, plan_id)
+    if not plan:
+        raise HTTPException(404, "未找到该转群安排")
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(plan, k, v)
+    db.commit()
+    return housing.plan_to_dict(plan, db)
+
+
+@app.post("/api/transfers/{plan_id}/confirm")
+def confirm_transfer(plan_id: int, db: Session = Depends(get_db)):
+    try:
+        plan = housing.confirm_plan(db, plan_id)
+    except housing.HousingError as e:
+        raise HTTPException(409, str(e))
+    return housing.plan_to_dict(plan, db)
+
+
+@app.post("/api/transfers/{plan_id}/postpone")
+def postpone_transfer(plan_id: int, payload: schemas.PostponePayload,
+                      db: Session = Depends(get_db)):
+    try:
+        plan = housing.postpone_plan(db, plan_id, payload.effective_date,
+                                     payload.return_date)
+    except housing.HousingError as e:
+        raise HTTPException(409, str(e))
+    return housing.plan_to_dict(plan, db)
+
+
+@app.post("/api/transfers/{plan_id}/cancel")
+def cancel_transfer(plan_id: int, payload: schemas.CancelPayload,
+                    db: Session = Depends(get_db)):
+    try:
+        plan = housing.cancel_plan(db, plan_id, payload.reason)
+    except housing.HousingError as e:
+        raise HTTPException(409, str(e))
+    return housing.plan_to_dict(plan, db)
+
+
+@app.post("/api/transfers/{plan_id}/release")
+def release_transfer(plan_id: int, payload: schemas.ReleasePayload,
+                     db: Session = Depends(get_db)):
+    """隔离牛回迁（提前结束隔离）"""
+    try:
+        plan = housing.release_isolation(db, plan_id, payload.return_date,
+                                         payload.return_pen_id)
+    except housing.HousingError as e:
+        raise HTTPException(409, str(e))
+    return housing.plan_to_dict(plan, db)
+
+
+# ---------------- 居住历史 / 补录 ----------------
+@app.get("/api/stays")
+def list_stays(cow_id: Optional[int] = None, pen_id: Optional[int] = None,
+               db: Session = Depends(get_db)):
+    q = db.query(models.Stay)
+    if cow_id:
+        q = q.filter(models.Stay.cow_id == cow_id)
+    if pen_id:
+        q = q.filter(models.Stay.pen_id == pen_id)
+    rows = q.order_by(models.Stay.start_date.desc(), models.Stay.id.desc()).limit(500).all()
+    return [housing.stay_to_dict(s, db) for s in rows]
+
+
+@app.post("/api/stays/backfill", status_code=201)
+def backfill_stay(payload: schemas.BackfillStay, db: Session = Depends(get_db)):
+    try:
+        stay = housing.backfill_stay(
+            db, cow_id=payload.cow_id, pen_id=payload.pen_id,
+            start_date=payload.start_date, end_date=payload.end_date, note=payload.note)
+    except housing.HousingError as e:
+        raise HTTPException(409, str(e))
+    return housing.stay_to_dict(stay, db)
 
 
 # ---------------- 静态前端 ----------------

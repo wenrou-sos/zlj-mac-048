@@ -39,6 +39,18 @@ const H_TYPE = { checkup: "常规体检", diagnosis: "疾病诊断", vaccination
 const SEVERITY = { mild: "轻度", moderate: "中度", severe: "重度" };
 const H_RESULT = { recovered: "已康复", ongoing: "治疗中", observed: "观察中" };
 const INSEM_RESULT = { pending: "待孕检", pregnant: "已孕", negative: "未孕", unknown: "未确认" };
+const PEN_PURPOSE = {
+  lactating: { label: "泌乳牛舍", cls: "green", ico: "🥛" },
+  dry: { label: "干奶牛舍", cls: "gray", ico: "🌾" },
+  maternity: { label: "产房/待产", cls: "blue", ico: "🐣" },
+  isolation: { label: "隔离舍", cls: "red", ico: "🚧" },
+  other: { label: "其他", cls: "gray", ico: "🏚️" },
+};
+const PLAN_STATUS = {
+  draft: { label: "待确认", cls: "amber" },
+  confirmed: { label: "已确认", cls: "green" },
+  cancelled: { label: "已取消", cls: "gray" },
+};
 
 const REMINDER_META = {
   estrus: { ico: "🔥", label: "发情配种" },
@@ -50,6 +62,7 @@ const REMINDER_META = {
   health_followup: { ico: "🏥", label: "健康复查" },
   calving: { ico: "🐣", label: "待产" },
   first_insemination: { ico: "📅", label: "产后首配" },
+  transfer_due: { ico: "🔀", label: "转群安排" },
 };
 
 /* ---------------- 全局状态 ---------------- */
@@ -66,6 +79,8 @@ const S = reactive({
   health: [],
   meds: [],
   estruses: [],
+  pens: [],
+  plans: [],
   loading: { milkings: false },
 });
 
@@ -113,6 +128,11 @@ async function switchView(v) {
     if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
     if (!S.estruses.length) loadEstrusesAll();
   }
+  if (v === "housing") {
+    loadPens().catch((e) => toast(e.message, "error"));
+    loadPlans();
+    if (!S.cows.length) loadCows().catch((e) => toast(e.message, "error"));
+  }
   if (v === "milkings" && !S.cows.length) {
     loadCows().catch((e) => toast(e.message, "error"));
   }
@@ -128,6 +148,10 @@ async function loadMilkings(q = "") {
 async function loadHealthAll() { S.health = await api("/api/health"); }
 async function loadMedsAll() { S.meds = await api("/api/medications"); }
 async function loadEstrusesAll() { S.estruses = await api("/api/estruses"); }
+async function loadPens() { S.pens = await api("/api/pens"); }
+async function loadPlans(status = "") {
+  S.plans = await api("/api/transfers" + (status ? "?status=" + status : ""));
+}
 
 /* ---------------- 柱状图 ---------------- */
 const BarChart = {
@@ -271,6 +295,33 @@ const Dashboard = {
           </div>
           <div v-if="!S.reminders.length" class="empty">暂无提醒，牛群状态良好 🌿</div>
         </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-title">🏠 牛舍占用
+        <span class="sub">今日在栏 / 容量；含已确认的未来转群安排</span>
+        <span class="spacer"></span>
+        <button class="link" @click="switchView('housing')">管理牛舍与转群 →</button>
+      </div>
+      <div class="pen-grid">
+        <div v-for="p in (S.dashboard.pens||[]).slice(0,12)" :key="p.id"
+             class="pen-chip" :class="{full:p.occupied>=p.capacity}">
+          <div class="pen-name">{{ p.name }}</div>
+          <div class="pen-num"><b :class="p.occupied>p.capacity?'txt-red':''">{{ p.occupied }}</b>/ {{ p.capacity }}</div>
+          <div class="occ-bar mini"><div class="occ-fill" :class="p.occupied>p.capacity?'over':(p.free===0?'full':'')"
+            :style="{width:Math.min(100,Math.round(p.occupied/Math.max(1,p.capacity)*100))+'%'}"></div></div>
+        </div>
+      </div>
+      <div style="margin-top:10px">
+        <span class="badge amber" v-if="S.dashboard.draft_transfers">
+          🔀 {{ S.dashboard.draft_transfers }} 个待确认转群安排
+          <span class="badge red" v-if="S.dashboard.draft_transfers_due" style="margin-left:6px">
+            {{ S.dashboard.draft_transfers_due }} 个已到生效日
+          </span>
+        </span>
+        <span class="badge red" v-if="S.dashboard.isolation_now">🚧 隔离中 {{ S.dashboard.isolation_now }} 头</span>
+        <span class="badge red" v-if="S.dashboard.pens_over_capacity">⚠️ {{ S.dashboard.pens_over_capacity }} 个栏位超栏</span>
       </div>
     </div>
 
@@ -689,7 +740,7 @@ const CowFormModal = {
         closeModal();
       } catch (e) { err.value = e.message; }
     }
-    return { f, err, save, closeModal };
+    return { f, err, save, closeModal, S, PEN_PURPOSE };
   },
   template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal">
@@ -718,7 +769,16 @@ const CowFormModal = {
           </select></div>
       </div>
       <div class="field-row">
-        <div class="field"><label>牛舍/群组</label><input class="input" v-model="f.group" placeholder="如 A栋1栏"></div>
+        <div class="field"><label>牛舍/栏位</label>
+          <input class="input" v-model="f.group" list="pen-list"
+                 placeholder="选择或输入牛舍名">
+          <datalist id="pen-list">
+            <option v-for="p in S.pens" :key="p.id" :value="p.name">
+              {{ PEN_PURPOSE[p.purpose]?.label }}（{{ p.occupied }}/{{ p.capacity }}）
+            </option>
+          </datalist>
+          <div class="hint">选择已有栏位会自动登记居住；输入新名称将自动归并建栏</div>
+        </div>
         <div class="field"><label>标定日产奶量 kg</label><input type="number" step="0.1" min="0" class="input" v-model.number="f.avg_yield_kg"></div>
       </div>
       <div class="field-row">
@@ -1131,8 +1191,7 @@ const CowDetailModal = {
       openModal({ type, rec: preset });
     }
     return { d, tab, spark, addRecord, closeModal, SESSION, H_TYPE, SEVERITY, H_RESULT, DETECTION, INSEM_RESULT, addDays };
-  },
-  template: `
+  },  template: `
   <div class="modal-mask" @click.self="closeModal"><div class="modal wide" v-if="d">
     <div class="modal-head"><h3>牛只档案详情</h3><button class="modal-close" @click="closeModal">×</button></div>
     <div class="modal-body">
@@ -1143,7 +1202,8 @@ const CowDetailModal = {
           <div class="detail-meta">
             <span class="badge green">{{ d.status_label }}</span>
             <span class="badge gray">{{ d.breed }} · {{ d.parity }}胎</span>
-            <span class="badge gray" v-if="d.group">{{ d.group }}</span>
+            <span class="badge blue" v-if="d.current_pen">🏠 {{ d.current_pen.name }}</span>
+            <span class="badge gray" v-else-if="d.group">🏠 {{ d.group }}</span>
             <span class="badge blue" v-if="d.days_in_milk != null">泌乳 {{ d.days_in_milk }} 天</span>
             <span class="badge red" v-if="d.in_withdrawal">🚫 休药期至 {{ d.withdrawal.withdrawal_end }}</span>
           </div>
@@ -1167,6 +1227,7 @@ const CowDetailModal = {
 
       <div class="tabs">
         <button class="tab" :class="{active:tab==='overview'}" @click="tab='overview'">概览</button>
+        <button class="tab" :class="{active:tab==='housing'}" @click="tab='housing'">🏠 牛舍历史</button>
         <button class="tab" :class="{active:tab==='milkings'}" @click="tab='milkings'">挤奶记录</button>
         <button class="tab" :class="{active:tab==='health'}" @click="tab='health'">健康</button>
         <button class="tab" :class="{active:tab==='meds'}" @click="tab='meds'">用药/休药</button>
@@ -1177,6 +1238,27 @@ const CowDetailModal = {
         <div class="card-title">近7天日产奶量（不含废弃）</div>
         <sparkline :points="spark"></sparkline>
         <p v-if="d.note" style="color:#6b7280;margin-top:14px">备注：{{ d.note }}</p>
+      </div>
+
+      <div v-if="tab==='housing'" class="table-wrap">
+        <div style="margin:8px 0">
+          <span class="badge blue" v-if="d.current_pen">当前所在：{{ d.current_pen.name }}</span>
+          <button class="btn btn-sm" style="margin-left:10px"
+                  @click="openModal({type:'backfillForm'})">＋ 补录居住</button>
+        </div>
+        <table class="data">
+          <thead><tr><th>迁入日</th><th>迁出日</th><th>栏位</th><th>来源</th><th>备注</th></tr></thead>
+          <tbody>
+            <tr v-for="s in d.stays" :key="s.id">
+              <td>{{ s.start_date }}</td>
+              <td>{{ s.end_date || '至今' }}</td>
+              <td><b>{{ s.pen_name }}</b></td>
+              <td><span class="badge gray">{{ {seed:'建账',transfer:'转群',history:'补录',manual:'手工'}[s.source] || s.source }}</span></td>
+              <td style="color:#6b7280">{{ s.note || '-' }}</td>
+            </tr>
+            <tr v-if="!d.stays.length"><td colspan="5" class="empty">无居住记录</td></tr>
+          </tbody>
+        </table>
       </div>
 
       <div v-if="tab==='milkings'" class="table-wrap"><table class="data">
@@ -1238,11 +1320,644 @@ const CowDetailModal = {
   </div></div>`,
 };
 
+/* ---------------- 牛舍与转群 ---------------- */
+const HousingPage = {
+  setup() {
+    const tab = ref("pens");
+    const occDate = ref(todayStr());
+    const planFilter = ref("");
+    async function reloadPens() {
+      S.pens = await api("/api/pens?on_date=" + occDate.value);
+    }
+    async function reloadPlans() {
+      await loadPlans(planFilter.value);
+    }
+    watch(tab, (t) => {
+      if (t === "plans") reloadPlans();
+      if (t === "pens") reloadPens();
+    });
+    onMounted(() => { reloadPens(); reloadPlans(); });
+
+    async function confirmPlan(p) {
+      if (!confirm(`确认执行安排「${p.title}」？\n${p.effective_date} 生效，共 ${p.items.length} 头牛。\n确认后将同步更新去向与占栏量。`)) return;
+      try {
+        await api(`/api/transfers/${p.id}/confirm`, { method: "POST" });
+        toast("转群已确认，占栏量已更新");
+        await Promise.all([reloadPlans(), reloadPens(), loadCows()]);
+      } catch (e) { toast(e.message, "error"); }
+    }
+    async function cancelPlan(p) {
+      const reason = prompt(`取消安排「${p.title}」的原因（选填）：`, "");
+      if (reason === null) return;
+      try {
+        await api(`/api/transfers/${p.id}/cancel`, { method: "POST", body: { reason } });
+        toast("安排已取消，预占栏位已释放");
+        await Promise.all([reloadPlans(), reloadPens()]);
+      } catch (e) { toast(e.message, "error"); }
+    }
+    function planCows(p) {
+      return p.items.map((i) => i.cow_tag).join("、");
+    }
+    return {
+      S, tab, occDate, planFilter, reloadPens, reloadPlans, confirmPlan, cancelPlan,
+      openModal, planCows, PEN_PURPOSE, PLAN_STATUS, todayStr,
+    };
+  },
+  template: `
+  <div>
+    <div class="card">
+      <div class="tabs">
+        <button class="tab" :class="{active:tab==='pens'}" @click="tab='pens'">🏠 牛舍栏位</button>
+        <button class="tab" :class="{active:tab==='plans'}" @click="tab='plans'">🔀 转群安排</button>
+        <button class="tab" :class="{active:tab==='history'}" @click="tab='history'">📜 居住历史/补录</button>
+      </div>
+
+      <!-- 栏位 -->
+      <div v-if="tab==='pens'">
+        <div class="toolbar">
+          <label class="input" :style="{width:'auto',display:'flex',alignItems:'center',gap:'6px',borderStyle:'dashed'}">
+            查看日期 <input type="date" class="input" style="border:none;width:140px;padding:2px"
+                  v-model="occDate" @change="reloadPens">
+            <span class="hint" v-if="occDate!==todayStr()">含该日已确认的未来安排</span>
+          </label>
+          <span class="spacer"></span>
+          <button class="btn btn-primary" @click="openModal({type:'penForm', pen:null})">＋ 新建牛舍</button>
+        </div>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>牛舍/栏位</th><th>用途</th><th class="num">容量</th><th class="num">在栏</th>
+            <th style="width:220px">占用</th><th class="num">剩余</th><th>状态</th><th>备注</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="p in S.pens" :key="p.id" :style="p.over>0?'background:#fff5f5':(!p.active?'opacity:.5':'')">
+              <td><b>{{ p.name }}</b></td>
+              <td><span class="badge" :class="PEN_PURPOSE[p.purpose]?.cls">
+                {{ PEN_PURPOSE[p.purpose]?.ico }} {{ PEN_PURPOSE[p.purpose]?.label }}</span></td>
+              <td class="num">{{ p.capacity }}</td>
+              <td class="num"><b :class="p.over>0?'txt-red':''">{{ p.occupied }}</b></td>
+              <td>
+                <div class="occ-bar">
+                  <div class="occ-fill" :class="p.over>0?'over':(p.free===0?'full':'')"
+                       :style="{width: Math.min(100, Math.round(p.occupied/Math.max(1,p.capacity)*100)) + '%'}"></div>
+                </div>
+              </td>
+              <td class="num">
+                <span v-if="p.over>0" class="badge red">超 {{ p.over }}</span>
+                <span v-else :class="p.free===0?'txt-amber':''">{{ p.free }}</span>
+              </td>
+              <td><span class="badge" :class="p.active?'green':'gray'">{{ p.active ? '启用' : '停用' }}</span></td>
+              <td style="color:#6b7280;max-width:200px">{{ p.note || '-' }}</td>
+              <td style="white-space:nowrap">
+                <button class="link" style="margin-right:10px" @click="openModal({type:'penForm', pen:p})">编辑</button>
+                <button class="link" @click="openModal({type:'backfillForm', presetPen:p})">补录迁入</button>
+              </td>
+            </tr>
+            <tr v-if="!S.pens.length"><td colspan="9" class="empty">暂无牛舍</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+
+      <!-- 安排 -->
+      <div v-if="tab==='plans'">
+        <div class="toolbar">
+          <select class="input" style="width:150px" v-model="planFilter" @change="reloadPlans">
+            <option value="">全部状态</option>
+            <option value="draft">待确认</option>
+            <option value="confirmed">已确认</option>
+            <option value="cancelled">已取消</option>
+          </select>
+          <span class="spacer"></span>
+          <button class="btn" @click="openModal({type:'backfillForm'})">补录历史转群</button>
+          <button class="btn btn-primary" @click="openModal({type:'transferForm', kind:'isolation'})">🚧 临时隔离</button>
+          <button class="btn btn-primary" @click="openModal({type:'transferForm', kind:'group'})">＋ 批量转群</button>
+        </div>
+        <div class="alert-box info" style="margin:4px 0 12px">
+          待确认安排可提前查看容量冲突；<b>先确认者占栏成功</b>，两个安排争用同一空栏时，后确认者会被容量校验与数据库约束拒绝。
+        </div>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>安排</th><th>类型</th><th>生效日</th><th>状态</th><th>牛只</th>
+            <th>迁移动作</th><th>经办人</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="p in S.plans" :key="p.id" :style="p.status==='cancelled'?'opacity:.55':''">
+              <td style="min-width:160px"><b>{{ p.title }}</b>
+                <div class="hint" v-if="p.note">{{ p.note }}</div></td>
+              <td><span class="badge" :class="p.kind==='isolation'?'red':'blue'">{{ p.kind_label }}</span></td>
+              <td>{{ p.effective_date }}
+                <div class="hint" v-if="p.status==='confirmed'">已确认 {{ p.confirmed_at?.slice(0,10) }}</div></td>
+              <td><span class="badge" :class="PLAN_STATUS[p.status].cls">{{ p.status_label }}</span></td>
+              <td style="max-width:180px">{{ planCows(p) }}</td>
+              <td style="font-size:12.5px">
+                <div v-for="it in p.items" :key="it.id">
+                  {{ it.cow_tag }}：{{ it.from_pen_name || '—' }} → <b>{{ it.to_pen_name }}</b>
+                  <span v-if="it.return_date" class="hint">，{{ it.return_date }} 回 {{ it.return_pen_name }}</span>
+                </div>
+              </td>
+              <td>{{ p.operator || '-' }}</td>
+              <td style="white-space:nowrap">
+                <button v-if="p.can_confirm" class="btn btn-sm btn-primary" style="margin-right:6px"
+                  @click="confirmPlan(p)">确认执行</button>
+                <button v-if="p.can_postpone" class="btn btn-sm" style="margin-right:6px"
+                  @click="openModal({type:'postponeForm', plan:p})">延期</button>
+                <button v-if="p.can_release" class="btn btn-sm" style="margin-right:6px"
+                  @click="openModal({type:'releaseForm', plan:p})">回迁</button>
+                <button v-if="p.can_cancel" class="btn btn-sm btn-danger" style="margin-right:6px"
+                  @click="cancelPlan(p)">取消</button>
+                <button class="link" @click="openModal({type:'planDetail', id:p.id})">流水</button>
+              </td>
+            </tr>
+            <tr v-if="!S.plans.length"><td colspan="8" class="empty">暂无转群安排</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+
+      <!-- 历史 -->
+      <div v-if="tab==='history'">
+        <housing-history></housing-history>
+      </div>
+    </div>
+  </div>`,
+};
+
+const HousingHistory = {
+  setup() {
+    const cowId = ref("");
+    const penId = ref("");
+    const rows = ref([]);
+    async function reload() {
+      const p = new URLSearchParams();
+      if (cowId.value) p.set("cow_id", cowId.value);
+      if (penId.value) p.set("pen_id", penId.value);
+      rows.value = await api("/api/stays?" + p.toString());
+    }
+    onMounted(reload);
+    const SOURCE_LABEL = { seed: "建账", transfer: "转群", history: "补录", manual: "手工" };
+    return { S, cowId, penId, rows, reload, openModal, SOURCE_LABEL };
+  },
+  template: `
+    <div>
+      <div class="toolbar">
+        <select class="input" style="width:200px" v-model="cowId" @change="reload">
+          <option value="">全部牛只</option>
+          <option v-for="c in S.cows.filter(x=>x.status!=='sold')" :key="c.id" :value="c.id">{{ c.ear_tag }} {{ c.name || '' }}</option>
+        </select>
+        <select class="input" style="width:200px" v-model="penId" @change="reload">
+          <option value="">全部栏位</option>
+          <option v-for="p in S.pens" :key="p.id" :value="p.id">{{ p.name }}</option>
+        </select>
+        <span class="spacer"></span>
+        <button class="btn btn-primary" @click="openModal({type:'backfillForm'})">＋ 补录历史转群</button>
+      </div>
+      <div class="alert-box warn" style="margin:4px 0 12px">
+        同一头牛的居住区间不允许重叠：补录与已有在栏记录冲突时会被拒绝（应用层校验 + 数据库触发器双重保证）。
+      </div>
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>耳标号</th><th>牛名</th><th>栏位</th><th>迁入日</th><th>迁出日</th><th>来源</th><th>备注</th></tr></thead>
+        <tbody>
+          <tr v-for="s in rows" :key="s.id">
+            <td><b @click="openModal({type:'cowDetail', id:s.cow_id})" class="link">{{ s.cow_tag }}</b></td>
+            <td>{{ s.cow_name || '-' }}</td>
+            <td>{{ s.pen_name }}</td>
+            <td>{{ s.start_date }}</td>
+            <td>{{ s.end_date || '至今' }}</td>
+            <td><span class="badge gray">{{ SOURCE_LABEL[s.source] || s.source }}</span></td>
+            <td style="color:#6b7280">{{ s.note || '-' }}</td>
+          </tr>
+          <tr v-if="!rows.length"><td colspan="7" class="empty">暂无居住记录</td></tr>
+        </tbody>
+      </table></div>
+    </div>`,
+};
+HousingPage.components = { HousingHistory };
+
+/* ---------------- 弹窗：牛舍表单 ---------------- */
+const PenFormModal = {
+  setup() {
+    const m = topModal();
+    const f = reactive(m.pen
+      ? { ...m.pen }
+      : { name: "", purpose: "lactating", capacity: 10, active: true, note: "" });
+    const err = ref("");
+    async function save() {
+      err.value = "";
+      try {
+        if (m.pen) {
+          await api(`/api/pens/${m.pen.id}`, { method: "PATCH", body: f });
+          toast("牛舍已更新");
+        } else {
+          await api("/api/pens", { method: "POST", body: f });
+          toast("牛舍已创建");
+        }
+        await loadPens();
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    return { f, err, save, closeModal, PEN_PURPOSE };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:500px">
+    <div class="modal-head"><h3>{{ f.id ? '编辑牛舍' : '新建牛舍' }}</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field-row">
+        <div class="field"><label>栏位名称 <span class="req">*</span></label>
+          <input class="input" v-model="f.name" placeholder="如 A栋5栏"></div>
+        <div class="field"><label>用途</label>
+          <select class="input" v-model="f.purpose">
+            <option v-for="(v,k) in PEN_PURPOSE" :key="k" :value="k">{{ v.ico }} {{ v.label }}</option>
+          </select></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>容量（头）</label>
+          <input type="number" min="0" class="input" v-model.number="f.capacity">
+          <div class="hint">0 表示停用，不能安排迁入</div></div>
+        <div class="field"><label>状态</label>
+          <select class="input" v-model="f.active"><option :value="true">启用</option><option :value="false">停用</option></select></div>
+      </div>
+      <div class="field"><label>备注</label><textarea class="input" rows="2" v-model="f.note"></textarea></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">保存</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：批量转群/隔离表单（含预检冲突） ---------------- */
+const TransferFormModal = {
+  setup() {
+    const m = topModal();
+    const kind = m.kind || "group";
+    const f = reactive({
+      title: "", effective_date: todayStr(), kind,
+      operator: "", note: "",
+      items: [{ cow_id: null, to_pen_id: null, return_pen_id: null, return_date: null }],
+    });
+    if (kind === "isolation") {
+      const isoPen = S.pens.find((p) => p.purpose === "isolation" && p.active);
+      if (isoPen) f.items[0].to_pen_id = isoPen.id;
+    }
+    const err = ref("");
+    const preview = ref(null);
+    let previewSeq = 0;
+
+    function addRow() {
+      const preset = kind === "isolation"
+        ? { cow_id: null, to_pen_id: f.items[0]?.to_pen_id || null,
+            return_pen_id: null, return_date: null }
+        : { cow_id: null, to_pen_id: null };
+      f.items.push(preset);
+    }
+    function removeRow(i) { f.items.splice(i, 1); }
+
+    function payload() {
+      return {
+        title: f.title || (kind === "isolation" ? "临时隔离" : "批量转群"),
+        effective_date: f.effective_date, kind,
+        operator: f.operator, note: f.note,
+        items: f.items
+          .filter((x) => x.cow_id && x.to_pen_id)
+          .map((x) => ({
+            cow_id: Number(x.cow_id), to_pen_id: Number(x.to_pen_id),
+            return_pen_id: x.return_pen_id ? Number(x.return_pen_id) : null,
+            return_date: x.return_date || null,
+          })),
+      };
+    }
+
+    async function runPreview() {
+      const body = payload();
+      if (!body.items.length || !f.effective_date) { preview.value = null; return; }
+      const seq = ++previewSeq;
+      try {
+        const res = await api("/api/transfers/preview", { method: "POST", body });
+        if (seq === previewSeq) preview.value = res;
+      } catch (e) {
+        if (seq === previewSeq) preview.value = { ok: false, errors: [e.message], item_reports: [], pen_conflicts: [] };
+      }
+    }
+    watch(() => JSON.stringify({ f, pens: S.pens.map(p=>p.id) }),
+      () => { clearTimeout(runPreview._t); runPreview._t = setTimeout(runPreview, 250); });
+    onMounted(runPreview);
+
+    async function save(confirmNow) {
+      err.value = "";
+      const body = payload();
+      if (!body.items.length) { err.value = "请至少添加一头牛并选择目标栏位"; return; }
+      body.confirm = !!confirmNow;
+      try {
+        await api("/api/transfers", { method: "POST", body });
+        toast(confirmNow ? "转群已确认，占栏量已更新" : "安排已保存为待确认，可稍后确认/延期/取消");
+        await loadPlans(); await loadPens(); await loadCows();
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    const activePens = computed(() => S.pens.filter((p) => p.active));
+    const activeCows = computed(() => S.cows.filter((c) => c.status !== "sold"));
+    return {
+      f, kind, err, preview, addRow, removeRow, save, closeModal,
+      activePens, activeCows, PEN_PURPOSE, todayStr,
+    };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal wide">
+    <div class="modal-head"><h3>{{ kind==='isolation' ? '🚧 临时隔离安排' : '🔀 批量转群安排' }}</h3>
+      <button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field-row">
+        <div class="field" style="flex:2"><label>安排名称 <span class="req">*</span></label>
+          <input class="input" v-model="f.title"
+                 :placeholder="kind==='isolation' ? '如 乳房炎隔离治疗' : '如 经产牛群调整'"></div>
+        <div class="field"><label>生效日期 <span class="req">*</span></label>
+          <input type="date" class="input" v-model="f.effective_date"></div>
+        <div class="field"><label>经办人</label><input class="input" v-model="f.operator"></div>
+      </div>
+
+      <div class="card-title" style="margin:6px 0">牛只明细
+        <span class="spacer"></span>
+        <button class="btn btn-sm" @click="addRow">＋ 添加牛只</button>
+      </div>
+      <div class="table-wrap"><table class="data" style="font-size:13px">
+        <thead><tr><th>牛只</th><th>当前栏</th>
+          <th>{{ kind==='isolation' ? '隔离栏' : '转入栏' }}</th>
+          <th v-if="kind==='isolation'">返回栏</th>
+          <th v-if="kind==='isolation'">返回日期</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="(it,i) in f.items" :key="i">
+            <td style="min-width:180px">
+              <select class="input" v-model="it.cow_id">
+                <option :value="null" disabled>请选择</option>
+                <option v-for="c in activeCows" :key="c.id" :value="c.id">{{ c.ear_tag }} {{ c.name || '' }}（{{ c.group || '未分栏' }}）</option>
+              </select>
+              <div v-if="report(i)?.errors.length" class="hint txt-red" style="white-space:normal">
+                {{ report(i).errors.join('；') }}
+              </div>
+              <div v-else-if="report(i)?.warnings.length" class="hint txt-amber" style="white-space:normal">
+                {{ report(i).warnings.join('；') }}
+              </div>
+            </td>
+            <td>{{ report(i)?.from_pen_name || '—' }}</td>
+            <td style="min-width:160px">
+              <select class="input" v-model="it.to_pen_id">
+                <option :value="null" disabled>请选择</option>
+                <option v-for="p in activePens" :key="p.id" :value="p.id">
+                  {{ p.name }}（剩 {{ p.free }}/{{ p.capacity }}）
+                </option>
+              </select>
+            </td>
+            <td v-if="kind==='isolation'">
+              <select class="input" v-model="it.return_pen_id">
+                <option :value="null">返回原栏</option>
+                <option v-for="p in activePens" :key="p.id" :value="p.id">{{ p.name }}</option>
+              </select>
+            </td>
+            <td v-if="kind==='isolation'">
+              <input type="date" class="input" v-model="it.return_date" :min="f.effective_date">
+              <div class="hint">留空=持续隔离，手动回迁</div>
+            </td>
+            <td><button class="link" style="color:#dc2626" @click="removeRow(i)" v-if="f.items.length>1">移除</button></td>
+          </tr>
+        </tbody>
+      </table></div>
+
+      <!-- 预检结果 -->
+      <div v-if="preview" style="margin-top:10px">
+        <div class="alert-box danger" v-if="!preview.ok">
+          <b>⛔ 存在冲突，不能保存/确认：</b>
+          <ul style="margin:6px 0 0 18px">
+            <li v-for="(e,i) in preview.errors" :key="i">{{ e }}</li>
+          </ul>
+        </div>
+        <div class="alert-box info" v-else-if="preview.warnings.length">
+          <b>⚠️ 可保存，但请注意：</b>
+          <ul style="margin:6px 0 0 18px"><li v-for="(w,i) in preview.warnings" :key="i">{{ w }}</li></ul>
+        </div>
+        <div class="alert-box" style="background:#f0fdf4;color:#166534" v-else>
+          ✅ 预检通过：生效日各目标栏位均有剩余容量，同一头牛不存在冲突安排。
+        </div>
+        <div v-if="preview.pen_conflicts.length" class="table-wrap" style="margin-top:8px">
+          <table class="data" style="font-size:12.5px">
+            <thead><tr><th>栏位</th><th class="num">容量</th><th class="num">现住</th>
+              <th class="num">迁入</th><th class="num">迁出</th><th class="num">生效日在栏</th><th class="num">余位</th></tr></thead>
+            <tbody>
+              <tr v-for="c in preview.pen_conflicts" :key="c.pen_id" style="background:#fff5f5">
+                <td><b>{{ c.name }}</b></td><td class="num">{{ c.capacity }}</td>
+                <td class="num">{{ c.baseline }}</td><td class="num">+{{ c.incoming }}</td>
+                <td class="num">-{{ c.outgoing }}</td><td class="num"><b class="txt-red">{{ c.projected }}</b></td>
+                <td class="num"><span class="badge red">{{ c.free_after }}</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="field" style="margin-top:10px"><label>备注</label>
+        <textarea class="input" rows="1" v-model="f.note"></textarea></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <span class="spacer"></span>
+      <button class="btn" @click="save(false)" :disabled="preview && !preview.ok">仅保存待确认</button>
+      <button class="btn btn-primary" @click="save(true)" :disabled="preview && !preview.ok">
+        {{ f.effective_date <= todayStr ? '保存并立即确认' : '保存并确认（按生效日占栏）' }}
+      </button>
+    </div>
+  </div></div>`,
+  methods: {
+    report(i) { return this.preview?.item_reports?.[i]; },
+  },
+};
+
+/* ---------------- 弹窗：延期 ---------------- */
+const PostponeModal = {
+  setup() {
+    const m = topModal();
+    const hasReturn = m.plan.items.some((i) => i.return_date);
+    const f = reactive({
+      effective_date: m.plan.effective_date,
+      change_return: false, return_date: m.plan.items.find((i) => i.return_date)?.return_date || "",
+    });
+    const err = ref("");
+    async function save() {
+      err.value = "";
+      try {
+        await api(`/api/transfers/${m.plan.id}/postpone`, {
+          method: "POST",
+          body: { effective_date: f.effective_date, return_date: hasReturn && f.change_return ? f.return_date : null },
+        });
+        toast("安排已延期");
+        await loadPlans(); await loadPens();
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    return { f, err, save, closeModal, m, hasReturn, todayStr };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:460px">
+    <div class="modal-head"><h3>延期安排：{{ m.plan.title }}</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field"><label>新生效日期 <span class="req">*</span></label>
+        <input type="date" class="input" :min="todayStr()" v-model="f.effective_date"></div>
+      <div class="field" v-if="hasReturn">
+        <label><input type="checkbox" v-model="f.change_return"> 同时调整隔离返回日期</label>
+        <input v-if="f.change_return" type="date" class="input" :min="f.effective_date" v-model="f.return_date" style="margin-top:6px">
+      </div>
+      <div class="hint">已确认的安排延期时，会重新检查目标栏位在新日期的容量；区间重叠时操作被拒绝。</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">确认延期</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：隔离回迁 ---------------- */
+const ReleaseModal = {
+  setup() {
+    const m = topModal();
+    const f = reactive({
+      return_date: todayStr(),
+      return_pen_id: m.plan.items[0]?.return_pen_id || m.plan.items[0]?.from_pen_id || null,
+    });
+    const err = ref("");
+    async function save() {
+      err.value = "";
+      try {
+        await api(`/api/transfers/${m.plan.id}/release`, {
+          method: "POST", body: f,
+        });
+        toast("回迁已办理，占栏量已更新");
+        await loadPlans(); await loadPens(); await loadCows();
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    return { f, err, save, closeModal, m };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:460px">
+    <div class="modal-head"><h3>隔离回迁：{{ m.plan.title }}</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="field"><label>回迁日期 <span class="req">*</span></label>
+        <input type="date" class="input" v-model="f.return_date">
+        <div class="hint">隔离段将截至该日，之后牛只住回下方栏位</div></div>
+      <div class="field"><label>返回栏位</label>
+        <select class="input" v-model="f.return_pen_id">
+          <option v-for="p in S.pens.filter(x=>x.active)" :key="p.id" :value="p.id">
+            {{ p.name }}（剩 {{ p.free }}/{{ p.capacity }}）
+          </option>
+        </select></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">办理回迁</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：补录历史居住 ---------------- */
+const BackfillModal = {
+  setup() {
+    const m = topModal();
+    const f = reactive({
+      cow_id: null, pen_id: m.presetPen?.id || null,
+      start_date: todayStr(), end_date: "", note: "",
+    });
+    const err = ref("");
+    async function save() {
+      err.value = "";
+      try {
+        await api("/api/stays/backfill", {
+          method: "POST",
+          body: { cow_id: f.cow_id, pen_id: f.pen_id, start_date: f.start_date,
+                  end_date: f.end_date || null, note: f.note || null },
+        });
+        toast("历史居住已补录");
+        await loadPens(); await loadCows();
+        closeModal();
+      } catch (e) { err.value = e.message; }
+    }
+    return { f, err, save, closeModal, S, todayStr };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:500px">
+    <div class="modal-head"><h3>补录历史转群/居住</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body">
+      <div class="alert-box danger" v-if="err">{{ err }}</div>
+      <div class="alert-box warn">
+        迁入日不能晚于今天；与该牛已有居住区间重叠将被拒绝（同一头牛不能同时住两栏）。
+        迁出日留空表示“迁入后一直住到现在”，会自动衔接当前在栏记录。
+      </div>
+      <div class="field-row">
+        <div class="field"><label>牛只 <span class="req">*</span></label>
+          <select class="input" v-model="f.cow_id">
+            <option :value="null" disabled>请选择</option>
+            <option v-for="c in S.cows" :key="c.id" :value="c.id">{{ c.ear_tag }} {{ c.name || '' }}（{{ c.group || '未分栏' }}）</option>
+          </select></div>
+        <div class="field"><label>迁入栏位 <span class="req">*</span></label>
+          <select class="input" v-model="f.pen_id">
+            <option :value="null" disabled>请选择</option>
+            <option v-for="p in S.pens" :key="p.id" :value="p.id">{{ p.name }}</option>
+          </select></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>迁入日期 <span class="req">*</span></label>
+          <input type="date" class="input" :max="todayStr()" v-model="f.start_date"></div>
+        <div class="field"><label>迁出日期（留空=至今）</label>
+          <input type="date" class="input" v-model="f.end_date" :min="f.start_date"></div>
+      </div>
+      <div class="field"><label>备注</label><input class="input" v-model="f.note" placeholder="如 历史寄养/纸质档案补录"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="closeModal">取消</button>
+      <button class="btn btn-primary" @click="save">补录</button>
+    </div>
+  </div></div>`,
+};
+
+/* ---------------- 弹窗：安排流水 ---------------- */
+const PlanDetailModal = {
+  setup() {
+    const m = topModal();
+    const p = ref(null);
+    onMounted(async () => { p.value = await api(`/api/transfers/${m.id}`); });
+    const ACTION = {
+      created: "创建", confirmed: "确认", postponed: "延期", cancelled: "取消",
+      released: "回迁", returned: "回迁完成", backfilled: "补录",
+    };
+    return { p, closeModal, ACTION, PLAN_STATUS };
+  },
+  template: `
+  <div class="modal-mask" @click.self="closeModal"><div class="modal" style="width:560px">
+    <div class="modal-head"><h3>迁入迁出流水</h3><button class="modal-close" @click="closeModal">×</button></div>
+    <div class="modal-body" v-if="p">
+      <h3 style="margin-bottom:4px">{{ p.title }}
+        <span class="badge" :class="PLAN_STATUS[p.status].cls">{{ p.status_label }}</span></h3>
+      <div class="hint">{{ p.kind_label }} · 生效日 {{ p.effective_date }} · 经办人 {{ p.operator || '-' }}</div>
+      <div class="card-title" style="margin:12px 0 6px">牛只</div>
+      <div v-for="it in p.items" :key="it.id" style="padding:4px 0">
+        <b>{{ it.cow_tag }}</b> {{ it.cow_name || '' }}：
+        {{ it.from_pen_name || '—' }} → <b>{{ it.to_pen_name }}</b>
+        <span v-if="it.return_date" class="hint">，{{ it.return_date }} 回 {{ it.return_pen_name }}</span>
+      </div>
+      <div class="card-title" style="margin:14px 0 6px">操作流水</div>
+      <ul class="event-list">
+        <li v-for="e in p.events" :key="e.id">
+          <span class="badge gray">{{ ACTION[e.action] || e.action }}</span>
+          <span style="margin-left:8px">{{ e.detail }}</span>
+          <span class="hint" style="float:right">{{ e.at?.replace('T',' ').slice(0,16) }}</span>
+        </li>
+      </ul>
+    </div>
+  </div></div>`,
+};
+
 /* ---------------- 根组件 ---------------- */
 const App = {
-  components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage,
+  components: { Dashboard, CowsPage, MilkingsPage, HealthPage, ReproPage, HousingPage,
     CowFormModal, MilkingFormModal, HealthFormModal, DrugFormModal,
-    MedFormModal, EstrusFormModal, CowDetailModal },
+    MedFormModal, EstrusFormModal, CowDetailModal,
+    PenFormModal, TransferFormModal, PostponeModal, ReleaseModal,
+    BackfillModal, PlanDetailModal },
   setup() {
     onMounted(async () => {
       try {
@@ -1261,6 +1976,7 @@ const App = {
       { key: "milkings", ico: "🥛", label: "挤奶记录" },
       { key: "health", ico: "🏥", label: "健康与用药" },
       { key: "repro", ico: "💕", label: "发情与配种" },
+      { key: "housing", ico: "🏠", label: "牛舍转群" },
     ];
     return { S, switchView, nav, topModal };
   },
@@ -1289,6 +2005,7 @@ const App = {
         <milkings-page v-else-if="S.view==='milkings'"></milkings-page>
         <health-page v-else-if="S.view==='health'"></health-page>
         <repro-page v-else-if="S.view==='repro'"></repro-page>
+        <housing-page v-else-if="S.view==='housing'"></housing-page>
       </div>
     </main>
 
@@ -1301,6 +2018,12 @@ const App = {
       <med-form-modal v-else-if="md.type==='medForm'"></med-form-modal>
       <estrus-form-modal v-else-if="md.type==='estrusForm'"></estrus-form-modal>
       <cow-detail-modal v-else-if="md.type==='cowDetail'"></cow-detail-modal>
+      <pen-form-modal v-else-if="md.type==='penForm'"></pen-form-modal>
+      <transfer-form-modal v-else-if="md.type==='transferForm'"></transfer-form-modal>
+      <postpone-modal v-else-if="md.type==='postponeForm'"></postpone-modal>
+      <release-modal v-else-if="md.type==='releaseForm'"></release-modal>
+      <backfill-modal v-else-if="md.type==='backfillForm'"></backfill-modal>
+      <plan-detail-modal v-else-if="md.type==='planDetail'"></plan-detail-modal>
     </template>
 
     <div class="toast-wrap">

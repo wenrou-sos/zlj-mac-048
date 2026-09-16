@@ -212,3 +212,67 @@ class EstrusOut(EstrusCreate):
 
     class Config:
         from_attributes = True
+
+
+# ---------- 牛舍 ----------
+class PenCreate(BaseModel):
+    name: str = Field(..., max_length=64)
+    purpose: str = Field("lactating", pattern="^(lactating|dry|maternity|isolation|other)$")
+    capacity: int = Field(0, ge=0, le=10000)
+    active: bool = True
+    note: Optional[str] = None
+
+
+class PenUpdate(BaseModel):
+    name: Optional[str] = Field(None, max_length=64)
+    purpose: Optional[str] = Field(None, pattern="^(lactating|dry|maternity|isolation|other)$")
+    capacity: Optional[int] = Field(None, ge=0, le=10000)
+    active: Optional[bool] = None
+    note: Optional[str] = None
+
+
+# ---------- 转群 ----------
+class MoveItem(BaseModel):
+    cow_id: int
+    to_pen_id: int
+    from_pen_id: Optional[int] = None
+    return_pen_id: Optional[int] = None
+    return_date: Optional[date] = None
+
+
+class PlanCreate(BaseModel):
+    title: str = Field(..., max_length=128)
+    effective_date: date
+    kind: str = Field("group", pattern="^(group|isolation)$")
+    operator: Optional[str] = None
+    note: Optional[str] = None
+    items: List[MoveItem] = Field(..., min_length=1)
+    confirm: bool = False
+
+
+class PlanPatch(BaseModel):
+    title: Optional[str] = None
+    note: Optional[str] = None
+    operator: Optional[str] = None
+
+
+class PostponePayload(BaseModel):
+    effective_date: date
+    return_date: Optional[date] = None
+
+
+class CancelPayload(BaseModel):
+    reason: Optional[str] = None
+
+
+class ReleasePayload(BaseModel):
+    return_date: date
+    return_pen_id: Optional[int] = None
+
+
+class BackfillStay(BaseModel):
+    cow_id: int
+    pen_id: int
+    start_date: date
+    end_date: Optional[date] = None
+    note: Optional[str] = None

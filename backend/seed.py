@@ -1,6 +1,6 @@
 """初始化并写入样例牛群数据（所有日期相对今天生成，保证提醒场景可直接演示）"""
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -10,6 +10,24 @@ from .database import Base, SessionLocal, engine
 
 def _d(offset: int) -> date:
     return date.today() + timedelta(days=offset)
+
+
+# (栏位名, 用途, 容量, 备注)
+PENS = [
+    ("A栋1栏", "lactating", 4, "泌乳牛舍，靠近挤奶厅"),
+    ("A栋2栏", "lactating", 2, "泌乳牛舍，仅剩 1 个空位用于演示争用"),
+    ("A栋3栏", "lactating", 6, "泌乳牛舍"),
+    ("A栋4栏", "lactating", 6, "泌乳牛舍"),
+    ("B栋1栏", "lactating", 6, "泌乳牛舍"),
+    ("B栋2栏", "lactating", 6, "泌乳牛舍"),
+    ("B栋3栏", "lactating", 6, "泌乳牛舍（乳房炎牛临时集中观察）"),
+    ("C栋1栏", "lactating", 6, "泌乳牛舍"),
+    ("C栋产后栏", "maternity", 4, "新产牛产房护理栏"),
+    ("C栋待产栏", "maternity", 4, "预产期 15 天内转入"),
+    ("D栋干奶栏", "dry", 6, "干奶牛舍"),
+    ("E栋隔离舍", "isolation", 2, "病牛/购入牛临时隔离，离场前不得混群"),
+    ("已离场", "other", 0, "离场牛归集栏，已停用"),
+]
 
 
 DRUGS = [
@@ -87,6 +105,15 @@ def seed_database(db: Session) -> None:
         drug_map[name] = d
     db.flush()
 
+    # ---------- 牛舍栏位 ----------
+    pen_map = {}
+    for pname, purpose, cap, pnote in PENS:
+        p = models.Pen(name=pname, purpose=purpose, capacity=cap,
+                       active=cap > 0, note=pnote)
+        db.add(p)
+        pen_map[pname] = p
+    db.flush()
+
     # ---------- 奶牛档案 ----------
     cows = {}
     for tag, name, breed, parity, status, group, calv_off, exp_off, avg in COWS:
@@ -106,6 +133,20 @@ def seed_database(db: Session) -> None:
         db.add(cow)
         db.flush()
         cows[tag] = cow
+
+    # ---------- 居住历史建账（每头牛当前栏位的开放居住区间，半开区间） ----------
+    for tag, cow in cows.items():
+        group = next(row[5] for row in COWS if row[0] == tag)
+        if group in pen_map and cow.status != "sold":
+            if cow.status in ("dry", "pregnant"):
+                start = _d(-60)
+            else:
+                start = cow.calving_date or _d(-200)
+            db.add(models.Stay(
+                cow_id=cow.id, pen_id=pen_map[group].id,
+                start_date=start, end_date=None,
+                source="seed", note="建账迁移自原牛舍文本"))
+    db.flush()
 
     # ---------- 挤奶记录：近20个完整日 + 今日早班 ----------
     for tag, cow in cows.items():
@@ -234,6 +275,110 @@ def seed_database(db: Session) -> None:
                             note="复检未孕，之后未见明显发情"),
     ])
 
+    # ---------- 牛舍转群：历史 / 隔离 / 争用演示 ----------
+    # 1) 一条已确认的历史转群：1605 青青 45 天前从 B栋2栏 迁入 A栋3栏
+    hist = models.TransferPlan(
+        title="经产牛群调整（示例历史）", effective_date=_d(-45),
+        kind="group", status="confirmed", operator="王主管",
+        confirmed_at=datetime.utcnow(), note="样例：已执行的历史迁入迁出")
+    db.add(hist)
+    db.flush()
+    hitem = models.TransferItem(
+        plan_id=hist.id, cow_id=cows["1605"].id,
+        from_pen_id=pen_map["B栋2栏"].id, to_pen_id=pen_map["A栋3栏"].id)
+    db.add(hitem)
+    db.flush()
+    # 重写 1605 的居住区间：B栋2栏 -> A栋3栏
+    db.query(models.Stay).filter_by(cow_id=cows["1605"].id).delete()
+    db.add(models.Stay(cow_id=cows["1605"].id, pen_id=pen_map["B栋2栏"].id,
+                       start_date=_d(-260), end_date=_d(-45), source="seed",
+                       note="建账迁移自原牛舍文本"))
+    db.add(models.Stay(cow_id=cows["1605"].id, pen_id=pen_map["A栋3栏"].id,
+                       start_date=_d(-45), end_date=None, source="transfer",
+                       transfer_item_id=hitem.id, note=hist.title))
+    db.add_all([
+        models.TransferEvent(plan_id=hist.id, cow_id=cows["1605"].id,
+                             action="created", detail="创建安排，1 头牛"),
+        models.TransferEvent(plan_id=hist.id, cow_id=cows["1605"].id,
+                             action="confirmed",
+                             detail=f"{_d(-45)} 迁入「A栋3栏」"),
+    ])
+
+    # 2) 已确认的临时隔离：1610 玉珠 3 天前入隔离舍，计划 4 天后返回 B栋3栏
+    iso = models.TransferPlan(
+        title="玉珠乳房炎隔离治疗", effective_date=_d(-3),
+        kind="isolation", status="confirmed", operator="王兽医",
+        confirmed_at=datetime.utcnow(), note="临床乳房炎隔离，休药期结束复检后回迁")
+    db.add(iso)
+    db.flush()
+    iitem = models.TransferItem(
+        plan_id=iso.id, cow_id=cows["1610"].id,
+        from_pen_id=pen_map["B栋3栏"].id, to_pen_id=pen_map["E栋隔离舍"].id,
+        return_pen_id=pen_map["B栋3栏"].id, return_date=_d(4))
+    db.add(iitem)
+    db.flush()
+    db.query(models.Stay).filter_by(cow_id=cows["1610"].id).delete()
+    db.add(models.Stay(cow_id=cows["1610"].id, pen_id=pen_map["B栋3栏"].id,
+                       start_date=_d(-110), end_date=_d(-3), source="seed",
+                       note="建账迁移自原牛舍文本"))
+    db.add(models.Stay(cow_id=cows["1610"].id, pen_id=pen_map["E栋隔离舍"].id,
+                       start_date=_d(-3), end_date=_d(4), source="transfer",
+                       transfer_item_id=iitem.id, note="隔离：" + iso.title))
+    db.add(models.Stay(cow_id=cows["1610"].id, pen_id=pen_map["B栋3栏"].id,
+                       start_date=_d(4), end_date=None, source="transfer",
+                       transfer_item_id=iitem.id, note="隔离返回：" + iso.title))
+    cows["1610"].group = "E栋隔离舍"
+    db.add_all([
+        models.TransferEvent(plan_id=iso.id, cow_id=cows["1610"].id,
+                             action="created", detail="创建隔离安排，1 头牛"),
+        models.TransferEvent(plan_id=iso.id, cow_id=cows["1610"].id,
+                             action="confirmed",
+                             detail=f"{_d(-3)} 临时隔离至「E栋隔离舍」，计划 {_d(4)} 返回"),
+    ])
+
+    # 3) 待确认安排甲：1603 金花 明天转入 A栋2栏（该栏仅剩 1 个空位）
+    plan_a = models.TransferPlan(
+        title="金花转入挤奶动线前排", effective_date=_d(1),
+        kind="group", status="draft", operator="王主管",
+        note="样例：先确认此安排可成功")
+    db.add(plan_a)
+    db.flush()
+    db.add(models.TransferItem(
+        plan_id=plan_a.id, cow_id=cows["1603"].id,
+        from_pen_id=pen_map["B栋1栏"].id, to_pen_id=pen_map["A栋2栏"].id))
+    db.add(models.TransferEvent(plan_id=plan_a.id, cow_id=cows["1603"].id,
+                                action="created",
+                                detail=f"创建安排，1 头牛，{_d(1)} 生效"))
+
+    # 4) 待确认安排乙：1604 大兰 同一天也转入 A栋2栏 —— 与甲争用最后栏位
+    plan_b = models.TransferPlan(
+        title="大兰调整至 A栋2栏", effective_date=_d(1),
+        kind="group", status="draft", operator="李主管",
+        note="样例：与“金花转入挤奶动线前排”争用 A栋2栏最后 1 个空位，后确认者会失败")
+    db.add(plan_b)
+    db.flush()
+    db.add(models.TransferItem(
+        plan_id=plan_b.id, cow_id=cows["1604"].id,
+        from_pen_id=pen_map["B栋2栏"].id, to_pen_id=pen_map["A栋2栏"].id))
+    db.add(models.TransferEvent(plan_id=plan_b.id, cow_id=cows["1604"].id,
+                                action="created",
+                                detail=f"创建安排，1 头牛，{_d(1)} 生效"))
+
+    # 5) 待确认的未来隔离安排：1609 甜豆 明天隔离，5 天后返回 A栋4栏（可演示延期/取消）
+    plan_c = models.TransferPlan(
+        title="甜豆呼吸道感染隔离", effective_date=_d(1),
+        kind="isolation", status="draft", operator="李兽医",
+        note="样例：待确认的隔离安排，含计划返回日期")
+    db.add(plan_c)
+    db.flush()
+    db.add(models.TransferItem(
+        plan_id=plan_c.id, cow_id=cows["1609"].id,
+        from_pen_id=pen_map["A栋4栏"].id, to_pen_id=pen_map["E栋隔离舍"].id,
+        return_pen_id=pen_map["A栋4栏"].id, return_date=_d(6)))
+    db.add(models.TransferEvent(plan_id=plan_c.id, cow_id=cows["1609"].id,
+                                action="created",
+                                detail=f"创建隔离安排，1 头牛，{_d(1)} 生效"))
+
     db.commit()
 
 
@@ -250,6 +395,22 @@ def init_db(force: bool = False) -> None:
             seed_database(db)
         finally:
             db.close()
+    else:
+        migrate_group_text(db_log=True)
+
+
+def migrate_group_text(db_log: bool = False) -> None:
+    """老库升级：pens 表为空但 cows.group 有文本时，自动对照归并建账（幂等）"""
+    from . import housing
+    db = SessionLocal()
+    try:
+        if db.query(models.Pen).count() == 0 and db.query(models.Cow).count() > 0:
+            result = housing.reconcile_group_text(db)
+            if db_log:
+                print(f"旧牛舍文本已归并：新建 {len(result['created_pens'])} 个栏位，"
+                      f"关联 {result['linked']} 头牛")
+    finally:
+        db.close()
 
 
 def db_is_empty() -> bool:
